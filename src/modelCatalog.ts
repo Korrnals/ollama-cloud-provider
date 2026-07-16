@@ -1,4 +1,5 @@
 import { AuthManager } from './auth.js';
+import { assertBaseUrlAllowed } from './configValidator.js';
 import { logger } from './logger.js';
 
 const MODELS_ENDPOINT_SUFFIX = '/models';
@@ -455,6 +456,13 @@ export class ModelCatalog {
     const baseUrl = this.authManager.getBaseUrl();
     const rootUrl = this.authManager.getRootUrl();
 
+    // Issue 9 — security boundary: refuse to send the API key to any
+    // host not in the whitelist. One check here covers both the
+    // /v1/models request and the /api/tags fallback, because rootUrl is
+    // derived from baseUrl in AuthManager.getRootUrl. If baseUrl is not
+    // whitelisted, neither endpoint is safe.
+    assertBaseUrlAllowed(baseUrl);
+
     try {
       return await fetchModelIdsFromOpenAICatalog(baseUrl, apiKey);
     } catch (error) {
@@ -528,6 +536,10 @@ async function fetchModelIdsFromOpenAICatalog(
   baseUrl: string,
   apiKey?: string,
 ): Promise<string[]> {
+  // Issue 9 — assert enforced by caller (fetchModelIds) before this
+  // function is reached, so the API key is never sent to a non-
+  // whitelisted host. Defense in depth: the check lives at the request
+  // boundary, not at activation.
   const response = await fetch(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
     headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
   });
