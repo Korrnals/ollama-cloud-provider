@@ -22,9 +22,13 @@ const OUTPUT_CHANNEL_NAME = 'Ollama Cloud';
  */
 const REDACTION_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
   // 1. Full Authorization header — most specific, apply before generic Bearer.
-  { pattern: /Authorization:\s*Bearer\s+[^\s"']+/gi, replacement: 'Authorization: Bearer [REDACTED]' },
+  // LOW-1 — `\s*` (not `\s+`) after both `:` and `Bearer` so the
+  // no-space form `Authorization:Bearer<token>` is also redacted. Some
+  // clients emit the header with no whitespace, and the old `\s+`
+  // missed that form.
+  { pattern: /Authorization:\s*Bearer\s*[^\s"']+/gi, replacement: 'Authorization: Bearer [REDACTED]' },
   // 2. Standalone "Bearer <token>" without the Authorization: prefix.
-  { pattern: /Bearer\s+[A-Za-z0-9._-]{4,}/gi, replacement: 'Bearer [REDACTED]' },
+  { pattern: /Bearer\s*[A-Za-z0-9._-]{4,}/gi, replacement: 'Bearer [REDACTED]' },
   // 3. JSON "api_key":"..." (double quotes).
   { pattern: /"api_key"\s*:\s*"[^"]*"/gi, replacement: '"api_key":"[REDACTED]"' },
   // 4. JSON "apiKey":"..." (camelCase variant).

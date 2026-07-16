@@ -18,6 +18,11 @@ import {
 const REQUEST_TIMEOUT_MIN_MS = 5000;
 const REQUEST_TIMEOUT_MAX_MS = 600000;
 const REQUEST_TIMEOUT_DEFAULT_MS = 120000;
+// MEDIUM-2 — cap the SSE buffer at 1 MiB. A well-formed stream emits
+// newline-delimited chunks, so the buffer between line splits stays
+// small. A hostile/malformed stream with no newlines would grow it
+// without bound; this cap turns that into a bounded, reported error.
+const MAX_SSE_BUFFER_BYTES = 1048576;
 
 interface OpenAIStreamChunk {
   choices?: Array<{
@@ -68,7 +73,13 @@ export class OllamaClient {
     // one, so the timeout applies end-to-end.
     const controller = new AbortController();
     const requestTimeoutMs = resolveRequestTimeoutMs();
+    // MEDIUM-1 — track whether the timeout fired. The catch block must
+    // distinguish a timeout-abort (route to onError) from a caller-
+    // cancel abort (route to onDone). Without this flag, a timed-out
+    // stream silently succeeds, hiding the failure from the user.
+    let timeoutFired = false;
     const timeoutHandle = setTimeout(() => {
+      timeoutFired = true;
       logger.error(
         `Ollama Cloud: request timed out after ${requestTimeoutMs}ms`,
       );
@@ -166,6 +177,15 @@ export class OllamaClient {
         }
 
         buffer += decoder.decode(chunk.value, { stream: true });
+        // MEDIUM-2 — unbounded SSE buffer is a DoS vector. A malformed
+        // or hostile stream that never emits a newline would grow
+        // `buffer` without limit. Cap at 1 MiB; if exceeded, abort with
+        // an error rather than continuing to accumulate memory.
+        if (buffer.length > MAX_SSE_BUFFER_BYTES) {
+          throw new Error(
+            `Ollama Cloud: SSE buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a newline; aborting to prevent unbounded memory growth.`,
+          );
+        }
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || '';
 
@@ -201,7 +221,19 @@ export class OllamaClient {
       }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
-        callbacks.onDone();
+        // MEDIUM-1 — a timeout abort is a failure, not a silent success.
+        // Only a caller-cancel abort routes to onDone. Without this
+        // distinction, a hung stream that timed out looked like a
+        // successful completion to the caller.
+        if (timeoutFired) {
+          callbacks.onError(
+            new Error(
+              `Ollama Cloud: request timed out after ${requestTimeoutMs}ms`,
+            ),
+          );
+        } else {
+          callbacks.onDone();
+        }
         return;
       }
       callbacks.onError(

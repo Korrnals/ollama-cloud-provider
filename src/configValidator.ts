@@ -86,12 +86,19 @@ export async function validateConfiguration(
     message: apiKeyOk ? 'API key is configured' : 'API key is missing',
   });
 
-  // Check 3 — baseUrl reachable. Skipped (not failed) when no API key:
-  // a 401 from an unauthenticated probe is not evidence of an
-  // unreachable host, so we cannot draw a meaningful conclusion.
+  // Check 3 — baseUrl reachable. Skipped (not failed) when no API key
+  // OR when baseUrl is not whitelisted: HIGH-1 — a non-whitelisted
+  // baseUrl must NEVER receive the API key, even during a validation
+  // probe. The reachability fetch sends `Authorization: Bearer`, so
+  // gating it on `apiKeyOk && baseUrlOk` closes the SEC-03 bypass that
+  // Issue 9 was meant to prevent. A malicious workspace cannot
+  // exfiltrate the key via the `Validate Configuration` command.
   let reachableOk = false;
-  let reachableMessage = 'skipped (no API key)';
-  if (apiKeyOk) {
+  let reachableMessage =
+    !apiKeyOk
+      ? 'skipped (no API key)'
+      : 'skipped (baseUrl not whitelisted)';
+  if (apiKeyOk && baseUrlOk) {
     try {
       const controller = new AbortController();
       const timeoutHandle = setTimeout(
