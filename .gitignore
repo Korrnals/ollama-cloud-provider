@@ -1,0 +1,63 @@
+# === Dependencies ===
+node_modules/
+
+# === Build output ===
+out/
+dist/
+*.vsix
+*.tsbuildinfo
+
+# === IDE / Editor (keep shared configs) ===
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS files ===
+.DS_Store
+Thumbs.db
+desktop.ini
+.directory
+
+# === Environment / secrets (NEVER commit) ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# === GPG signing keys (local only, NEVER commit) ===
+*.gpg
+*.asc
+secring.gpg
+publishing.gpg
+!gpg-public-key.asc
+
+# === Logs ===
+*.log
+logs/
+
+# === Coverage / test output ===
+coverage/
+.nyc_output/
+test-results/
+.junit.xml
+
+# === Sigstore / SLSA / SBOM artifacts (generated in CI) ===
+*.sig
+*.bundle
+*.intoto.json
+*.spdx.json
+*.spdx.xml
+cosign.pub
+
+# === Local development state ===
+.ollama-cloud-dev/
+local-settings.json
+HANDOFF.md
