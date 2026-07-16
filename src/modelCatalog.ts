@@ -6,6 +6,10 @@ import { httpErrorFromResponse, withRetry } from './retry.js';
 const MODELS_ENDPOINT_SUFFIX = '/models';
 const TAGS_ENDPOINT_SUFFIX = '/api/tags';
 const DEFAULT_DETAIL = 'Ollama Cloud';
+// INFO-3 — explicit timeout for catalog fetches. Without it, a hung
+// endpoint blocks model discovery indefinitely. 30s is generous for a
+// one-shot JSON catalog pull and short enough to fail fast visibly.
+const CATALOG_FETCH_TIMEOUT_MS = 30000;
 
 export interface ModelDefinition {
   id: string;
@@ -544,17 +548,30 @@ async function fetchModelIdsFromOpenAICatalog(
   // Issue 13 — wrapped in withRetry for transient 429/5xx/network
   // failures. This is a one-shot JSON fetch (not a stream), so retrying
   // the whole call is safe.
+  // INFO-3 — explicit 30s timeout. Without it, a hung catalog endpoint
+  // would block model discovery indefinitely. withRetry would keep
+  // retrying a never-resolving fetch, multiplying the stall.
   const response = await withRetry(async () => {
-    const res = await fetch(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
-      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
-    });
-    if (!res.ok) {
-      throw await httpErrorFromResponse(
-        res,
-        `Model catalog request failed with HTTP ${res.status}.`,
-      );
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(
+      () => controller.abort(),
+      CATALOG_FETCH_TIMEOUT_MS,
+    );
+    try {
+      const res = await fetch(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw await httpErrorFromResponse(
+          res,
+          `Model catalog request failed with HTTP ${res.status}.`,
+        );
+      }
+      return res;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
-    return res;
   });
 
   const payload = (await response.json()) as { data?: Array<{ id?: string }> };
@@ -574,17 +591,30 @@ async function fetchModelIdsFromTagsCatalog(
   apiKey?: string,
 ): Promise<string[]> {
   // Issue 13 — same retry treatment as the OpenAI catalog fetch.
+  // INFO-3 — explicit 30s timeout, same rationale as the OpenAI
+  // catalog helper: a hung /api/tags endpoint must not block model
+  // discovery indefinitely.
   const response = await withRetry(async () => {
-    const res = await fetch(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
-      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
-    });
-    if (!res.ok) {
-      throw await httpErrorFromResponse(
-        res,
-        `Tags catalog request failed with HTTP ${res.status}.`,
-      );
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(
+      () => controller.abort(),
+      CATALOG_FETCH_TIMEOUT_MS,
+    );
+    try {
+      const res = await fetch(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        throw await httpErrorFromResponse(
+          res,
+          `Tags catalog request failed with HTTP ${res.status}.`,
+        );
+      }
+      return res;
+    } finally {
+      clearTimeout(timeoutHandle);
     }
-    return res;
   });
 
   const payload = (await response.json()) as {
