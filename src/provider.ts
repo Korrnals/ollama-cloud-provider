@@ -6,6 +6,8 @@ import {
   convertToolsToOpenAI,
   getMessageText,
 } from './convert.js';
+import { validateConfiguration } from './configValidator.js';
+import { runHealthCheckCommand } from './healthCheck.js';
 import { logger } from './logger.js';
 import {
   getModelConfigurationSchema,
@@ -42,6 +44,15 @@ export class OllamaCloudChatProvider
 
   readonly onDidChangeLanguageModelChatInformation =
     this.onDidChangeLanguageModelChatInformationEmitter.event;
+
+  /**
+   * Exposed for the Issue 17 smart-notification wiring in `extension.ts`,
+   * which needs to check whether an API key is set without going through
+   * the command handler. Read-only access.
+   */
+  get auth(): AuthManager {
+    return this.authManager;
+  }
 
   constructor(context: vscode.ExtensionContext) {
     this.authManager = new AuthManager(context);
@@ -128,51 +139,17 @@ export class OllamaCloudChatProvider
   }
 
   async checkConnection(): Promise<void> {
-    const hasApiKey = await this.authManager.hasApiKey();
-    if (!hasApiKey) {
-      void vscode.window.showWarningMessage(
-        'Ollama Cloud API key not configured. Run "Ollama Cloud: Set API Key".',
-      );
-      return;
-    }
-
-    try {
-      const result = await this.modelCatalog.refresh();
-      this.onDidChangeLanguageModelChatInformationEmitter.fire();
-      void vscode.window.showInformationMessage(
-        `Ollama Cloud connection OK. ${result.count} models available.`,
-      );
-    } catch (error) {
-      logger.error('Ollama Cloud connection check failed.', error);
-      void vscode.window.showErrorMessage(
-        'Ollama Cloud connection check failed. See logs for details.',
-      );
-    }
+    // Issue 15 — delegate to the healthCheck module. It performs the
+    // whitelist + API-key + reachability checks and shows the result
+    // notification. This method is the command handler body.
+    await runHealthCheckCommand(this.authManager);
   }
 
   async validateConfig(): Promise<void> {
-    const hasApiKey = await this.authManager.hasApiKey();
-    const baseUrl = this.authManager.getBaseUrl();
-    const models = this.modelCatalog.list();
-
-    const lines = [
-      `baseUrl=${baseUrl}`,
-      `apiKey=${hasApiKey ? 'configured' : 'missing'}`,
-      `registeredModels=${models.length}`,
-    ];
-
-    logger.info(`Ollama Cloud config validation.\n${lines.join('\n')}`);
-    logger.show();
-
-    if (!hasApiKey) {
-      void vscode.window.showWarningMessage(
-        'Ollama Cloud: API key missing. Run "Ollama Cloud: Set API Key".',
-      );
-    } else {
-      void vscode.window.showInformationMessage(
-        'Ollama Cloud config written to the output log.',
-      );
-    }
+    // Issue 16 — delegate to the configValidator module. It runs the
+    // full validation suite (baseUrl whitelist, API key, reachability,
+    // requestTimeoutMs, maxRetries) and shows the summary notification.
+    await validateConfiguration(this.authManager);
   }
 
   async provideLanguageModelChatInformation(
