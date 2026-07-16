@@ -61,3 +61,6 @@ cosign.pub
 .ollama-cloud-dev/
 local-settings.json
 HANDOFF.md
+
+# VS Code local history
+.history/
