@@ -1,0 +1,128 @@
+{
+  "name": "ollama-cloud-provider",
+  "displayName": "Ollama Cloud Provider",
+  "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
+  "version": "0.2.0",
+  "type": "module",
+  "publisher": "Korrnals",
+  "icon": "media/ollama-logo.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Korrnals/ollama-cloud-provider.git"
+  },
+  "homepage": "https://github.com/Korrnals/ollama-cloud-provider#readme",
+  "bugs": {
+    "url": "https://github.com/Korrnals/ollama-cloud-provider/issues"
+  },
+  "engines": {
+    "vscode": "^1.118.0"
+  },
+  "categories": ["AI", "Chat"],
+  "keywords": [
+    "ollama",
+    "ollama cloud",
+    "copilot",
+    "github copilot",
+    "language model",
+    "chat",
+    "openai compatible"
+  ],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "extensionKind": ["workspace", "ui"],
+  "contributes": {
+    "languageModelChatProviders": [
+      {
+        "vendor": "ollama-cloud",
+        "displayName": "Ollama Cloud"
+      }
+    ],
+    "commands": [
+      {
+        "command": "ollamaCloud.setApiKey",
+        "title": "Ollama Cloud: Set API Key"
+      },
+      {
+        "command": "ollamaCloud.clearApiKey",
+        "title": "Ollama Cloud: Clear API Key"
+      },
+      {
+        "command": "ollamaCloud.showRegisteredModels",
+        "title": "Ollama Cloud: Show Registered Models"
+      },
+      {
+        "command": "ollamaCloud.showLogs",
+        "title": "Ollama Cloud: Show Logs"
+      },
+      {
+        "command": "ollamaCloud.checkConnection",
+        "title": "Ollama Cloud: Check Connection"
+      },
+      {
+        "command": "ollamaCloud.validateConfig",
+        "title": "Ollama Cloud: Validate Configuration"
+      }
+    ],
+    "configuration": {
+      "title": "Ollama Cloud",
+      "properties": {
+        "ollamaCloud.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Ollama Cloud API key fallback. Prefer the command palette to store it securely in SecretStorage.",
+          "scope": "application"
+        },
+        "ollamaCloud.baseUrl": {
+          "type": "string",
+          "default": "https://ollama.com/v1",
+          "description": "Ollama Cloud OpenAI-compatible API base URL. Must be in allowedBaseUrls or the extension refuses to start.",
+          "scope": "application"
+        },
+        "ollamaCloud.allowedBaseUrls": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["https://ollama.com/v1"],
+          "description": "Whitelist of permitted base URLs. The extension refuses to send requests to any baseUrl not in this list.",
+          "scope": "application"
+        },
+        "ollamaCloud.requestTimeoutMs": {
+          "type": "integer",
+          "default": 120000,
+          "minimum": 5000,
+          "maximum": 600000,
+          "description": "Request timeout in milliseconds for chat completions.",
+          "scope": "application"
+        },
+        "ollamaCloud.maxRetries": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Maximum number of retries for transient failures (429, 5xx). Uses exponential backoff.",
+          "scope": "application"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "build": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package",
+    "verify": "npm run lint && npm run compile && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.30",
+    "@types/vscode": "^1.118.0",
+    "@typescript-eslint/eslint-plugin": "8.53.0",
+    "@typescript-eslint/parser": "8.53.0",
+    "@vscode/vsce": "^3.9.1",
+    "eslint": "9.39.2",
+    "globals": "17.0.0",
+    "typescript": "5.9.3"
+  }
+}

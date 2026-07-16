@@ -1,0 +1,8 @@
+# Security-critical files require review
+src/logger.ts          @Korrnals
+src/ollamaClient.ts    @Korrnals
+src/auth.ts            @Korrnals
+src/provider.ts        @Korrnals
+.github/workflows/     @Korrnals
+docs/adr/              @Korrnals
+SECURITY.md            @Korrnals

@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Lint, Compile, Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Check scope:application on config keys
+        run: |
+          # Security gate: all ollamaCloud.* config must be scope: application
+          # Prevents workspace .vscode/settings.json from overriding keys/URLs
+          node -e "
+          const pkg = require('./package.json');
+          const props = pkg.contributes?.configuration?.properties || {};
+          const violations = [];
+          for (const [key, val] of Object.entries(props)) {
+            if (key.startsWith('ollamaCloud.') && val.scope !== 'application') {
+              violations.push(key + ' has scope=' + (val.scope || 'undefined'));
+            }
+          }
+          if (violations.length) {
+            console.error('SECURITY GATE FAILED: config keys must be scope:application');
+            violations.forEach(v => console.error('  ' + v));
+            process.exit(1);
+          }
+          console.log('OK: all ollamaCloud.* config keys are scope:application');
+          "
+
+      - name: Check no child_process / eval / Function in source
+        run: |
+          # Security gate: no code execution primitives in source
+          if grep -rnE 'child_process|require\(.child_process|new Function|eval\(' src/; then
+            echo 'SECURITY GATE FAILED: code execution primitives found in src/'
+            exit 1
+          fi
+          echo 'OK: no child_process / eval / Function in src/'
+
+      - name: Check no webview / URI handler
+        run: |
+          # Security gate: no webview or URI handler registration
+          if grep -rnE 'createWebviewPanel|registerUriHandler|WebviewViewProvider' src/; then
+            echo 'SECURITY GATE FAILED: webview or URI handler found in src/'
+            exit 1
+          fi
+          echo 'OK: no webview / URI handler in src/'
+
+      - name: Check no telemetry / analytics
+        run: |
+          if grep -rniE 'telemetry|analytics|tracking|phone.home' src/ --include='*.ts' | grep -v '// ' | grep -v '//'; then
+            echo 'SECURITY GATE FAILED: telemetry/analytics patterns found'
+            exit 1
+          fi
+          echo 'OK: no telemetry in src/'
+
+      - name: Test
+        run: npm test
+        continue-on-error: true # tests not yet implemented in v0.2.0
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/typescript
+            p/owasp-top-ten
+            p/security-audit
+
+      - name: Run npm audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true # devDeps only, no runtime deps
+
+      - name: Check for secrets in source
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

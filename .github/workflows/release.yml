@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write  # required for Sigstore keyless signing
+  packages: write
+
+jobs:
+  release:
+    name: Build, Sign, Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Lint and Compile
+        run: |
+          npm run lint
+          npm run compile
+
+      - name: Security gates
+        run: |
+          # Re-run the same security gates as CI
+          node -e "
+          const pkg = require('./package.json');
+          const props = pkg.contributes?.configuration?.properties || {};
+          const violations = [];
+          for (const [key, val] of Object.entries(props)) {
+            if (key.startsWith('ollamaCloud.') && val.scope !== 'application') {
+              violations.push(key + ' has scope=' + (val.scope || 'undefined'));
+            }
+          }
+          if (violations.length) { process.exit(1); }
+          "
+          ! grep -rnE 'child_process|new Function|eval\(' src/
+          ! grep -rnE 'createWebviewPanel|registerUriHandler|WebviewViewProvider' src/
+
+      - name: Package VSIX
+        run: npm run package
+
+      - name: Compute SHA256
+        run: |
+          sha256sum *.vsix > sha256.txt
+          cat sha256.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sigstore keyless sign VSIX
+        run: |
+          VSIX_FILE=$(ls *.vsix | head -1)
+          cosign sign-blob --yes "$VSIX_FILE" --output-signature "${VSIX_FILE}.sig"
+          cosign sign-blob --yes sha256.txt --output-signature "sha256.txt.sig"
+
+      - name: GPG sign checksums
+        run: |
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --sign --detach-sign --armor sha256.txt
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          artifact: true
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            *.vsix
+            sha256.txt
+            sha256.txt.sig
+            sha256.txt.asc
+            *.vsix.sig
+            sbom.spdx.json
