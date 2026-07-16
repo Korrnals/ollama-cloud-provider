@@ -1,3 +1,4 @@
+import * as vscode from 'vscode';
 import type { CancellationToken } from 'vscode';
 import { assertBaseUrlAllowed } from './configValidator.js';
 import { logger } from './logger.js';
@@ -8,6 +9,15 @@ import type {
   StreamCallbacks,
   UsageInfo,
 } from './protocolTypes.js';
+import {
+  defaultRetryOn,
+  httpErrorFromResponse,
+  withRetry,
+} from './retry.js';
+
+const REQUEST_TIMEOUT_MIN_MS = 5000;
+const REQUEST_TIMEOUT_MAX_MS = 600000;
+const REQUEST_TIMEOUT_DEFAULT_MS = 120000;
 
 interface OpenAIStreamChunk {
   choices?: Array<{
@@ -52,10 +62,25 @@ export class OllamaClient {
     callbacks: StreamCallbacks,
     cancellationToken?: CancellationToken,
   ): Promise<void> {
+    // Issue 14 — per-request timeout. The controller lives for the
+    // whole stream: both the initial connection AND the streaming
+    // duration are bounded. A hung stream is worse than a cancelled
+    // one, so the timeout applies end-to-end.
     const controller = new AbortController();
+    const requestTimeoutMs = resolveRequestTimeoutMs();
+    const timeoutHandle = setTimeout(() => {
+      logger.error(
+        `Ollama Cloud: request timed out after ${requestTimeoutMs}ms`,
+      );
+      controller.abort();
+    }, requestTimeoutMs);
+
+    // Combine the caller's CancellationToken with the timeout: if the
+    // caller cancels, abort. The timeout's abort is wired above.
     const cancelListener = cancellationToken?.onCancellationRequested(() =>
       controller.abort(),
     );
+
     let done = false;
 
     try {
@@ -67,24 +92,59 @@ export class OllamaClient {
       assertBaseUrlAllowed(this.baseUrl);
 
       const { extraBody, ...baseRequest } = request;
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.apiKey}`,
-        },
-        body: JSON.stringify({
-          ...baseRequest,
-          ...extraBody,
-          stream: true,
-          stream_options: { include_usage: true },
-        }),
-        signal: controller.signal,
+      const body = JSON.stringify({
+        ...baseRequest,
+        ...extraBody,
+        stream: true,
+        stream_options: { include_usage: true },
       });
 
-      if (!response.ok) {
-        throw new Error(await extractErrorMessage(response));
-      }
+      // Issue 13 — retry the INITIAL CONNECTION only. Once `fetch`
+      // resolves with an ok Response, streaming begins and we must NOT
+      // retry mid-stream. `withRetry` wraps just the `fetch` + status
+      // check; the body reader loop below is outside the wrapper.
+      // `retryOn` excludes the caller-abort case so a user-cancelled
+      // request does not burn retry budget.
+      const retryOn = (error: unknown): boolean => {
+        // Do not retry when the caller already cancelled — that abort
+        // is permanent for this request, not a transient failure.
+        if (cancellationToken?.isCancellationRequested) {
+          return false;
+        }
+        // Do not retry when our own timeout fired — the timeout is
+        // intentional and retrying would just hit the timeout again.
+        if (error instanceof Error && error.name === 'AbortError') {
+          if (cancellationToken?.isCancellationRequested) {
+            return false;
+          }
+          // Ambiguous AbortError: could be our timeout or a transient
+          // network abort. Default to not retrying to avoid silently
+          // doubling the user's wait; the timeout is the dominant case.
+          return false;
+        }
+        return defaultRetryOn(error);
+      };
+
+      const response = await withRetry(
+        async () => {
+          const res = await fetch(`${this.baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${this.apiKey}`,
+            },
+            body,
+            signal: controller.signal,
+          });
+          if (!res.ok) {
+            const message = await extractErrorMessage(res);
+            throw await httpErrorFromResponse(res, message);
+          }
+          return res;
+        },
+        { retryOn },
+      );
+
       if (!response.body) {
         throw new Error('Ollama Cloud returned no response body.');
       }
@@ -148,6 +208,7 @@ export class OllamaClient {
         error instanceof Error ? error : new Error(String(error)),
       );
     } finally {
+      clearTimeout(timeoutHandle);
       cancelListener?.dispose();
     }
   }
@@ -255,6 +316,25 @@ function flushToolCalls(
     });
   }
   pendingToolCalls.clear();
+}
+
+/**
+ * Issue 14 — reads and clamps `ollamaCloud.requestTimeoutMs`. The
+ * package.json schema already constrains the value, but a workspace
+ * `settings.json` with `minimum`/`maximum` violations is still
+ * possible, so we clamp defensively at the read site.
+ */
+function resolveRequestTimeoutMs(): number {
+  const configured = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<number>('requestTimeoutMs');
+  if (typeof configured !== 'number' || Number.isNaN(configured)) {
+    return REQUEST_TIMEOUT_DEFAULT_MS;
+  }
+  return Math.min(
+    Math.max(configured, REQUEST_TIMEOUT_MIN_MS),
+    REQUEST_TIMEOUT_MAX_MS,
+  );
 }
 
 async function extractErrorMessage(response: Response): Promise<string> {
