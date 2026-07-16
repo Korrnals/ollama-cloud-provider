@@ -1,6 +1,7 @@
 import { AuthManager } from './auth.js';
 import { assertBaseUrlAllowed } from './configValidator.js';
 import { logger } from './logger.js';
+import { httpErrorFromResponse, withRetry } from './retry.js';
 
 const MODELS_ENDPOINT_SUFFIX = '/models';
 const TAGS_ENDPOINT_SUFFIX = '/api/tags';
@@ -540,15 +541,21 @@ async function fetchModelIdsFromOpenAICatalog(
   // function is reached, so the API key is never sent to a non-
   // whitelisted host. Defense in depth: the check lives at the request
   // boundary, not at activation.
-  const response = await fetch(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+  // Issue 13 — wrapped in withRetry for transient 429/5xx/network
+  // failures. This is a one-shot JSON fetch (not a stream), so retrying
+  // the whole call is safe.
+  const response = await withRetry(async () => {
+    const res = await fetch(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+    });
+    if (!res.ok) {
+      throw await httpErrorFromResponse(
+        res,
+        `Model catalog request failed with HTTP ${res.status}.`,
+      );
+    }
+    return res;
   });
-
-  if (!response.ok) {
-    throw new Error(
-      `Model catalog request failed with HTTP ${response.status}.`,
-    );
-  }
 
   const payload = (await response.json()) as { data?: Array<{ id?: string }> };
   const ids = payload.data
@@ -566,15 +573,19 @@ async function fetchModelIdsFromTagsCatalog(
   rootUrl: string,
   apiKey?: string,
 ): Promise<string[]> {
-  const response = await fetch(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+  // Issue 13 — same retry treatment as the OpenAI catalog fetch.
+  const response = await withRetry(async () => {
+    const res = await fetch(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
+    });
+    if (!res.ok) {
+      throw await httpErrorFromResponse(
+        res,
+        `Tags catalog request failed with HTTP ${res.status}.`,
+      );
+    }
+    return res;
   });
-
-  if (!response.ok) {
-    throw new Error(
-      `Tags catalog request failed with HTTP ${response.status}.`,
-    );
-  }
 
   const payload = (await response.json()) as {
     models?: Array<{ model?: string; name?: string }>;

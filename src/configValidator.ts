@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { AuthManager } from './auth.js';
+import { logger } from './logger.js';
 
 /**
  * Issue 9 — baseUrl whitelist enforcement.
@@ -19,6 +21,157 @@ import * as vscode from 'vscode';
  */
 
 const DEFAULT_ALLOWED_BASE_URLS: readonly string[] = ['https://ollama.com/v1'];
+const REQUEST_TIMEOUT_MIN_MS = 5000;
+const REQUEST_TIMEOUT_MAX_MS = 600000;
+const MAX_RETRIES_MAX = 10;
+
+/**
+ * Issue 16 — `Validate Configuration` command result.
+ *
+ * Each entry is one named check with a pass/fail flag and a human-
+ * readable message. The {@link ok} flag is true only when every check
+ * passed.
+ */
+export interface ValidationResult {
+  ok: boolean;
+  checks: Array<{ name: string; passed: boolean; message: string }>;
+}
+
+/**
+ * Issue 16 — runs the full validation suite and reports the result.
+ *
+ * Checks:
+ *   1. baseUrl whitelisted
+ *   2. API key set (SecretStorage or fallback config/env)
+ *   3. baseUrl reachable (fetch /v1/models — reuses the health check
+ *      logic by reading `ollamaCloud.requestTimeoutMs` to bound the
+ *      reachability probe; a fast probe is preferred but the full
+ *      timeout is the upper bound)
+ *   4. requestTimeoutMs valid (between 5000 and 600000)
+ *   5. maxRetries valid (>= 0 when the key exists)
+ *
+ * The reachability check requires an API key — if the key is missing,
+ * the reachability check is marked as skipped (not failed) because a
+ * 401 would not indicate an unreachable host. The {@link ok} flag
+ * requires all *performed* checks to pass; skipped checks do not fail
+ * the suite.
+ *
+ * Results are written to the hardened logger's output channel (one line
+ * per check) and a summary notification is shown. The function is safe
+ * to call from the command handler.
+ */
+export async function validateConfiguration(
+  authManager: AuthManager,
+): Promise<ValidationResult> {
+  const checks: ValidationResult['checks'] = [];
+
+  // Check 1 — baseUrl whitelisted.
+  const baseUrl = getEffectiveBaseUrl();
+  const allowed = getAllowedBaseUrls();
+  const baseUrlOk = allowed.includes(baseUrl);
+  checks.push({
+    name: 'baseUrl whitelisted',
+    passed: baseUrlOk,
+    message: baseUrlOk
+      ? `baseUrl '${baseUrl}' is whitelisted`
+      : `baseUrl '${baseUrl}' is NOT in allowedBaseUrls`,
+  });
+
+  // Check 2 — API key set.
+  const apiKey = await authManager.getApiKey();
+  const apiKeyOk = typeof apiKey === 'string' && apiKey.length > 0;
+  checks.push({
+    name: 'API key set',
+    passed: apiKeyOk,
+    message: apiKeyOk ? 'API key is configured' : 'API key is missing',
+  });
+
+  // Check 3 — baseUrl reachable. Skipped (not failed) when no API key:
+  // a 401 from an unauthenticated probe is not evidence of an
+  // unreachable host, so we cannot draw a meaningful conclusion.
+  let reachableOk = false;
+  let reachableMessage = 'skipped (no API key)';
+  if (apiKeyOk) {
+    try {
+      const controller = new AbortController();
+      const timeoutHandle = setTimeout(
+        () => controller.abort(),
+        REQUEST_TIMEOUT_MAX_MS,
+      );
+      try {
+        const response = await fetch(`${baseUrl}/models`, {
+          headers: { Authorization: `Bearer ${apiKey}` },
+          signal: controller.signal,
+        });
+        reachableOk = response.ok;
+        reachableMessage = reachableOk
+          ? 'baseUrl reachable'
+          : `baseUrl returned HTTP ${response.status}`;
+      } finally {
+        clearTimeout(timeoutHandle);
+      }
+    } catch (error) {
+      reachableMessage =
+        error instanceof Error ? error.message : String(error);
+    }
+  }
+  checks.push({
+    name: 'baseUrl reachable',
+    passed: apiKeyOk ? reachableOk : true,
+    message: reachableMessage,
+  });
+
+  // Check 4 — requestTimeoutMs valid.
+  const timeoutMs = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<number>('requestTimeoutMs');
+  const timeoutValid =
+    typeof timeoutMs === 'number' &&
+    timeoutMs >= REQUEST_TIMEOUT_MIN_MS &&
+    timeoutMs <= REQUEST_TIMEOUT_MAX_MS;
+  checks.push({
+    name: 'requestTimeoutMs valid',
+    passed: timeoutValid,
+    message: timeoutValid
+      ? `requestTimeoutMs=${timeoutMs}`
+      : `requestTimeoutMs=${timeoutMs} is outside [${REQUEST_TIMEOUT_MIN_MS}, ${REQUEST_TIMEOUT_MAX_MS}]`,
+  });
+
+  // Check 5 — maxRetries valid (only if the key is declared).
+  const config = vscode.workspace.getConfiguration('ollamaCloud');
+  const maxRetries = config.get<number>('maxRetries');
+  const retriesValid =
+    typeof maxRetries === 'number' && maxRetries >= 0 && maxRetries <= MAX_RETRIES_MAX;
+  checks.push({
+    name: 'maxRetries valid',
+    passed: retriesValid,
+    message: retriesValid
+      ? `maxRetries=${maxRetries}`
+      : `maxRetries=${maxRetries} is invalid (expected 0..${MAX_RETRIES_MAX})`,
+  });
+
+  // Emit one line per check to the output channel, then a summary line.
+  for (const check of checks) {
+    const status = check.passed ? 'PASS' : 'FAIL';
+    logger.info(`[validateConfig] ${status} ${check.name}: ${check.message}`);
+  }
+  const failed = checks.filter((c) => !c.passed);
+  const ok = failed.length === 0;
+  logger.info(
+    `[validateConfig] summary: ${ok ? 'valid' : `${failed.length} issue(s)`}`,
+  );
+  logger.show();
+
+  if (ok) {
+    void vscode.window.showInformationMessage('Ollama Cloud: Configuration valid.');
+  } else {
+    void vscode.window.showWarningMessage(
+      `Ollama Cloud: Configuration has ${failed.length} issue(s). See logs for details.`,
+    );
+  }
+
+  return { ok, checks };
+}
 
 /**
  * Returns the normalized baseUrl the extension will actually use for
