@@ -11,8 +11,8 @@
 #   6. SBOM (syft if present, else minimal SPDX-JSON fallback)
 #   7. Create annotated git tag (no push yet)
 #   8. Generate release notes (gh or git log fallback)
-#   9. Create GitHub Release + upload artifacts (gh)
-#  10. Push tag to origin
+#   9. Push tag to origin
+#  10. Create GitHub Release + upload artifacts (gh)
 #
 # Usage:
 #   ./scripts/local-ci/run-release-local.sh             # version from package.json
@@ -332,7 +332,7 @@ else
   git tag -a "$VERSION" -m "Release $VERSION_NUM" \
     || fail 7 "git tag creation failed"
 fi
-ok "Tag $VERSION ready (local only; pushed in step 10)"
+ok "Tag $VERSION ready (local only; pushed in step 9)"
 echo
 
 # ─── Step 8: Generate release notes ────────────────────────────────────────
@@ -402,19 +402,29 @@ else
 fi
 echo
 
-# ─── Step 9: Create GitHub Release + upload artifacts ──────────────────────
-step 9 "Create GitHub Release and upload artifacts"
+# ─── Step 9: Push tag ─────────────────────────────────────────────────────
+step 9 "Push tag $VERSION to origin"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: git push origin '$VERSION'"
+else
+  git push origin "$VERSION" || fail 9 "git push tag failed"
+fi
+ok "Tag $VERSION pushed to origin"
+echo
+
+# ─── Step 10: Create GitHub Release + upload artifacts ─────────────────────
+step 10 "Create GitHub Release and upload artifacts"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: gh release create '$VERSION' --title '$VERSION' --notes-file '$NOTES_FILE'"
   echo "  would upload: $VSIX_FILE, sha256.txt, sha256.txt.sig (if exists), sha256.txt.asc, ${VSIX_FILE}.sig (if exists), sbom.spdx.json"
 else
   if ! command -v gh >/dev/null 2>&1; then
-    fail 9 "gh CLI not installed — cannot create GitHub Release. Install: https://cli.github.com/"
+    fail 10 "gh CLI not installed — cannot create GitHub Release. Install: https://cli.github.com/"
   fi
   gh release create "$VERSION" \
     --title "$VERSION" \
     --notes-file "$NOTES_FILE" \
-    || fail 9 "gh release create failed"
+    || fail 10 "gh release create failed"
 
   UPLOAD_ARGS=()
   for f in "$VSIX_FILE" sha256.txt sha256.txt.sig sha256.txt.asc "${VSIX_FILE}.sig" sbom.spdx.json; do
@@ -422,26 +432,16 @@ else
   done
   if [ "${#UPLOAD_ARGS[@]}" -gt 0 ]; then
     gh release upload "$VERSION" "${UPLOAD_ARGS[@]}" --clobber \
-      || fail 9 "gh release upload failed"
+      || fail 10 "gh release upload failed"
   fi
   ok "GitHub Release created: https://github.com/Korrnals/ollama-cloud-provider/releases/tag/${VERSION}"
 fi
 echo
 
-# ─── Step 10: Push tag ─────────────────────────────────────────────────────
-step 10 "Push tag $VERSION to origin"
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  would run: git push origin '$VERSION'"
-else
-  git push origin "$VERSION" || fail 10 "git push tag failed"
-fi
-ok "Tag $VERSION pushed to origin"
-echo
-
 # ─── Step 11: Move artifacts to dist/ ──────────────────────────────────────
 # Release artefacts (VSIX, checksums, signatures, SBOM) are produced in the
 # project root during the build/sign flow because vsce and the signing tools
-# reference them by basename. After the GitHub release upload (step 9) has
+# reference them by basename. After the GitHub release upload (step 10) has
 # consumed them, move everything into dist/ so the project root stays clean
 # and the artefacts have a single, predictable resting place.
 step 11 "Move release artifacts to dist/"
