@@ -157,10 +157,27 @@ echo
 step 5 "GPG detached-sign checksums (L3 — identity, required)"
 
 GPG_KEY_AVAILABLE=0
-GPG_KEY_ID=""
+GPG_SOURCE=""
 
-# Path A: env vars provided (CI portability)
+# Three-path strategy (Option C — most robust):
+#   1. GPG_PRIVATE_KEY + GPG_PASSPHRASE env vars → import + sign with passphrase
+#      (CI portability; existing Path A, already works)
+#   2. GPG_PASSPHRASE only (key already in keyring) → use keyring key +
+#      --pinentry-mode loopback --passphrase (local maintainer workflow)
+#   3. Neither set → try keyring key + --pinentry-mode loopback with empty
+#      passphrase (relies on gpg-agent cache or unprotected key).
+#   4. All fail → clear error telling user how to proceed.
+#
+# Why --pinentry-mode loopback: without it, gpg invokes pinentry-curses
+# (interactive TUI) which fails with "signal Interrupt caught" in a
+# non-interactive terminal. Loopback mode lets gpg read the passphrase
+# from --passphrase / --passphrase-fd instead of spawning a TUI.
+
+GPG_LISTING="$(gpg --list-secret-keys --with-colons 2>/dev/null || true)"
+KEYRING_KEY_ID="$(echo "$GPG_LISTING" | awk -F: '/^sec:/ {print $5; exit}')"
+
 if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_PASSPHRASE:-}" ]; then
+  # Path 1: full env-var flow (CI portability) — import key, sign with passphrase
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  would import GPG_PRIVATE_KEY from env and sign sha256.txt"
   else
@@ -173,28 +190,40 @@ if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_PASSPHRASE:-}" ]; then
   GPG_KEY_AVAILABLE=1
   GPG_SOURCE="env (GPG_PRIVATE_KEY / GPG_PASSPHRASE)"
   ok "L3 GPG signature produced via env-var key"
-else
-  # Path B: check keyring for an already-imported key
-  GPG_LISTING="$(gpg --list-secret-keys --with-colons 2>/dev/null || true)"
-  if echo "$GPG_LISTING" | grep -q '^sec:'; then
-    GPG_KEY_ID="$(echo "$GPG_LISTING" | awk -F: '/^sec:/ {print $5; exit}')"
-    if [ -n "$GPG_KEY_ID" ]; then
-      if [ "$DRY_RUN" -eq 1 ]; then
-        echo "  found key $GPG_KEY_ID in keyring — would sign sha256.txt"
-      else
-        gpg --batch --yes --local-user "$GPG_KEY_ID" \
-          --sign --detach-sign --armor sha256.txt \
-          || fail 5 "gpg sign (keyring key $GPG_KEY_ID) failed"
-      fi
-      GPG_KEY_AVAILABLE=1
-      GPG_SOURCE="keyring (key $GPG_KEY_ID)"
-      ok "L3 GPG signature produced via keyring key $GPG_KEY_ID"
+elif [ -n "${GPG_PASSPHRASE:-}" ] && [ -n "$KEYRING_KEY_ID" ]; then
+  # Path 2: passphrase env var + keyring key — local maintainer workflow
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  found key $KEYRING_KEY_ID in keyring + GPG_PASSPHRASE set — would sign sha256.txt"
+  else
+    printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+      --passphrase-fd 0 --local-user "$KEYRING_KEY_ID" \
+      --sign --detach-sign --armor sha256.txt \
+      || fail 5 "gpg sign (keyring key $KEYRING_KEY_ID + GPG_PASSPHRASE) failed"
+  fi
+  GPG_KEY_AVAILABLE=1
+  GPG_SOURCE="keyring + GPG_PASSPHRASE (key $KEYRING_KEY_ID)"
+  ok "L3 GPG signature produced via keyring key $KEYRING_KEY_ID + GPG_PASSPHRASE"
+elif [ -n "$KEYRING_KEY_ID" ]; then
+  # Path 3: keyring key only — rely on gpg-agent cache or unprotected key.
+  # Empty --passphrase is required so gpg doesn't try to spawn pinentry-curses.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  found key $KEYRING_KEY_ID in keyring — would sign sha256.txt via gpg-agent cache"
+  else
+    if ! printf '' | gpg --batch --yes --pinentry-mode loopback \
+        --passphrase-fd 0 --local-user "$KEYRING_KEY_ID" \
+        --sign --detach-sign --armor sha256.txt 2>/tmp/gpg-sign.err; then
+      err "gpg sign (keyring key $KEYRING_KEY_ID, gpg-agent cache) failed:"
+      sed 's/^/    /' /tmp/gpg-sign.err >&2
+      fail 5 "GPG passphrase required. Set GPG_PASSPHRASE env var, or cache the passphrase in gpg-agent (gpg --sign once interactively), or set GPG_PRIVATE_KEY + GPG_PASSPHRASE for CI flow."
     fi
   fi
+  GPG_KEY_AVAILABLE=1
+  GPG_SOURCE="keyring (key $KEYRING_KEY_ID, gpg-agent cache)"
+  ok "L3 GPG signature produced via keyring key $KEYRING_KEY_ID (gpg-agent cache)"
 fi
 
 if [ "$GPG_KEY_AVAILABLE" -ne 1 ]; then
-  fail 5 "GPG key required for L3 signing. Set GPG_PRIVATE_KEY and GPG_PASSPHRASE env vars, or import a key into the gpg keyring."
+  fail 5 "GPG key required for L3 signing. Options: (a) set GPG_PRIVATE_KEY + GPG_PASSPHRASE env vars (CI flow); (b) import a key into the gpg keyring and set GPG_PASSPHRASE; (c) cache the passphrase in gpg-agent by signing once interactively."
 fi
 ARTIFACTS+=("sha256.txt.asc|L3 GPG detached signature")
 echo
@@ -407,6 +436,39 @@ else
   git push origin "$VERSION" || fail 10 "git push tag failed"
 fi
 ok "Tag $VERSION pushed to origin"
+echo
+
+# ─── Step 11: Move artifacts to dist/ ──────────────────────────────────────
+# Release artefacts (VSIX, checksums, signatures, SBOM) are produced in the
+# project root during the build/sign flow because vsce and the signing tools
+# reference them by basename. After the GitHub release upload (step 9) has
+# consumed them, move everything into dist/ so the project root stays clean
+# and the artefacts have a single, predictable resting place.
+step 11 "Move release artifacts to dist/"
+DIST_DIR="$REPO_ROOT/dist"
+RELEASE_ARTIFACTS=(
+  "$VSIX_FILE"
+  "${VSIX_FILE}.sig"
+  "sha256.txt"
+  "sha256.txt.sig"
+  "sha256.txt.asc"
+  "sbom.spdx.json"
+)
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would create: $DIST_DIR"
+  printf "  would move: %s\n" "${RELEASE_ARTIFACTS[@]}"
+else
+  mkdir -p "$DIST_DIR"
+  MOVED=0
+  for f in "${RELEASE_ARTIFACTS[@]}"; do
+    if [ -f "$REPO_ROOT/$f" ]; then
+      mv -f "$REPO_ROOT/$f" "$DIST_DIR/$f"
+      MOVED=$((MOVED + 1))
+    fi
+  done
+  echo "  moved $MOVED artefact(s) to $DIST_DIR/"
+fi
+ok "Artifacts staged in dist/"
 echo
 
 # ─── Summary ───────────────────────────────────────────────────────────────
