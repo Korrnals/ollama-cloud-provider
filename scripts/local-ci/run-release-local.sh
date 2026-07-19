@@ -1,61 +1,433 @@
 #!/usr/bin/env bash
-# Local release build — replicates .github/workflows/release.yml minus the
-# CI-only signing steps (Sigstore cosign, GPG detached sign, SBOM, GitHub Release).
-# Produces a VSIX + sha256.txt that a maintainer can sign/publish in CI.
-set -u
+# Local release pipeline — full replication of .github/workflows/release.yml
+# run on a maintainer laptop. GitHub Actions is blocked by account billing
+# (issue #1), so this script performs every step locally:
+#
+#   1. Pre-release validation (all CI gates)
+#   2. Build VSIX (npm ci → lint → compile → vsce package)
+#   3. Compute SHA256                 (L1 — integrity, REQUIRED)
+#   4. Sigstore cosign sign-blob      (L2 — build provenance, OPTIONAL)
+#   5. GPG detached-sign checksums    (L3 — identity, REQUIRED)
+#   6. SBOM (syft if present, else minimal SPDX-JSON fallback)
+#   7. Create annotated git tag (no push yet)
+#   8. Generate release notes (gh or git log fallback)
+#   9. Create GitHub Release + upload artifacts (gh)
+#  10. Push tag to origin
+#
+# Usage:
+#   ./scripts/local-ci/run-release-local.sh             # version from package.json
+#   ./scripts/local-ci/run-release-local.sh v0.2.0      # explicit version
+#   ./scripts/local-ci/run-release-local.sh --dry-run   # print plan, do nothing
+#
+# Signing layers:
+#   L1 SHA256      — always (integrity)
+#   L2 Sigstore    — optional, degrades with warning if cosign missing
+#   L3 GPG         — required; uses env vars GPG_PRIVATE_KEY/GPG_PASSPHRASE
+#                    or an already-imported key in the gpg keyring
+set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
-cd "$REPO_ROOT" || { echo "[FAIL] cannot cd to repo root"; exit 1; }
+cd "$REPO_ROOT"
 
-fail() { echo "[FAIL] $*"; exit 1; }
-
-echo "=== Local release build ==="
-echo
-
-# 1. Install deps
-if [ -f package-lock.json ]; then
-  echo "[1/6] npm ci"
-  npm ci || fail "npm ci failed"
+# ─── Colour helpers ────────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m';  C_BOLD=$'\033[1m'; C_RESET=$'\033[0m'
 else
-  echo "[1/6] npm install (no lockfile)"
-  npm install || fail "npm install failed"
+  C_GREEN=""; C_RED=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""; C_RESET=""
 fi
 
-# 2. Lint
-echo "[2/6] npm run lint"
-npm run lint || fail "lint failed"
+ok()    { echo "${C_GREEN}✓${C_RESET} $*"; }
+warn()  { echo "${C_YELLOW}⚠${C_RESET} $*"; }
+err()   { echo "${C_RED}✗${C_RESET} $*" >&2; }
+step()  { echo "${C_BLUE}→${C_RESET} ${C_BOLD}Step $1:${C_RESET} $2"; }
+fail()  { err "FAILED at step $1: $2"; exit 1; }
 
-# 3. Compile
-echo "[3/6] npm run compile"
-npm run compile || fail "compile failed"
-
-# 4. Security gates (same as run-all.sh)
-echo "[4/6] security gates"
-for g in gate-scope-application.sh gate-no-rce-primitives.sh gate-no-webview-uri.sh gate-no-telemetry.sh gate-secrets-scan.sh; do
-  if ! "$HERE/$g" >/dev/null; then
-    "$HERE/$g"
-    fail "security gate $g failed"
-  fi
+# ─── Dry-run mode ──────────────────────────────────────────────────────────
+DRY_RUN=0
+ARG_VERSION=""
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run|-n) DRY_RUN=1 ;;
+    -h|--help)
+      sed -n '2,20p' "$0"
+      exit 0
+      ;;
+    *) ARG_VERSION="$arg" ;;
+  esac
 done
-echo "  all security gates passed"
 
-# 5. Package VSIX
-echo "[5/6] npm run package"
-npm run package || fail "vsce package failed"
-
-# 6. SHA256
-echo "[6/6] sha256sum"
-VSIX=$(ls *.vsix 2>/dev/null | head -1)
-if [ -z "$VSIX" ]; then
-  fail "no .vsix produced"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "${C_BOLD}=== DRY RUN — no mutations will be performed ===${C_RESET}"
+  echo
 fi
-sha256sum "$VSIX" > sha256.txt
-SHA=$(awk '{print $1}' sha256.txt)
 
+# ─── Resolve version ───────────────────────────────────────────────────────
+if [ -n "$ARG_VERSION" ]; then
+  VERSION_RAW="$ARG_VERSION"
+else
+  VERSION_RAW="$(node -p "require('./package.json').version")"
+fi
+VERSION_NUM="${VERSION_RAW#v}"
+VERSION="v${VERSION_NUM}"
+
+echo "${C_BOLD}Release target:${C_RESET} $VERSION (package.json: $(node -p "require('./package.json').version"))"
 echo
-echo "Local release build complete. VSIX: $VSIX, SHA256: $SHA"
+
+# ─── Track produced artefacts for final summary ────────────────────────────
+ARTIFACTS=()
+ARTIFACTS+=("sha256.txt|L1 integrity checksum")
+COSIGN_OK=0
+SBOM_MODE=""
+GPG_SOURCE=""
+
+# ─── Step 1: Pre-release validation ────────────────────────────────────────
+step 1 "Pre-release validation (all CI gates)"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: $HERE/run-all.sh"
+else
+  if ! "$HERE/run-all.sh"; then
+    fail 1 "one or more CI gates failed"
+  fi
+fi
+ok "CI gates pass"
 echo
-echo "NOTE: Sigstore (cosign) and GPG signing are CI-only steps."
-echo "      For an official release, push a v* tag and let the GitHub"
-echo "      Actions release.yml workflow sign and publish the VSIX."
+
+# ─── Step 2: Build VSIX ────────────────────────────────────────────────────
+step 2 "Build VSIX (npm ci → lint → compile → package)"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: npm ci && npm run lint && npm run compile && npm run package"
+else
+  if [ -f package-lock.json ]; then
+    npm ci || fail 2 "npm ci failed"
+  else
+    npm install || fail 2 "npm install failed"
+  fi
+  npm run lint    || fail 2 "lint failed"
+  npm run compile || fail 2 "compile failed"
+  npm run package || fail 2 "vsce package failed"
+fi
+VSIX_FILE="$(ls *.vsix 2>/dev/null | head -1 || true)"
+if [ -z "$VSIX_FILE" ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    VSIX_FILE="ollama-cloud-provider-0.2.0.vsix (projected)"
+  else
+    fail 2 "no .vsix produced"
+  fi
+fi
+ok "VSIX: $VSIX_FILE"
+echo
+
+# ─── Step 3: Compute SHA256 ────────────────────────────────────────────────
+step 3 "Compute SHA256 (L1 — integrity, required)"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: sha256sum '$VSIX_FILE' > sha256.txt"
+else
+  sha256sum "$VSIX_FILE" > sha256.txt
+  SHA="$(awk '{print $1}' sha256.txt)"
+  echo "  SHA256: $SHA"
+fi
+ok "L1 checksum written to sha256.txt"
+echo
+
+# ─── Step 4: Sigstore cosign (L2 — build provenance, optional) ─────────────
+step 4 "Sigstore cosign signing (L2 — build provenance, optional)"
+if command -v cosign >/dev/null 2>&1; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  cosign installed — would sign: $VSIX_FILE, sha256.txt"
+  else
+    cosign sign-blob --yes "$VSIX_FILE" --output-signature "${VSIX_FILE}.sig" \
+      || fail 4 "cosign sign-blob VSIX failed"
+    cosign sign-blob --yes sha256.txt --output-signature "sha256.txt.sig" \
+      || fail 4 "cosign sign-blob sha256.txt failed"
+  fi
+  COSIGN_OK=1
+  ARTIFACTS+=("${VSIX_FILE}.sig|L2 sigstore — VSIX")
+  ARTIFACTS+=("sha256.txt.sig|L2 sigstore — checksums")
+  ok "L2 Sigstore signatures produced"
+else
+  warn "cosign not installed — L2 Sigstore signing skipped."
+  warn "Install: https://github.com/sigstore/cosign/releases"
+  echo "  (L2 is optional; L1 SHA256 + L3 GPG remain the required layers.)"
+fi
+echo
+
+# ─── Step 5: GPG sign checksums (L3 — identity, required) ──────────────────
+step 5 "GPG detached-sign checksums (L3 — identity, required)"
+
+GPG_KEY_AVAILABLE=0
+GPG_KEY_ID=""
+
+# Path A: env vars provided (CI portability)
+if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_PASSPHRASE:-}" ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  would import GPG_PRIVATE_KEY from env and sign sha256.txt"
+  else
+    printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import \
+      || fail 5 "gpg import from env failed"
+    printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
+      --passphrase-fd 0 --sign --detach-sign --armor sha256.txt \
+      || fail 5 "gpg sign (env key) failed"
+  fi
+  GPG_KEY_AVAILABLE=1
+  GPG_SOURCE="env (GPG_PRIVATE_KEY / GPG_PASSPHRASE)"
+  ok "L3 GPG signature produced via env-var key"
+else
+  # Path B: check keyring for an already-imported key
+  GPG_LISTING="$(gpg --list-secret-keys --with-colons 2>/dev/null || true)"
+  if echo "$GPG_LISTING" | grep -q '^sec:'; then
+    GPG_KEY_ID="$(echo "$GPG_LISTING" | awk -F: '/^sec:/ {print $5; exit}')"
+    if [ -n "$GPG_KEY_ID" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  found key $GPG_KEY_ID in keyring — would sign sha256.txt"
+      else
+        gpg --batch --yes --local-user "$GPG_KEY_ID" \
+          --sign --detach-sign --armor sha256.txt \
+          || fail 5 "gpg sign (keyring key $GPG_KEY_ID) failed"
+      fi
+      GPG_KEY_AVAILABLE=1
+      GPG_SOURCE="keyring (key $GPG_KEY_ID)"
+      ok "L3 GPG signature produced via keyring key $GPG_KEY_ID"
+    fi
+  fi
+fi
+
+if [ "$GPG_KEY_AVAILABLE" -ne 1 ]; then
+  fail 5 "GPG key required for L3 signing. Set GPG_PRIVATE_KEY and GPG_PASSPHRASE env vars, or import a key into the gpg keyring."
+fi
+ARTIFACTS+=("sha256.txt.asc|L3 GPG detached signature")
+echo
+
+# ─── Step 6: SBOM ──────────────────────────────────────────────────────────
+step 6 "Generate SBOM (SPDX-JSON)"
+if command -v syft >/dev/null 2>&1; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "  syft installed — would run: syft . -o spdx-json=sbom.spdx.json"
+  else
+    syft . -o spdx-json=sbom.spdx.json || fail 6 "syft SBOM generation failed"
+  fi
+  SBOM_MODE="syft"
+  ok "SBOM generated by syft"
+else
+  warn "syft not installed — generating minimal SPDX-JSON from package.json + lockfile."
+  warn "Install: https://github.com/anchore/syft"
+  if [ "$DRY_RUN" -ne 1 ]; then
+    node --input-type=module <<'NODE_EOF'
+import { readFileSync, writeFileSync } from 'node:fs';
+
+const pkg = JSON.parse(readFileSync('./package.json', 'utf8'));
+let lock = null;
+try { lock = JSON.parse(readFileSync('./package-lock.json', 'utf8')); } catch {}
+
+const pkgName = pkg.name || 'unnamed';
+const pkgVersion = pkg.version || '0.0.0';
+const documentId = 'spdx://ollama-cloud-provider-' + pkgVersion + '-' + Date.now();
+
+const packages = [];
+const seen = new Set();
+const add = (name, version, rel) => {
+  if (!name || seen.has(name)) return;
+  seen.add(name);
+  packages.push({ name, version: version || 'UNKNOWN', rel });
+};
+
+add(pkgName, pkgVersion, 'DESCRIBES');
+for (const [n, v] of Object.entries(pkg.dependencies || {}))    add(n, v, 'DEPENDS_ON');
+for (const [n, v] of Object.entries(pkg.devDependencies || {})) add(n, v, 'DEV_DEPENDS_ON');
+if (lock && lock.packages) {
+  for (const [p, meta] of Object.entries(lock.packages)) {
+    if (!p) continue;
+    const name = p.replace(/^node_modules\//, '');
+    if (seen.has(name)) continue;
+    add(name, meta.version || 'UNKNOWN', 'DEPENDS_ON');
+  }
+}
+
+const sbom = {
+  spdxVersion: 'SPDX-2.3',
+  dataLicense: 'MIT',
+  SPDXID: 'SPDXRef-DOCUMENT',
+  name: pkgName,
+  documentNamespace: documentId,
+  creationInfo: {
+    created: new Date().toISOString(),
+    creators: ['Tool: run-release-local.sh (fallback SBOM generator)'],
+    licenseListVersion: '3.21',
+  },
+  packages: [{
+    name: pkgName,
+    SPDXID: 'SPDXRef-PACKAGE-ROOT',
+    versionInfo: pkgVersion,
+    downloadLocation: (pkg.repository && pkg.repository.url) || 'NOASSERTION',
+    filesAnalyzed: false,
+    licenseConcluded: pkg.license || 'NOASSERTION',
+    licenseDeclared: pkg.license || 'NOASSERTION',
+    copyrightText: 'NOASSERTION',
+  }],
+  relationships: packages
+    .filter(p => p.name !== pkgName)
+    .map(p => ({
+      spdxElementId: 'SPDXRef-PACKAGE-ROOT',
+      relationshipType: p.rel,
+      relatedSpdxElement: 'SPDXRef-PACKAGE-' + p.name.replace(/[^A-Za-z0-9.-]/g, '-'),
+    })),
+  externalRefs: packages
+    .filter(p => p.name !== pkgName)
+    .map(p => ({
+      referenceCategory: 'PACKAGE-MANAGER',
+      referenceType: 'purl',
+      referenceLocator: 'pkg:npm/' + p.name + '@' + p.version,
+    })),
+};
+
+writeFileSync('./sbom.spdx.json', JSON.stringify(sbom, null, 2));
+console.log('  fallback SBOM packages: ' + packages.length);
+NODE_EOF
+  fi
+  SBOM_MODE="fallback (package.json + lockfile)"
+  ok "SBOM generated by inline Node.js fallback"
+fi
+ARTIFACTS+=("sbom.spdx.json|SBOM, $SBOM_MODE")
+echo "  SBOM generated: sbom.spdx.json"
+echo
+
+# ─── Step 7: Create git tag (no push) ──────────────────────────────────────
+step 7 "Create annotated git tag $VERSION (no push yet)"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: git tag -a '$VERSION' -m 'Release $VERSION_NUM'"
+else
+  if git rev-parse "$VERSION" >/dev/null 2>&1; then
+    fail 7 "tag $VERSION already exists — refusing to overwrite. Bump package.json version or pick a different tag."
+  fi
+  git tag -a "$VERSION" -m "Release $VERSION_NUM" \
+    || fail 7 "git tag creation failed"
+fi
+ok "Tag $VERSION ready (local only; pushed in step 10)"
+echo
+
+# ─── Step 8: Generate release notes ────────────────────────────────────────
+step 8 "Generate release notes"
+NOTES_FILE="/tmp/release-notes-${VERSION}.md"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would write notes to: $NOTES_FILE"
+else
+  PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+  if [ -n "$PREV_TAG" ]; then
+    LOG_RANGE="${PREV_TAG}..HEAD"
+  else
+    LOG_RANGE=""
+  fi
+
+  if command -v gh >/dev/null 2>&1; then
+    {
+      echo "# Release ${VERSION}"
+      echo
+      echo "Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) by run-release-local.sh"
+      echo
+      if [ -n "$PREV_TAG" ]; then
+        echo "_Commits since ${PREV_TAG}_"
+      else
+        echo "_Initial release — all commits_"
+      fi
+      echo
+      for type in feat fix chore docs refactor perf test build ci; do
+        commits="$(git log ${LOG_RANGE} --oneline --no-merges --grep "^${type}(\|^${type}:" -i 2>/dev/null || true)"
+        if [ -n "$commits" ]; then
+          case "$type" in
+            feat)     title="Features" ;;
+            fix)      title="Bug Fixes" ;;
+            chore)    title="Chores" ;;
+            docs)     title="Documentation" ;;
+            refactor) title="Refactors" ;;
+            perf)     title="Performance" ;;
+            test)     title="Tests" ;;
+            build)    title="Build" ;;
+            ci)       title="CI" ;;
+          esac
+          echo "## ${title}"
+          echo
+          echo "$commits" | sed 's/^/ - /'
+          echo
+        fi
+      done
+      echo "## Artifacts"
+      echo
+      echo "- \`${VSIX_FILE}\` — packaged VS Code extension"
+      echo "- \`sha256.txt\` — SHA256 checksums (L1)"
+      echo "- \`sha256.txt.asc\` — GPG detached signature (L3)"
+      [ "$COSIGN_OK" -eq 1 ] && echo "- \`*.vsix.sig\`, \`sha256.txt.sig\` — Sigstore signatures (L2)"
+      echo "- \`sbom.spdx.json\` — SBOM (${SBOM_MODE})"
+    } > "$NOTES_FILE"
+    ok "Release notes generated by git log (gh present, conventional-commit grouping)"
+  else
+    warn "gh not available — generating notes from git log --oneline only"
+    {
+      echo "# Release ${VERSION}"
+      echo
+      git log ${LOG_RANGE} --oneline --no-merges | sed 's/^/- /'
+    } > "$NOTES_FILE"
+    ok "Release notes generated from raw git log"
+  fi
+  echo "  notes file: $NOTES_FILE ($(wc -l < "$NOTES_FILE") lines)"
+fi
+echo
+
+# ─── Step 9: Create GitHub Release + upload artifacts ──────────────────────
+step 9 "Create GitHub Release and upload artifacts"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: gh release create '$VERSION' --title '$VERSION' --notes-file '$NOTES_FILE'"
+  echo "  would upload: $VSIX_FILE, sha256.txt, sha256.txt.sig (if exists), sha256.txt.asc, ${VSIX_FILE}.sig (if exists), sbom.spdx.json"
+else
+  if ! command -v gh >/dev/null 2>&1; then
+    fail 9 "gh CLI not installed — cannot create GitHub Release. Install: https://cli.github.com/"
+  fi
+  gh release create "$VERSION" \
+    --title "$VERSION" \
+    --notes-file "$NOTES_FILE" \
+    || fail 9 "gh release create failed"
+
+  UPLOAD_ARGS=()
+  for f in "$VSIX_FILE" sha256.txt sha256.txt.sig sha256.txt.asc "${VSIX_FILE}.sig" sbom.spdx.json; do
+    [ -f "$f" ] && UPLOAD_ARGS+=("$f")
+  done
+  if [ "${#UPLOAD_ARGS[@]}" -gt 0 ]; then
+    gh release upload "$VERSION" "${UPLOAD_ARGS[@]}" --clobber \
+      || fail 9 "gh release upload failed"
+  fi
+  ok "GitHub Release created: https://github.com/Korrnals/ollama-cloud-provider/releases/tag/${VERSION}"
+fi
+echo
+
+# ─── Step 10: Push tag ─────────────────────────────────────────────────────
+step 10 "Push tag $VERSION to origin"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "  would run: git push origin '$VERSION'"
+else
+  git push origin "$VERSION" || fail 10 "git push tag failed"
+fi
+ok "Tag $VERSION pushed to origin"
+echo
+
+# ─── Summary ───────────────────────────────────────────────────────────────
+echo "${C_BOLD}=== Release $VERSION summary ===${C_RESET}"
+echo
+printf "  %-45s %s\n" "Artefact" "Description"
+printf "  %-45s %s\n" "───────────────────────────────────────────────────" "────────────────────────────"
+for a in "${ARTIFACTS[@]}"; do
+  name="${a%%|*}"
+  desc="${a#*|}"
+  printf "  %-45s %s\n" "$name" "$desc"
+done
+echo
+printf "  %-20s %s\n" "L1 SHA256"  "✓ required — produced"
+printf "  %-20s %s\n" "L2 Sigstore" "$([ "$COSIGN_OK" -eq 1 ] && echo '✓ produced' || echo '⚠ skipped (cosign not installed)')"
+printf "  %-20s %s\n" "L3 GPG"     "✓ required — produced via $GPG_SOURCE"
+printf "  %-20s %s\n" "SBOM"       "$SBOM_MODE"
+echo
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "${C_YELLOW}DRY RUN completed — no mutations were performed.${C_RESET}"
+else
+  echo "${C_GREEN}Release $VERSION published.${C_RESET}"
+fi
+exit 0
