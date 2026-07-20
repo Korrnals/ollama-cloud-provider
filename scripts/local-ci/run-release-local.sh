@@ -176,10 +176,32 @@ GPG_SOURCE=""
 GPG_LISTING="$(gpg --list-secret-keys --with-colons 2>/dev/null || true)"
 KEYRING_KEY_ID="$(echo "$GPG_LISTING" | awk -F: '/^sec:/ {print $5; exit}')"
 
+# Decode GPG_PASSPHRASE if it is base64-encoded. The user may store the
+# passphrase base64-encoded in ~/.bashrc to avoid accidental shoulder-surf
+# leakage. gpg needs the decoded plaintext value, so we transparently decode
+# here. Safety: NEVER print the passphrase value (neither base64 nor
+# decoded) — only a one-word hint for debugging.
+GPG_PASSPHRASE_ENCODING="unset"
+if [ -n "${GPG_PASSPHRASE:-}" ]; then
+  DECODED_PASSPHRASE=""
+  if DECODED_PASSPHRASE=$(printf '%s' "$GPG_PASSPHRASE" | base64 -d 2>/dev/null) \
+      && [ -n "$DECODED_PASSPHRASE" ] \
+      && [ "$DECODED_PASSPHRASE" != "$GPG_PASSPHRASE" ] \
+      && ! printf '%s' "$DECODED_PASSPHRASE" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+    # base64 decode succeeded, produced a different value, and the result
+    # is printable ASCII (not arbitrary binary). Use the decoded value.
+    GPG_PASSPHRASE="$DECODED_PASSPHRASE"
+    GPG_PASSPHRASE_ENCODING="base64 (decoded)"
+  else
+    GPG_PASSPHRASE_ENCODING="plaintext"
+  fi
+fi
+
 if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_PASSPHRASE:-}" ]; then
   # Path 1: full env-var flow (CI portability) — import key, sign with passphrase
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  would import GPG_PRIVATE_KEY from env and sign sha256.txt"
+    echo "  GPG_PASSPHRASE: $GPG_PASSPHRASE_ENCODING"
   else
     printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import \
       || fail 5 "gpg import from env failed"
@@ -194,6 +216,7 @@ elif [ -n "${GPG_PASSPHRASE:-}" ] && [ -n "$KEYRING_KEY_ID" ]; then
   # Path 2: passphrase env var + keyring key — local maintainer workflow
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  found key $KEYRING_KEY_ID in keyring + GPG_PASSPHRASE set — would sign sha256.txt"
+    echo "  GPG_PASSPHRASE: $GPG_PASSPHRASE_ENCODING"
   else
     printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
       --passphrase-fd 0 --local-user "$KEYRING_KEY_ID" \
