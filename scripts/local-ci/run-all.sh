@@ -42,6 +42,7 @@ run_gate "No webview/URI"     "$HERE/gate-no-webview-uri.sh"
 run_gate "No telemetry"       "$HERE/gate-no-telemetry.sh"
 run_gate "Secrets scan"       "$HERE/gate-secrets-scan.sh"
 run_gate "npm audit"          "$HERE/gate-npm-audit.sh"
+run_gate "Tests"              "$HERE/gate-test.sh"
 
 # Summary table
 echo
