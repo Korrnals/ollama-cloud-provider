@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="Ollama Cloud Provider banner">
+  <defs>
+    <linearGradient id="bgBanner" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0D1117"/>
+      <stop offset="100%" stop-color="#161B22"/>
+    </linearGradient>
+    <linearGradient id="cloudGradB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F4F4F4"/>
+      <stop offset="100%" stop-color="#D2D2D2"/>
+    </linearGradient>
+    <linearGradient id="shieldGradB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3FB950"/>
+      <stop offset="100%" stop-color="#1A7F37"/>
+    </linearGradient>
+    <linearGradient id="accentLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#3FB950" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#3FB950" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#3FB950" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="320" fill="url(#bgBanner)"/>
+
+  <!-- Subtle accent line under header -->
+  <rect x="80" y="232" width="1040" height="2" fill="url(#accentLine)"/>
+
+  <!-- Icon motif: cloud + shield (left side, vertically centered) -->
+  <g transform="translate(96, 96) scale(1.25)">
+    <path d="
+      M 16 64
+      C 6 64 -2 56 -2 46
+      C -2 37 5 30 14 29
+      C 16 16 28 6 42 6
+      C 56 6 68 17 70 31
+      C 80 32 88 40 88 50
+      C 88 60 80 66 70 66
+      L 16 66
+      Z
+    " fill="url(#cloudGradB)" stroke="#8B949E" stroke-width="2" stroke-linejoin="round"/>
+
+    <path d="
+      M 60 60
+      L 60 84
+      C 60 96 72 104 84 108
+      C 96 104 108 96 108 84
+      L 108 60
+      L 84 53
+      Z
+    " fill="url(#shieldGradB)" stroke="#0D1117" stroke-width="2" stroke-linejoin="round"/>
+
+    <rect x="74" y="77" width="20" height="16" rx="3" fill="#0D1117"/>
+    <path d="M 78 77 L 78 71 C 78 67 82 64 84 64 C 86 64 90 67 90 71 L 90 77"
+          fill="none" stroke="#0D1117" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="84" cy="85" r="2" fill="#3FB950"/>
+  </g>
+
+  <!-- Title -->
+  <text x="280" y="160" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="64" font-weight="700" fill="#F0F6FC" text-rendering="geometricPrecision">
+    Ollama Cloud Provider
+  </text>
+
+  <!-- Subtitle -->
+  <text x="280" y="208" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="28" font-weight="400" fill="#8B949E" text-rendering="geometricPrecision">
+    Security-hardened fork · VS Code language model provider
+  </text>
+
+  <!-- Badge: Marketplace context -->
+  <g transform="translate(280, 248)">
+    <rect x="0" y="0" width="148" height="32" rx="16" fill="#21262D" stroke="#30363D" stroke-width="1"/>
+    <circle cx="18" cy="16" r="5" fill="#3FB950"/>
+    <text x="32" y="22" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="16" font-weight="500" fill="#C9D1D9">
+      VS Code Extension
+    </text>
+  </g>
+  <g transform="translate(440, 248)">
+    <rect x="0" y="0" width="196" height="32" rx="16" fill="#21262D" stroke="#30363D" stroke-width="1"/>
+    <text x="16" y="22" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="16" font-weight="500" fill="#C9D1D9">
+      Copilot Chat · OpenAI-compatible
+    </text>
+  </g>
+</svg>
