@@ -23,6 +23,8 @@ function makeModel(
     family,
     version: 'test',
     detail: 'test',
+    connectionId: 'cloud',
+    origin: 'Cloud',
     maxInputTokens: 131072,
     maxOutputTokens: 32768,
     reasoning,

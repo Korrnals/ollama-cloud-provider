@@ -3,7 +3,61 @@ import type {
   OpenAICompatibleMessage,
   OpenAICompatibleTool,
   OpenAICompatibleToolCall,
+  OpenAIContentPart,
 } from './protocolTypes.js';
+
+/**
+ * Returns true when the message's content array contains at least one
+ * `vscode.LanguageModelDataPart` with an `image/*` mime type. Used by
+ * the provider to detect image-bearing requests and reject them when
+ * the selected model does not support vision.
+ *
+ * The duck-typing fallback mirrors the canonical `LanguageModelDataPart`
+ * shape so the stub-based tests can construct data parts without a real
+ * `vscode.LanguageModelDataPart` constructor.
+ */
+export function hasImageParts(
+  content: readonly unknown[],
+): boolean {
+  return content.some(isImageDataPart);
+}
+
+/**
+ * Returns true if `part` is an `image/*` data part — either a real
+ * `vscode.LanguageModelDataPart` or a duck-typed object with `mimeType`
+ * (string starting with `image/`) and `data` (Uint8Array).
+ */
+export function isImageDataPart(
+  part: unknown,
+): boolean {
+  return isDataPart(part) && part.mimeType.toLowerCase().startsWith('image/');
+}
+
+function isDataPart(
+  part: unknown,
+): part is vscode.LanguageModelDataPart {
+  if (part instanceof vscode.LanguageModelDataPart) {
+    return true;
+  }
+  if (!part || typeof part !== 'object') {
+    return false;
+  }
+  const candidate = part as { mimeType?: unknown; data?: unknown };
+  return (
+    typeof candidate.mimeType === 'string' &&
+    candidate.data instanceof Uint8Array
+  );
+}
+
+/**
+ * Converts a `LanguageModelDataPart` (image) to a `data:` URL — the
+ * form the OpenAI-compatible chat completions endpoint expects in the
+ * `image_url.url` field. The base64 encoding is deterministic and
+ * synchronous; large images still go through `Buffer.from(...).toString('base64')`.
+ */
+export function toDataUrl(part: vscode.LanguageModelDataPart): string {
+  return `data:${part.mimeType};base64,${Buffer.from(part.data).toString('base64')}`;
+}
 
 export function convertMessagesToOpenAI(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -13,6 +67,7 @@ export function convertMessagesToOpenAI(
   for (const message of messages) {
     const role = mapRole(message.role);
     let text = '';
+    const imageParts: OpenAIContentPart[] = [];
     const toolCalls: OpenAICompatibleToolCall[] = [];
     const toolResults: Array<{ callId: string; content: string }> = [];
 
@@ -36,6 +91,17 @@ export function convertMessagesToOpenAI(
           content: serializeToolResultContent(part.content),
         });
       }
+
+      // Vision — collect image parts. They are emitted into the
+      // user message's `content` array only (assistant/tool messages
+      // stay text-only). The provider's vision gate rejects images
+      // for text-only models BEFORE this function is reached.
+      if (isImageDataPart(part) && role === 'user') {
+        imageParts.push({
+          type: 'image_url',
+          image_url: { url: toDataUrl(part as vscode.LanguageModelDataPart) },
+        });
+      }
     }
 
     if (role === 'assistant') {
@@ -46,6 +112,16 @@ export function convertMessagesToOpenAI(
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         });
       }
+    } else if (imageParts.length > 0) {
+      // User message with images: content becomes an array of text +
+      // image parts. If there is no text, emit a single empty text
+      // part so the message is not empty (OpenAI requires content).
+      const parts: OpenAIContentPart[] = [];
+      if (text) {
+        parts.push({ type: 'text', text });
+      }
+      parts.push(...imageParts);
+      result.push({ role, content: parts });
     } else if (text) {
       result.push({ role, content: text });
     }
@@ -101,7 +177,7 @@ export function countOpenAIRequestChars(
   let total = 0;
 
   for (const message of messages) {
-    total += message.content?.length ?? 0;
+    total += contentLength(message.content);
     total += message.tool_call_id?.length ?? 0;
 
     for (const toolCall of message.tool_calls ?? []) {
@@ -111,6 +187,33 @@ export function countOpenAIRequestChars(
     }
   }
 
+  return total;
+}
+
+/**
+ * Returns the character length of an `OpenAIChatContent` value. For a
+ * string, returns its length. For an array of parts, sums the lengths
+ * of each part's text or image_url.url field. For `null`, returns 0.
+ *
+ * The image URL includes the full base64 payload — counting its length
+ * gives a conservative (high) estimate of the request size, which is
+ * what the token estimator wants (images cost many tokens).
+ */
+function contentLength(content: OpenAICompatibleMessage['content']): number {
+  if (content === null || content === undefined) {
+    return 0;
+  }
+  if (typeof content === 'string') {
+    return content.length;
+  }
+  let total = 0;
+  for (const part of content) {
+    if (part.type === 'text') {
+      total += part.text.length;
+    } else {
+      total += part.image_url.url.length;
+    }
+  }
   return total;
 }
 

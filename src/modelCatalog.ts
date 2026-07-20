@@ -1,5 +1,12 @@
 import { AuthManager } from './auth.js';
-import { assertBaseUrlAllowed } from './configValidator.js';
+import { assertBaseUrlAllowed, assertBaseUrlAllowedForConnection } from './configValidator.js';
+import {
+  connectionOriginLabel,
+  type ConnectionConfig,
+  modelIdPrefix,
+  openAiBaseUrl,
+  rootUrlForConnection,
+} from './connections.js';
 import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
 
@@ -18,6 +25,20 @@ export interface ModelDefinition {
   family: string;
   version: string;
   detail: string;
+  /**
+   * Connection id this model belongs to. Cloud connection uses the
+   * legacy `ollama-cloud/` id prefix (no connection segment in the id),
+   * so this field is the source of truth for which connection owns a
+   * model. `provider.ts` reads this to resolve the connection when
+   * streaming a chat request.
+   */
+  connectionId: string;
+  /**
+   * Origin label shown in the model picker — e.g. `Cloud`, `Local`,
+   * `VPS`, `custom`. The provider prepends it to the model name so
+   * the picker shows `Cloud:gpt-oss:120b`, `Local:llama3:8b`, etc.
+   */
+  origin: string;
   maxInputTokens: number;
   maxOutputTokens: number;
   reasoning: boolean;
@@ -456,6 +477,55 @@ export class ModelCatalog {
     return { changed, count: nextModels.length };
   }
 
+  /**
+   * Multi-connection refresh — discovers models for every connection in
+   * `connections`, merges them with the known snapshot models, and
+   * returns the merged list. Cloud connection models keep the legacy
+   * `ollama-cloud/<apiModel>` id; non-cloud connection models use
+   * `ollama-cloud/<connectionId>/<apiModel>`.
+   *
+   * Per-connection `allowedBaseUrls` is enforced fail-closed at every
+   * fetch boundary (`assertBaseUrlAllowedForConnection`). If a
+   * connection's baseUrl is not whitelisted, its discovery is skipped
+   * (logged) and its models do not appear — the API key is never sent
+   * to a non-whitelisted host.
+   */
+  async refreshForConnections(
+    connections: readonly ConnectionConfig[],
+  ): Promise<{ changed: boolean; count: number }> {
+    const nextModels: ModelDefinition[] = [...KNOWN_MODELS];
+
+    for (const connection of connections) {
+      try {
+        const ids = await this.fetchModelIdsForConnection(connection);
+        for (const apiModel of ids) {
+          const known = KNOWN_MODEL_MAP.get(apiModel);
+          const model = known
+            ? withConnection(known, connection)
+            : inferModelForConnection(apiModel, connection);
+          // Dedupe by id — if two connections expose the same apiModel,
+          // the connectionId segment in the id makes them distinct.
+          if (!nextModels.some((m) => m.id === model.id)) {
+            nextModels.push(model);
+          }
+        }
+      } catch (error) {
+        // Per-connection failures are logged + skipped — one bad
+        // connection must not break discovery for the others. The
+        // error is already redacted if it came from the HTTP layer
+        // (extractErrorMessage → redactSensitive).
+        logger.warn(
+          `Failed to refresh models for connection '${connection.id}'.`,
+          error,
+        );
+      }
+    }
+
+    const changed = !sameModelIds(this.models, nextModels);
+    this.models = nextModels;
+    return { changed, count: nextModels.length };
+  }
+
   private async fetchModelIds(): Promise<string[]> {
     const apiKey = await this.authManager.getApiKey();
     const baseUrl = this.authManager.getBaseUrl();
@@ -479,6 +549,36 @@ export class ModelCatalog {
 
     return fetchModelIdsFromTagsCatalog(rootUrl, apiKey);
   }
+
+  /**
+   * Per-connection model discovery. Tries the OpenAI `/models`
+   * endpoint first, then falls back to the native Ollama `/api/tags`
+   * endpoint. Each fetch boundary enforces the connection's own
+   * whitelist via `assertBaseUrlAllowedForConnection` — fail-closed.
+   */
+  private async fetchModelIdsForConnection(
+    connection: ConnectionConfig,
+  ): Promise<string[]> {
+    const openaiBase = openAiBaseUrl(connection);
+    const rootUrl = rootUrlForConnection(connection);
+
+    // SEC-03 per-connection gate — the API key for this connection is
+    // never sent to a host not in the connection's own whitelist.
+    assertBaseUrlAllowedForConnection(openaiBase, connection);
+
+    const apiKey = await this.authManager.getApiKeyForConnection(connection);
+
+    try {
+      return await fetchModelIdsFromOpenAICatalog(openaiBase, apiKey);
+    } catch (error) {
+      logger.warn(
+        `Failed to fetch catalog from /v1/models for connection '${connection.id}'. Falling back to /api/tags.`,
+        error,
+      );
+    }
+
+    return fetchModelIdsFromTagsCatalog(rootUrl, apiKey);
+  }
 }
 
 function defineModel(model: SnapshotModelDefinition): ModelDefinition {
@@ -491,6 +591,8 @@ function defineModel(model: SnapshotModelDefinition): ModelDefinition {
     family,
     version: inferVersion(model.apiModel, family),
     detail: DEFAULT_DETAIL,
+    connectionId: 'cloud',
+    origin: 'Cloud',
     maxInputTokens: model.maxInputTokens ?? inferMaxInputTokens(model.apiModel),
     maxOutputTokens:
       model.maxOutputTokens ?? inferMaxOutputTokens(model.apiModel),
@@ -527,6 +629,8 @@ function inferModel(id: string): ModelDefinition {
     family,
     version: inferVersion(id, family),
     detail: DEFAULT_DETAIL,
+    connectionId: 'cloud',
+    origin: 'Cloud',
     maxInputTokens: inferMaxInputTokens(id),
     maxOutputTokens: inferMaxOutputTokens(id),
     reasoning: inferReasoning(id),
@@ -536,6 +640,74 @@ function inferModel(id: string): ModelDefinition {
     },
   };
 }
+
+/**
+ * Adapts a known snapshot model for a non-cloud connection — rewrites
+ * the id prefix and the origin label so the model picker shows the
+ * correct origin. The vision support is re-resolved against the
+ * connection's own `visionModels` patterns (a connection may mark a
+ * model as vision-capable even when the snapshot does not).
+ */
+function withConnection(
+  known: ModelDefinition,
+  connection: ConnectionConfig,
+): ModelDefinition {
+  const prefix = modelIdPrefix(connection);
+  const id = `${prefix}${known.apiModel}`;
+  const origin = connectionOriginLabel(connection);
+  const imageInput = resolveVisionSupport(
+    known,
+    connection.visionModels,
+  );
+  return {
+    ...known,
+    id,
+    connectionId: connection.id,
+    origin,
+    capabilities: { ...known.capabilities, imageInput },
+  };
+}
+
+/**
+ * Infers a `ModelDefinition` for a model discovered on a non-cloud
+ * connection (no snapshot entry). The id is prefixed with the
+ * connection's segment so two connections exposing the same model
+ * name do not collide.
+ */
+function inferModelForConnection(
+  apiModel: string,
+  connection: ConnectionConfig,
+): ModelDefinition {
+  const family = inferFamily(apiModel);
+  const prefix = modelIdPrefix(connection);
+  const id = `${prefix}${apiModel}`;
+  const origin = connectionOriginLabel(connection);
+  const baseImageInput = inferImageInput(apiModel);
+  const imageInput =
+    baseImageInput ||
+    inferVisionSupport(apiModel, family) ||
+    matchesConfiguredVisionModel(apiModel, connection.visionModels);
+
+  return {
+    id,
+    apiModel,
+    name: humanizeModelId(apiModel),
+    family,
+    version: inferVersion(apiModel, family),
+    detail: connection.label,
+    connectionId: connection.id,
+    origin,
+    maxInputTokens: inferMaxInputTokens(apiModel),
+    maxOutputTokens: inferMaxOutputTokens(apiModel),
+    reasoning: inferReasoning(apiModel),
+    capabilities: {
+      imageInput,
+      toolCalling: inferToolCalling(apiModel),
+    },
+  };
+}
+
+
 
 async function fetchModelIdsFromOpenAICatalog(
   baseUrl: string,
@@ -857,6 +1029,98 @@ export function inferImageInput(id: string): boolean {
     id.startsWith('mistral-large-') ||
     id.startsWith('devstral-small-2')
   );
+}
+
+/**
+ * Vision markers — multimodal model families that are image-capable
+ * even when the model id does not match the `inferImageInput` prefix
+ * rules (the family-marker fallback when provider metadata omits
+ * `vision`).
+ *
+ * Covers: bakllava, gemma3, kimi-k2.6, llava, minicpm-v, moondream,
+ * pixtral, qwen-vl, qwen2-vl, qwen2.5-vl, qwen2.5vl, vision, vlm.
+ */
+const VISION_MARKERS: readonly string[] = [
+  'bakllava',
+  'gemma3',
+  'kimi-k2.6',
+  'llava',
+  'minicpm-v',
+  'moondream',
+  'pixtral',
+  'qwen-vl',
+  'qwen2-vl',
+  'qwen2.5vl',
+  'qwen2.5-vl',
+  'vision',
+  'vlm',
+];
+
+/**
+ * Infers vision support from a model id + optional family name. Used
+ * when the catalog does not have explicit `imageInput` metadata —
+ * the family markers catch known multimodal models. Returns true when
+ * any marker appears (case-insensitive) in the id or family.
+ */
+export function inferVisionSupport(id: string, family?: string): boolean {
+  const value = `${id} ${family ?? ''}`.toLowerCase();
+  return VISION_MARKERS.some((marker) => value.includes(marker));
+}
+
+/**
+ * Returns true when `id` matches any wildcard pattern in `patterns`.
+ * Patterns support `*` as a wildcard (matches any sequence, including
+ * empty). Matching is case-insensitive. An empty pattern matches
+ * nothing; `*` matches everything; `kimi-k2.6*` matches `kimi-k2.6`
+ * and `kimi-k2.6:cloud`.
+ */
+export function matchesConfiguredVisionModel(
+  id: string,
+  patterns: readonly string[],
+): boolean {
+  return patterns.some((pattern) => matchesModelWildcard(id, pattern));
+}
+
+function matchesModelWildcard(id: string, pattern: string): boolean {
+  const trimmed = pattern.trim();
+  if (!trimmed) {
+    return false;
+  }
+  // Anchor the pattern at both ends; `*` becomes `.*`. Escape all regex
+  // specials EXCEPT `*` first, so the wildcard substitution can still
+  // find the literal `*` character. (Escaping `*` to `\*` before the
+  // substitution leaves a stray backslash and breaks wildcard matches.)
+  const escaped = trimmed
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*');
+  const re = new RegExp(`^${escaped}$`, 'i');
+  return re.test(id);
+}
+
+/**
+ * Resolves a model's vision support — combines the snapshot metadata
+ * (`imageInput`), the family-marker inference (`inferVisionSupport`),
+ * and the user's manual `visionModels` patterns. This is the single
+ * decision point for "does this model accept images?".
+ *
+ * The `connectionVisionPatterns` parameter is the per-connection
+ * `visionModels` override (or the global list). Pass an empty array
+ * to skip the manual-pattern check.
+ */
+export function resolveVisionSupport(
+  model: Pick<ModelDefinition, 'apiModel' | 'family' | 'capabilities'>,
+  connectionVisionPatterns: readonly string[],
+): boolean {
+  if (model.capabilities.imageInput) {
+    return true;
+  }
+  if (inferVisionSupport(model.apiModel, model.family)) {
+    return true;
+  }
+  if (matchesConfiguredVisionModel(model.apiModel, connectionVisionPatterns)) {
+    return true;
+  }
+  return false;
 }
 
 export function inferToolCalling(id: string): boolean {

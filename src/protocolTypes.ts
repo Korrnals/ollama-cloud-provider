@@ -16,9 +16,23 @@ export interface OpenAICompatibleTool {
   };
 }
 
+/**
+ * Vision support — content parts for OpenAI-compatible chat messages.
+ * A message's `content` can be a plain string OR an array of typed parts
+ * (text + image_url) when the model supports vision.
+ */
+export type OpenAIContentPart =
+  | { type: 'text'; text: string }
+  | {
+      type: 'image_url';
+      image_url: { url: string };
+    };
+
+export type OpenAIChatContent = string | OpenAIContentPart[] | null;
+
 export interface OpenAICompatibleMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | null;
+  content: OpenAIChatContent;
   tool_call_id?: string;
   tool_calls?: OpenAICompatibleToolCall[];
   reasoning_content?: string;

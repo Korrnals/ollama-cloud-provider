@@ -1,6 +1,10 @@
 import * as vscode from 'vscode';
 import type { CancellationToken } from 'vscode';
-import { assertBaseUrlAllowed } from './configValidator.js';
+import {
+  assertBaseUrlAllowed,
+  assertBaseUrlAllowedForConnection,
+} from './configValidator.js';
+import type { ConnectionConfig } from './connections.js';
 import { logger, redactSensitive } from './logger.js';
 import type {
   OpenAICompatibleMessage,
@@ -51,10 +55,53 @@ interface OpenAIStreamChunk {
 }
 
 export class OllamaClient {
+  /**
+   * Optional connection the client is bound to. When set, every fetch
+   * boundary enforces the connection's own `allowedBaseUrls` whitelist
+   * via `assertBaseUrlAllowedForConnection` (the SEC-03 per-connection
+   * gate). When unset, the legacy global whitelist via
+   * `assertBaseUrlAllowed` is enforced — preserving backward
+   * compatibility for the 192 existing tests.
+   */
+  private readonly connection: ConnectionConfig | undefined;
+
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
-  ) {}
+    connection?: ConnectionConfig,
+  ) {
+    this.connection = connection;
+  }
+
+  /**
+   * Returns the effective fetch URL for chat completions —
+   * `baseUrl + openaiCompatiblePath` when bound to a connection, or
+   * `baseUrl` as-is otherwise.
+   */
+  private chatCompletionsUrl(): string {
+    if (this.connection) {
+      const base = this.connection.baseUrl + this.connection.openaiCompatiblePath;
+      return `${base}/chat/completions`;
+    }
+    return `${this.baseUrl}/chat/completions`;
+  }
+
+  /**
+   * Per-connection whitelist gate. Throws synchronously when the
+   * resolved baseUrl is not in the connection's whitelist (or the
+   * global whitelist when no connection is bound). The catch block
+   * surfaces it to the caller via onError.
+   */
+  private assertBaseUrlAllowedOrThrow(): void {
+    if (this.connection) {
+      assertBaseUrlAllowedForConnection(
+        this.connection.baseUrl + this.connection.openaiCompatiblePath,
+        this.connection,
+      );
+    } else {
+      assertBaseUrlAllowed(this.baseUrl);
+    }
+  }
 
   async streamChat(
     request: {
@@ -95,12 +142,13 @@ export class OllamaClient {
     let done = false;
 
     try {
-      // Issue 9 — security boundary: refuse to send the API key to any
-      // baseUrl not in the whitelist. This runs at every request, not
-      // just at activation, so a mid-session config change cannot bypass
-      // it. Throws synchronously — the catch below surfaces it to the
-      // caller via onError.
-      assertBaseUrlAllowed(this.baseUrl);
+      // Issue 9 / SEC-03 — security boundary: refuse to send the API
+      // key to any baseUrl not in the whitelist. This runs at every
+      // request, not just at activation, so a mid-session config
+      // change cannot bypass it. Throws synchronously — the catch
+      // below surfaces it to the caller via onError. When bound to a
+      // connection, the connection's OWN whitelist is enforced.
+      this.assertBaseUrlAllowedOrThrow();
 
       const { extraBody, ...baseRequest } = request;
       const body = JSON.stringify({
@@ -138,12 +186,15 @@ export class OllamaClient {
 
       const response = await withRetry(
         async () => {
-          const res = await fetch(`${this.baseUrl}/chat/completions`, {
+          const headers: Record<string, string> = {
+            'Content-Type': 'application/json',
+          };
+          if (this.apiKey) {
+            headers.Authorization = `Bearer ${this.apiKey}`;
+          }
+          const res = await fetch(this.chatCompletionsUrl(), {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${this.apiKey}`,
-            },
+            headers,
             body,
             signal: controller.signal,
           });
@@ -404,7 +455,7 @@ async function extractErrorMessage(response: Response): Promise<string> {
     if (!body) {
       return `HTTP ${response.status}`;
     }
-    // MEDIUM-1 — the preview is raw upstream body and may carry a
+    // MEDIUM-1 — the preview is raw response body and may carry a
     // reflected secret (e.g. an HTML page echoing the Authorization
     // header). Redact before the preview is embedded in the message
     // that flows to the user-facing notification.
@@ -421,7 +472,7 @@ async function extractErrorMessage(response: Response): Promise<string> {
  * are frequently incomplete until all deltas arrive. A parse failure
  * here is expected during streaming (the caller flushes accumulated
  * arguments at finish_reason), so we do NOT throw — we log the redacted
- * preview and return an empty object, same as upstream.
+ * preview and return an empty object, preserving the streaming contract.
  *
  * This is distinct from `extractErrorMessage`: that handles a full HTTP
  * error body (unexpected → surface). This handles a streamed tool-arg

@@ -1,14 +1,15 @@
 import * as vscode from 'vscode';
 import { AuthManager } from './auth.js';
+import type { ConnectionConfig } from './connections.js';
 import { logger } from './logger.js';
 
 /**
  * Issue 9 — baseUrl whitelist enforcement.
  *
- * Upstream sent the API key to whatever `baseUrl` the user configured.
- * A malicious workspace `.vscode/settings.json` could redirect the key
- * to an attacker-controlled host. This module is the single source of
- * truth for the whitelist check.
+ * Without a whitelist, the API key would be sent to whatever `baseUrl`
+ * the user configured. A malicious workspace `.vscode/settings.json`
+ * could redirect the key to an attacker-controlled host. This module
+ * is the single source of truth for the whitelist check.
  *
  * Defense in depth: every HTTP-emitting module (OllamaClient,
  * ModelCatalog) MUST call `assertBaseUrlAllowed` before `fetch`. The
@@ -240,6 +241,33 @@ export function assertBaseUrlAllowed(baseUrl: string): void {
   if (!allowed.includes(normalized)) {
     throw new Error(
       `Ollama Cloud: baseUrl '${normalized}' is not in allowedBaseUrls whitelist. Add it to ollamaCloud.allowedBaseUrls or use the default.`,
+    );
+  }
+}
+
+/**
+ * Multi-connection variant — asserts that `baseUrl` is in the
+ * connection's OWN `allowedBaseUrls` whitelist. This is the SEC-03
+ * enforcement at per-connection fetch boundaries. Fail-closed: a
+ * non-whitelisted host throws and the API key is never sent.
+ *
+ * Use this in preference to `assertBaseUrlAllowed` when the caller
+ * already resolved a `ConnectionConfig`. The two functions compose:
+ * `assertBaseUrlAllowed` covers the legacy single-connection path,
+ * `assertBaseUrlAllowedForConnection` covers the multi-connection path.
+ *
+ * @throws Error when baseUrl is not in the connection's whitelist.
+ */
+export function assertBaseUrlAllowedForConnection(
+  baseUrl: string,
+  connection: ConnectionConfig,
+): void {
+  const normalized = normalizeBaseUrl(baseUrl);
+  const allowed = connection.allowedBaseUrls.map(normalizeBaseUrl);
+
+  if (!allowed.includes(normalized)) {
+    throw new Error(
+      `Ollama Cloud: baseUrl '${normalized}' is not in the allowedBaseUrls whitelist for connection '${connection.id}'. Add it to the connection's allowedBaseUrls or use the connection's default baseUrl.`,
     );
   }
 }

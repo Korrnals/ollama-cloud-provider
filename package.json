@@ -113,6 +113,66 @@
           "maximum": 10,
           "description": "Maximum number of retries for transient failures (429, 5xx). Uses exponential backoff.",
           "scope": "application"
+        },
+        "ollamaCloud.connections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Stable connection id. Used as the SecretStorage key suffix (ollamaCloud.apiKey.<id>) and the model id prefix."
+              },
+              "label": {
+                "type": "string",
+                "description": "Human-readable label shown in the model picker origin tag."
+              },
+              "type": {
+                "type": "string",
+                "enum": ["cloud", "local", "remote", "custom"],
+                "description": "Connection type. Drives the origin label (Cloud/Local/VPS/custom) and the default allowedBaseUrls."
+              },
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Whether the connection is enabled. Disabled connections are skipped."
+              },
+              "baseUrl": {
+                "type": "string",
+                "description": "OpenAI-compatible base URL (e.g. https://ollama.com/v1, http://localhost:11434)."
+              },
+              "openaiCompatiblePath": {
+                "type": "string",
+                "default": "",
+                "description": "OpenAI-compatible path suffix appended to baseUrl. Defaults to empty (baseUrl already includes /v1)."
+              },
+              "allowedBaseUrls": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Per-connection whitelist. The extension refuses to send the connection's API key to any baseUrl not in this list. Defaults to [baseUrl] (fail-closed)."
+              },
+              "visionModels": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Per-connection vision wildcard patterns. A model id matching any pattern is treated as image-capable."
+              },
+              "requiresApiKey": {
+                "type": "boolean",
+                "description": "Whether an API key is required for this connection. Defaults to true for cloud/remote/custom, false for local."
+              }
+            },
+            "required": ["id", "baseUrl"]
+          },
+          "default": [],
+          "description": "Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint (Cloud, Local, VPS, or custom) with its own allowedBaseUrls whitelist and API key. When empty, the extension uses the legacy single-connection settings.",
+          "scope": "application"
+        },
+        "ollamaCloud.visionModels": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection visionModels override this list for that connection's models.",
+          "scope": "application"
         }
       }
     }

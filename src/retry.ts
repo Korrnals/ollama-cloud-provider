@@ -4,7 +4,7 @@ import { logger } from './logger.js';
 /**
  * Issue 13 — retry wrapper with exponential backoff.
  *
- * Upstream had no retry logic: a transient 429 (rate limit) or 5xx
+ * Without retry logic, a transient 429 (rate limit) or 5xx
  * (server error) failed the request immediately, even though Ollama
  * Cloud may recover in seconds. This module provides a reusable
  * `withRetry` wrapper usable by any HTTP-emitting call site.

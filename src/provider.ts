@@ -5,6 +5,7 @@ import {
   convertMessagesToOpenAI,
   convertToolsToOpenAI,
   getMessageText,
+  hasImageParts,
 } from './convert.js';
 import { validateConfiguration } from './configValidator.js';
 import { runHealthCheckCommand } from './healthCheck.js';
@@ -15,8 +16,13 @@ import {
   type ModelConfigurationOptions,
   type ModelConfigurationSchema,
 } from './modelConfiguration.js';
-import { ModelCatalog, type ModelDefinition } from './modelCatalog.js';
+import {
+  ModelCatalog,
+  resolveVisionSupport,
+  type ModelDefinition,
+} from './modelCatalog.js';
 import { OllamaClient } from './ollamaClient.js';
+import { loadConnections, openAiBaseUrl } from './connections.js';
 import type { UsageInfo } from './protocolTypes.js';
 
 const AUTH_REQUIRED_DETAIL =
@@ -63,16 +69,25 @@ export class OllamaCloudChatProvider
       vscode.workspace.onDidChangeConfiguration((event) => {
         if (
           event.affectsConfiguration('ollamaCloud.apiKey') ||
-          event.affectsConfiguration('ollamaCloud.baseUrl')
+          event.affectsConfiguration('ollamaCloud.baseUrl') ||
+          event.affectsConfiguration('ollamaCloud.connections') ||
+          event.affectsConfiguration('ollamaCloud.visionModels') ||
+          event.affectsConfiguration('ollamaCloud.allowedBaseUrls')
         ) {
-          if (event.affectsConfiguration('ollamaCloud.baseUrl')) {
+          if (
+            event.affectsConfiguration('ollamaCloud.baseUrl') ||
+            event.affectsConfiguration('ollamaCloud.connections') ||
+            event.affectsConfiguration('ollamaCloud.allowedBaseUrls')
+          ) {
             void this.syncModelCatalog();
           }
           this.onDidChangeLanguageModelChatInformationEmitter.fire();
         }
       }),
       context.secrets.onDidChange((event) => {
-        if (event.key === 'ollamaCloud.apiKey') {
+        // Fire on any ollamaCloud.apiKey* secret change so per-connection
+        // key updates refresh the model picker status icons.
+        if (event.key.startsWith('ollamaCloud.apiKey')) {
           this.onDidChangeLanguageModelChatInformationEmitter.fire();
         }
       }),
@@ -109,13 +124,21 @@ export class OllamaCloudChatProvider
     this.lastCatalogSync = now;
 
     try {
-      const result = await this.modelCatalog.refresh();
+      // Multi-connection refresh when `ollamaCloud.connections` is
+      // populated; legacy single-connection refresh otherwise. The
+      // legacy path preserves the 192 existing tests' behaviour.
+      const connections = loadConnections();
+      const result =
+        connections.length > 1 ||
+          (connections.length === 1 && connections[0]!.type !== 'cloud')
+          ? await this.modelCatalog.refreshForConnections(connections)
+          : await this.modelCatalog.refresh();
       logger.info(
-        `Synced Ollama Cloud model list. changed=${result.changed} count=${result.count}`,
+        `Synced model list. changed=${result.changed} count=${result.count} connections=${connections.length}`,
       );
       this.onDidChangeLanguageModelChatInformationEmitter.fire();
     } catch (error) {
-      logger.error('Failed to sync Ollama Cloud model list.', error);
+      logger.error('Failed to sync model list.', error);
     }
   }
 
@@ -169,19 +192,53 @@ export class OllamaCloudChatProvider
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken,
   ): Promise<void> {
-    const apiKey = await this.authManager.getApiKey();
-    if (!apiKey) {
-      throw new Error(
-        'Ollama Cloud API key not configured. Run "Ollama Cloud: Set API Key".',
-      );
-    }
-
     const model = this.modelCatalog.get(modelInfo.id);
     if (!model) {
       throw new Error(`Unknown Ollama Cloud model: ${modelInfo.id}`);
     }
 
-    const client = new OllamaClient(this.authManager.getBaseUrl(), apiKey);
+    // Resolve the connection for this model. Cloud connection models
+    // keep the legacy single-connection path (backward compatibility —
+    // the 192 existing tests exercise this branch). Non-cloud
+    // connection models resolve their connection via `connectionId`.
+    const connections = loadConnections();
+    const connection =
+      model.connectionId === 'cloud'
+        ? undefined
+        : connections.find((c) => c.id === model.connectionId);
+
+    // API key resolution — cloud connection uses the legacy
+    // `getApiKey()` (SecretStorage + config + env fallback). Non-cloud
+    // connections use `getApiKeyForConnection()` (SecretStorage only,
+    // keyed `ollamaCloud.apiKey.<connectionId>`). Connections with
+    // `requiresApiKey === false` (local Ollama) skip the key entirely.
+    const apiKey = connection
+      ? await this.authManager.getApiKeyForConnection(connection)
+      : await this.authManager.getApiKey();
+    if (!apiKey && (!connection || connection.requiresApiKey)) {
+      throw new Error(
+        'Ollama Cloud API key not configured. Run "Ollama Cloud: Set API Key".',
+      );
+    }
+
+    // Vision gate — SEC-03 complement: do NOT silently drop image
+    // attachments sent to a text-only model. Throw a clear error so
+    // the user sees why the request failed and can switch to a
+    // vision-capable model. Uses `resolveVisionSupport` (metadata +
+    // family markers + manual `visionModels` patterns).
+    const requestHasImages = messages.some((m) => hasImageParts(m.content));
+    const connectionVisionPatterns = connection?.visionModels ?? [];
+    const supportsImages = resolveVisionSupport(model, connectionVisionPatterns);
+    if (requestHasImages && !supportsImages) {
+      throw new Error(
+        `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
+      );
+    }
+
+    const clientBaseUrl = connection
+      ? openAiBaseUrl(connection)
+      : this.authManager.getBaseUrl();
+    const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
     const modelOptions = options as ModelConfigurationOptions;
     const requestConfiguration = resolveModelRequestConfiguration(
       model,
@@ -259,12 +316,22 @@ function toChatInformation(
 ): vscode.LanguageModelChatInformation {
   const configurationSchema = getModelConfigurationSchema(model);
 
+  // Origin label prefix — `Cloud:`, `Local:`, `VPS:`, `custom:`. Cloud
+  // connection keeps the bare model name for backward compatibility
+  // (existing test assertions check `name` without a prefix). Non-
+  // cloud connections prepend the origin label so the picker shows
+  // which connection a model came from.
+  const name =
+    model.origin === 'Cloud'
+      ? model.name
+      : `${model.origin}:${model.name}`;
+
   return {
     id: model.id,
-    name: model.name,
+    name,
     family: model.family,
     version: model.version,
-    detail: PROVIDER_TOOLTIP,
+    detail: model.origin === 'Cloud' ? PROVIDER_TOOLTIP : model.origin,
     tooltip: hasApiKey
       ? PROVIDER_TOOLTIP
       : `${PROVIDER_TOOLTIP}\n${AUTH_REQUIRED_DETAIL}`,

@@ -15,8 +15,8 @@ const OUTPUT_CHANNEL_NAME = 'Ollama Cloud';
  *   5. `api_key=<value>` (query/CLI form)    → `api_key=[REDACTED]`
  *   6. `sk-<20+ alphanumeric chars>`         → `sk-[REDACTED]`
  *
- * Why: upstream called `JSON.stringify(detail)` unconditionally. If a
- * detail object carried an `Authorization` header or an `api_key` field,
+ * Why: a naive logger calls `JSON.stringify(detail)` unconditionally. If
+ * a detail object carried an `Authorization` header or an `api_key` field,
  * the secret landed in the output channel log in cleartext. This layer
  * guarantees no secret pattern reaches the log, regardless of caller.
  */

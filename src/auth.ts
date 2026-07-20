@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { apiKeySecretKey, type ConnectionConfig } from './connections.js';
 
 const API_KEY_SECRET = 'ollamaCloud.apiKey';
 const DEFAULT_BASE_URL = 'https://ollama.com/v1';
@@ -37,6 +38,63 @@ export class AuthManager {
 
   async hasApiKey(): Promise<boolean> {
     const apiKey = await this.getApiKey();
+    return typeof apiKey === 'string' && apiKey.length > 0;
+  }
+
+  /**
+   * Returns the API key for a specific connection. Cloud connection
+   * uses the legacy `ollamaCloud.apiKey` secret (via `getApiKey`).
+   * Non-cloud connections use `ollamaCloud.apiKey.<connectionId>`.
+   *
+   * For non-cloud connections with `requiresApiKey === false` (e.g.
+   * local Ollama), returns `undefined` — no key is sent.
+   */
+  async getApiKeyForConnection(
+    connection: ConnectionConfig,
+  ): Promise<string | undefined> {
+    if (!connection.requiresApiKey) {
+      return undefined;
+    }
+    if (connection.id === 'cloud') {
+      return this.getApiKey();
+    }
+    const key = apiKeySecretKey(connection.id);
+    const secret = await this.context.secrets.get(key);
+    return secret?.trim() || undefined;
+  }
+
+  /**
+   * Stores an API key for a specific connection. Cloud connection
+   * uses the legacy `ollamaCloud.apiKey` secret.
+   */
+  async setApiKeyForConnection(
+    connectionId: string,
+    apiKey: string,
+  ): Promise<void> {
+    const key = apiKeySecretKey(connectionId);
+    await this.context.secrets.store(key, apiKey);
+  }
+
+  /**
+   * Deletes the API key for a specific connection.
+   */
+  async deleteApiKeyForConnection(connectionId: string): Promise<void> {
+    const key = apiKeySecretKey(connectionId);
+    await this.context.secrets.delete(key);
+  }
+
+  /**
+   * Returns true when the connection has an API key set (or does not
+   * require one). Used by the provider to decide whether a connection's
+   * models should be selectable.
+   */
+  async connectionHasApiKey(
+    connection: ConnectionConfig,
+  ): Promise<boolean> {
+    if (!connection.requiresApiKey) {
+      return true;
+    }
+    const apiKey = await this.getApiKeyForConnection(connection);
     return typeof apiKey === 'string' && apiKey.length > 0;
   }
 

@@ -156,6 +156,42 @@ export class LanguageModelToolResultPart {
   }
 }
 
+/**
+ * Vision support stub — `vscode.LanguageModelDataPart`. Carries a
+ * `mimeType` string and a `data` Uint8Array. The production code
+ * checks `part.mimeType.toLowerCase().startsWith('image/')` and
+ * `part.data instanceof Uint8Array`, so the stub mirrors that shape.
+ *
+ * The constructor signature matches the real `@types/vscode` class:
+ * `(data: Uint8Array, mimeType: string)` — data first, mime second.
+ * The static `image(data, mime)` factory is also provided so tests
+ * can use either form.
+ */
+export class LanguageModelDataPart {
+  constructor(data, mimeType) {
+    this.data = data;
+    this.mimeType = mimeType;
+  }
+
+  static image(data, mime) {
+    return new LanguageModelDataPart(data, mime);
+  }
+
+  static json(value, mime) {
+    return new LanguageModelDataPart(
+      new TextEncoder().encode(JSON.stringify(value)),
+      mime ?? 'application/json',
+    );
+  }
+
+  static text(value, mime) {
+    return new LanguageModelDataPart(
+      new TextEncoder().encode(value),
+      mime ?? 'text/plain',
+    );
+  }
+}
+
 export class CancellationToken {
   isCancellationRequested = false;
   _listeners = new Set();
@@ -237,6 +273,7 @@ export default {
   LanguageModelTextPart,
   LanguageModelToolCallPart,
   LanguageModelToolResultPart,
+  LanguageModelDataPart,
   CancellationToken,
   CancellationTokenSource,
   commands,

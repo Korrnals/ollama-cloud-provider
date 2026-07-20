@@ -224,3 +224,173 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — happy pat
     );
   });
 });
+
+/**
+ * Vision gate — `provider.ts` throws a clear error when a request
+ * carries image parts AND the selected model does NOT support images.
+ * It forwards the image as a `data:` URL when the model DOES support
+ * images. These tests pin both paths.
+ */
+describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision gate', () => {
+  let originalFetch: typeof fetch;
+  let fetchCalls: Array<{ url: string; body: unknown }>;
+
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+    });
+    originalFetch = global.fetch;
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  function imageMsg(): vscode.LanguageModelChatRequestMessage {
+    return {
+      role: vscode.LanguageModelChatMessageRole.User,
+      content: [
+        new vscode.LanguageModelTextPart('what is this?'),
+        new vscode.LanguageModelDataPart(
+          new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          'image/png',
+        ),
+      ] as unknown as vscode.LanguageModelChatRequestMessage['content'],
+      name: undefined,
+    };
+  }
+
+  it('throws when a text-only model receives an image (no silent drop)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+
+    // gpt-oss:120b is a text-only model (no vision marker, no
+    // imageInput metadata). fetch must NOT be called.
+    global.fetch = (() => {
+      throw new Error('fetch must not be called for a rejected image request');
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [imageMsg()],
+          {
+            modelOptions: {},
+            justification: 'test',
+          } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      /does not support image input/,
+    );
+  });
+
+  it('forwards the image as a data URL when the model supports vision', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+
+    // gemma3:12b is a vision-capable model (gemma3 family marker +
+    // imageInput metadata). The image must be forwarded in the
+    // OpenAI request body as an image_url data URL.
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"it is a png"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gemma3:12b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // fetch was called exactly once with the chat completions URL.
+    assert.equal(fetchCalls.length, 1);
+    assert.ok(fetchCalls[0].url.endsWith('/chat/completions'));
+    // The request body's first user message contains an image_url
+    // part with the base64 data URL.
+    const body = fetchCalls[0].body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const userMsg = body.messages.find((m) => m.role === 'user');
+    assert.ok(userMsg, 'a user message was sent');
+    assert.ok(Array.isArray(userMsg.content), 'content is a multipart array');
+    const parts = userMsg.content as Array<{
+      type: string;
+      image_url?: { url: string };
+      text?: string;
+    }>;
+    const imagePart = parts.find((p) => p.type === 'image_url');
+    assert.ok(imagePart, 'an image_url part was forwarded');
+    assert.equal(
+      imagePart!.image_url!.url,
+      'data:image/png;base64,iVBORw==',
+    );
+  });
+
+  it('allows a text-only model when the request has no images', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"hi back"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    // gpt-oss:120b is text-only, but the request is text-only too —
+    // the vision gate must not fire.
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('hi')],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    assert.equal(fetchCalls.length, 1);
+    const body = fetchCalls[0].body as {
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    const userEntry = body.messages.find((m) => m.role === 'user');
+    assert.ok(userEntry);
+    // Text-only request → content stays a plain string, not an array.
+    assert.equal(userEntry.content, 'hi');
+  });
+});
