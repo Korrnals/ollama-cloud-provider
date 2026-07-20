@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-logo.png",
@@ -18,7 +18,10 @@
   "engines": {
     "vscode": "^1.118.0"
   },
-  "categories": ["AI", "Chat"],
+  "categories": [
+    "AI",
+    "Chat"
+  ],
   "keywords": [
     "ollama",
     "ollama cloud",
@@ -28,9 +31,14 @@
     "chat",
     "openai compatible"
   ],
-  "activationEvents": ["onStartupFinished"],
-  "main": "./out/extension.js",
-  "extensionKind": ["workspace", "ui"],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/src/extension.js",
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
   "contributes": {
     "languageModelChatProviders": [
       {
@@ -81,8 +89,12 @@
         },
         "ollamaCloud.allowedBaseUrls": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": ["https://ollama.com/v1"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "https://ollama.com/v1"
+          ],
           "description": "Whitelist of permitted base URLs. The extension refuses to send requests to any baseUrl not in this list.",
           "scope": "application"
         },
@@ -110,19 +122,25 @@
     "build": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src",
-    "test": "node ./out/test/runTest.js",
+    "lint": "eslint src test",
+    "test": "mocha --config .mocharc.json",
+    "test:unit": "mocha --config .mocharc.json out/test/unit/**/*.test.js",
+    "test:integration": "mocha --config .mocharc.json out/test/integration/**/*.test.js",
     "package": "vsce package",
     "verify": "npm run lint && npm run compile && npm test"
   },
   "devDependencies": {
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
     "@types/node": "20.19.30",
     "@types/vscode": "^1.118.0",
     "@typescript-eslint/eslint-plugin": "8.53.0",
     "@typescript-eslint/parser": "8.53.0",
     "@vscode/vsce": "^3.9.1",
+    "chai": "^6.2.2",
     "eslint": "9.39.2",
     "globals": "17.0.0",
+    "mocha": "^11.7.6",
     "typescript": "5.9.3"
   }
 }

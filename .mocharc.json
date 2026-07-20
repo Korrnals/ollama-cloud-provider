@@ -1,0 +1,8 @@
+{
+  "extension": ["js"],
+  "spec": "out/test/**/*.test.js",
+  "timeout": 5000,
+  "reporter": "spec",
+  "import": "./test/_loader.mjs",
+  "exit": true
+}
