@@ -5,7 +5,7 @@
 
 ## Context
 
-The upstream extension's VSIX is published to the Marketplace without signing, CI, or checksums. This means:
+Unsigned VSIX distribution cannot be verified by users. Without signing, CI, or checksums:
 
 - Users cannot verify the VSIX they installed was built from the reviewed source.
 - A compromised publisher account could ship a malicious auto-update.

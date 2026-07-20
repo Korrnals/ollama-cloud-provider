@@ -1,26 +1,20 @@
 <p align="center">
-  <img src="media/banner.png" alt="Ollama Cloud Provider — Security-hardened fork" width="100%" />
+  <img src="media/banner.png" alt="Ollama Cloud Provider" width="100%" />
 </p>
 
 # Ollama Cloud Provider
 
 **Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.**
 
-This is a security-hardened fork of [Ollama-Cloud-for-Copilot](https://github.com/zelosleone/Ollama-Cloud-for-Copilot) by Denizhan Dakılır, with supply-chain hardening, secret-handling improvements, and reliability features. It registers Ollama Cloud models as native VS Code language models, making them available in Copilot Chat.
+Ollama Cloud Provider registers Ollama Cloud models as native VS Code language models, making them available in Copilot Chat. It is built with supply-chain hardening, secret-handling safeguards, and reliability features from the ground up.
 
-## Why this fork?
+## Security posture
 
-The upstream extension is clean and minimal, but has three unresolved security concerns:
+The extension is designed around three security invariants:
 
-1. **Unverifiable supply chain** — single-author Marketplace VSIX, no CI, no signed releases, no SBOM.
-2. **Logger without redaction** — no structural guarantee that sensitive data won't be logged.
-3. **No baseUrl restrictions** — the API key can be sent to any host the user configures.
-
-This fork closes all three:
-
-- **CI-built, signed releases** — every VSIX is built in GitHub Actions, signed with Sigstore (keyless) + GPG, with SHA256 checksums and SBOM.
-- **Logger redaction** — `Bearer` tokens and `api_key` patterns are masked before any `JSON.stringify`.
-- **baseUrl whitelist** — the extension refuses to send requests to any host not in `ollamaCloud.allowedBaseUrls`.
+1. **Verifiable supply chain** — every VSIX is built in GitHub Actions, signed with Sigstore (keyless) + GPG, with SHA256 checksums and SBOM.
+2. **Logger redaction** — `Bearer` tokens and `api_key` patterns are masked before any `JSON.stringify`.
+3. **baseUrl whitelist** — the extension refuses to send requests to any host not in `ollamaCloud.allowedBaseUrls`.
 
 ## Features
 
@@ -83,10 +77,6 @@ All settings are `scope: "application"` — workspace folders cannot override th
 ## Security
 
 See [SECURITY.md](SECURITY.md) for the security policy and responsible disclosure.
-
-## Acknowledgements
-
-This extension is a fork of [Ollama-Cloud-for-Copilot](https://github.com/zelosleone/Ollama-Cloud-for-Copilot) by Denizhan Dakılır. The original MIT license and attribution are preserved.
 
 ## License
 

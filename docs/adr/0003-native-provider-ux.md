@@ -5,9 +5,9 @@
 
 ## Context
 
-The upstream extension uses `vscode.LanguageModelChatProvider` — the native VS Code API for registering language models. Ollama Cloud models already appear in the Copilot Chat model picker with `displayName: "Ollama Cloud"`.
+The extension uses `vscode.LanguageModelChatProvider` — the native VS Code API for registering language models. Ollama Cloud models appear in the Copilot Chat model picker with `displayName: "Ollama Cloud"`.
 
-However, VS Code does not support inline API key entry in the model picker for third-party providers. The upstream extension requires the user to find and run `Ollama Cloud: Set API Key` from the command palette — a discoverability gap.
+However, VS Code does not support inline API key entry in the model picker for third-party providers. Requiring the user to find and run `Ollama Cloud: Set API Key` from the command palette is a discoverability gap.
 
 ## Decision
 

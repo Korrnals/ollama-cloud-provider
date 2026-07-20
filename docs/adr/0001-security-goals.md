@@ -1,23 +1,22 @@
-# ADR-0001: Fork rationale and security goals
+# ADR-0001: Security goals and non-goals
 
 **Date:** 2026-07-16
 **Status:** Accepted
 
 ## Context
 
-The upstream extension [Ollama-Cloud-for-Copilot](https://github.com/zelosleone/Ollama-Cloud-for-Copilot) by Denizhan Dakılır is a clean, minimal `LanguageModelChatProvider` implementation. A security audit (2026-07-16) found the code safe but identified three unresolved concerns:
+The extension is a `LanguageModelChatProvider` implementation that registers Ollama Cloud models in Copilot Chat. The initial security review (2026-07-16) set the scope and the invariants the extension must maintain:
 
-1. **SEC-01 (High):** Unverifiable supply chain — single-author Marketplace VSIX, no CI, no signed releases, no SBOM. Cannot prove the published VSIX matches the reviewed source.
-2. **SEC-02 (Medium):** Logger without redaction — `JSON.stringify(detail)` called unconditionally; no structural guarantee that future commits won't log sensitive data.
-3. **SEC-03 (Medium):** No baseUrl restrictions — API key sent to whatever host the user configures, including untrusted hosts.
+1. **SEC-01 (High):** Verifiable supply chain — VSIX releases must be built in CI, signed, and checksummed so users can prove the installed VSIX matches the reviewed source.
+2. **SEC-02 (Medium):** Logger redaction — `JSON.stringify(detail)` must never emit secrets; the redaction layer must be structural, not caller-dependent.
+3. **SEC-03 (Medium):** baseUrl restrictions — the API key must never be sent to a host outside the user-configured `allowedBaseUrls` whitelist.
 
-A separate extension, JKagiDesigns "Ollama Cloud", was also audited and rejected — it has a 10× larger attack surface (command execution, file editing, webview, URI handler), plaintext API key storage, and its GitLab repository is scheduled for deletion on 2026-07-23.
+A separate extension, JKagiDesigns "Ollama Cloud", was also audited and rejected — it has a 10× larger attack surface (command execution, file editing, webview, URI handler), plaintext API key storage, and its GitLab repository is scheduled for deletion on 2026-07-23. The rejected surface area informs the non-goals below.
 
 ## Decision
 
-Fork the upstream extension and harden it. The fork:
+Build a minimal, security-hardened `LanguageModelChatProvider`. The extension:
 
-- Preserves the MIT license and attribution to the original author.
 - Keeps the minimal architecture: `LanguageModelChatProvider` API, no webview, no `child_process`, no URI handler, no context-file ingestion.
 - Adds security hardening (logger redaction, baseUrl whitelist, scope verification).
 - Adds supply-chain hardening (CI-built VSIX, Sigstore + GPG signing, SHA256, SBOM).
@@ -40,4 +39,3 @@ The following features are explicitly **rejected** as they introduce attack surf
 
 - **Positive:** The extension remains auditable (~10 source files, zero runtime dependencies). Attack surface is minimal. Supply chain is verifiable.
 - **Negative:** Users who want ACT mode, multi-provider, or autocomplete must use a different extension. This is acceptable — the goal is a guaranteed-safe provider, not a feature-complete agent.
-- **Neutral:** The fork must track upstream for model-catalog updates and API changes, re-auditing security-critical files on each merge.

@@ -1,6 +1,6 @@
 # Development Plan — ollama-cloud-provider v0.2.0
 
-**Project:** Security-hardened fork of zelosleone/Ollama-Cloud-for-Copilot
+**Project:** Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat
 **Owner:** Korrnals
 **Repo:** https://github.com/Korrnals/ollama-cloud-provider
 **Local:** /var/home/abyss/.distrobox/vscode-box/home/LABs/Projects/ollama-cloud-provider
@@ -10,17 +10,17 @@
 ```
 src/
   extension.ts          — activation, command registration, provider wiring
-  provider.ts           — LanguageModelChatProvider implementation (from upstream, hardened)
-  auth.ts               — API key management via SecretStorage (from upstream, verified)
-  ollamaClient.ts       — HTTP client, SSE streaming (from upstream, hardened)
+  provider.ts           — LanguageModelChatProvider implementation
+  auth.ts               — API key management via SecretStorage
+  ollamaClient.ts       — HTTP client, SSE streaming
   logger.ts             — Output channel logger WITH REDACTION (hardened)
-  modelCatalog.ts       — Model list management (from upstream)
-  modelConfiguration.ts — Per-model config schema (from upstream, extended)
-  convert.ts            — VS Code ↔ OpenAI message/tool conversion (from upstream)
-  protocolTypes.ts      — TypeScript types (from upstream)
-  configValidator.ts    — NEW: validate config (baseUrl in whitelist, key present)
-  healthCheck.ts         — NEW: check connection to Ollama Cloud
-  retry.ts              — NEW: exponential backoff retry wrapper
+  modelCatalog.ts       — Model list management
+  modelConfiguration.ts — Per-model config schema
+  convert.ts            — VS Code ↔ OpenAI message/tool conversion
+  protocolTypes.ts      — TypeScript types
+  configValidator.ts    — validate config (baseUrl in whitelist, key present)
+  healthCheck.ts        — check connection to Ollama Cloud
+  retry.ts              — exponential backoff retry wrapper
 test/
   runTest.ts            — test runner
   suite/                — test suites
@@ -37,11 +37,11 @@ test/
 | 3 | Configure branch protection on `main`: require PR, require CI, no force-push | infra | Korrnals | 5m |
 | 4 | First commit: scaffold + initial push to main | chore | Tech Lead | 10m |
 
-### Phase 2 — Port upstream source
+### Phase 2 — Source implementation
 
 | # | Issue | Type | Assignee | Est |
 |---|---|---|---|---|
-| 5 | Port source files from upstream v0.1.9 to `src/` | feat | Senior System Engineer | 1h |
+| 5 | Implement source files in `src/` per architecture above | feat | Senior System Engineer | 1h |
 | 6 | Add `npm ci` + verify compile passes | chore | Senior System Engineer | 15m |
 | 7 | Verify extension loads in Extension Development Host | test | Senior System Engineer | 30m |
 

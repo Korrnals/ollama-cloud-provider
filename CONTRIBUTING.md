@@ -26,7 +26,7 @@ This project follows trunk-based development with conventional commits.
 4. Open a pull request to `main`. CI must pass. At least one review required.
 5. Squash-merge on approval.
 
-See [ADR-0001](docs/adr/0001-fork-rationale.md) for the project's security goals and non-goals.
+See [ADR-0001](docs/adr/0001-security-goals.md) for the project's security goals and non-goals.
 
 ## Versioning
 
