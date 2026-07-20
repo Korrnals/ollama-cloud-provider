@@ -15,10 +15,10 @@
     </linearGradient>
   </defs>
 
-  <!-- Rounded square background (Marketplace style) -->
+  <!-- Rounded square background -->
   <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="url(#bgGrad)"/>
 
-  <!-- Cloud: frames the llama (centered) -->
+  <!-- Cloud frame -->
   <path d="
     M 56 192
     C 30 192 14 176 14 156
@@ -33,10 +33,10 @@
     Z
   " fill="url(#cloudGrad)" stroke="#8B949E" stroke-width="3" stroke-linejoin="round"/>
 
-  <!-- LLAMA: embedded image (the actual Ollama llama, scaled to fit inside cloud) -->
-  <image href="llama.png" x="76" y="86" width="124" height="124" preserveAspectRatio="xMidYMid meet"/>
+  <!-- LLAMA image (centered inside cloud) -->
+  <image href="icons_lama.png" x="64" y="76" width="148" height="148" preserveAspectRatio="xMidYMid meet"/>
 
-  <!-- Shield overlay (bottom-right, security accent) -->
+  <!-- Shield overlay (bottom-right) -->
   <path d="
     M 172 178
     L 172 206
@@ -46,12 +46,8 @@
     L 200 170
     Z
   " fill="url(#shieldGrad)" stroke="#0D1117" stroke-width="3" stroke-linejoin="round"/>
-
-  <!-- Lock body inside shield -->
   <rect x="190" y="196" width="20" height="16" rx="3" fill="#0D1117"/>
-  <!-- Lock shackle -->
   <path d="M 194 196 L 194 190 C 194 186 198 183 200 183 C 202 183 206 186 206 190 L 206 196"
         fill="none" stroke="#0D1117" stroke-width="3" stroke-linecap="round"/>
-  <!-- Lock keyhole -->
   <circle cx="200" cy="204" r="2" fill="#3FB950"/>
 </svg>
