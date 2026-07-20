@@ -17,9 +17,8 @@
 
   <rect x="0" y="0" width="1200" height="320" rx="24" ry="24" fill="url(#bgGradB)"/>
 
-  <!-- Llama icon group (left third): cloud + llama image + shield -->
+  <!-- Llama icon group (left third) -->
   <g transform="translate(40, 40) scale(0.95)">
-    <!-- Cloud -->
     <path d="
       M 56 192
       C 30 192 14 176 14 156
@@ -33,9 +32,7 @@
       C 50 206 56 198 56 192
       Z
     " fill="url(#cloudGradB)" stroke="#8B949E" stroke-width="3" stroke-linejoin="round"/>
-    <!-- Llama image (real Ollama llama) -->
-    <image href="llama.png" x="76" y="86" width="124" height="124" preserveAspectRatio="xMidYMid meet"/>
-    <!-- Shield -->
+    <image href="icons_lama.png" x="64" y="76" width="148" height="148" preserveAspectRatio="xMidYMid meet"/>
     <path d="M 172 178 L 172 206 C 172 220 186 230 200 234 C 214 230 228 220 228 206 L 228 178 L 200 170 Z"
           fill="url(#shieldGradB)" stroke="#0D1117" stroke-width="3" stroke-linejoin="round"/>
     <rect x="190" y="196" width="20" height="16" rx="3" fill="#0D1117"/>
