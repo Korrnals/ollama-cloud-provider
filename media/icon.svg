@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Ollama Cloud Provider icon">
+  <!-- Canvas: subtle radial background for depth, transparent-friendly -->
+  <defs>
+    <linearGradient id="cloudGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F4F4F4"/>
+      <stop offset="100%" stop-color="#D2D2D2"/>
+    </linearGradient>
+    <linearGradient id="shieldGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3FB950"/>
+      <stop offset="100%" stop-color="#1A7F37"/>
+    </linearGradient>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1F2428"/>
+      <stop offset="100%" stop-color="#0D1117"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background (Marketplace style) -->
+  <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="url(#bgGrad)"/>
+
+  <!-- Cloud shape: minimalist, centered -->
+  <path d="
+    M 96 150
+    C 78 150 64 136 64 118
+    C 64 102 76 90 92 88
+    C 96 70 114 56 134 56
+    C 156 56 174 72 178 94
+    C 196 96 208 110 208 128
+    C 208 144 196 156 180 156
+    L 96 156
+    Z
+  " fill="url(#cloudGrad)" stroke="#8B949E" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- Shield overlay (lower-right of cloud, security accent) -->
+  <path d="
+    M 168 168
+    L 168 198
+    C 168 214 184 224 200 228
+    C 216 224 232 214 232 198
+    L 232 168
+    L 200 160
+    Z
+  " fill="url(#shieldGrad)" stroke="#0D1117" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- Lock body inside shield -->
+  <rect x="190" y="188" width="20" height="16" rx="3" fill="#0D1117"/>
+  <!-- Lock shackle -->
+  <path d="M 194 188 L 194 182 C 194 178 198 175 200 175 C 202 175 206 178 206 182 L 206 188"
+        fill="none" stroke="#0D1117" stroke-width="3" stroke-linecap="round"/>
+  <!-- Lock keyhole -->
+  <circle cx="200" cy="196" r="2" fill="#3FB950"/>
+</svg>

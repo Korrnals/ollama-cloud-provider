@@ -5,7 +5,7 @@
   "version": "0.4.0",
   "type": "module",
   "publisher": "Korrnals",
-  "icon": "media/ollama-logo.png",
+  "icon": "media/ollama-cloud-provider-icon.png",
   "license": "MIT",
   "repository": {
     "type": "git",
