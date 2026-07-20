@@ -119,7 +119,12 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     // Issue 17 — wire the smart API-key prompt.
-    registerApiKeyPrompt(context, provider);
+    // MEDIUM-1 — push the handle's disposables (resetListener +
+    // infoListener) to context.subscriptions so they are disposed on
+    // extension deactivation. Discarding the handle left two
+    // EventEmitters leaking across dev reloads.
+    const promptHandle = registerApiKeyPrompt(context, provider);
+    context.subscriptions.push(...promptHandle.disposables);
 
     logger.info('Ollama Cloud extension activated.');
   } catch (error) {

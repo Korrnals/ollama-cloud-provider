@@ -635,7 +635,7 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
-function humanizeModelId(id: string): string {
+export function humanizeModelId(id: string): string {
   return id
     .split('-')
     .map((segment) => humanizeSegment(segment))
@@ -682,7 +682,7 @@ function capitalizeKnown(value: string): string {
   return lower.charAt(0).toUpperCase() + lower.slice(1);
 }
 
-function inferFamily(id: string): string {
+export function inferFamily(id: string): string {
   if (id.startsWith('cogito-')) {
     return 'cogito';
   }
@@ -729,7 +729,7 @@ function inferFamily(id: string): string {
   return 'ollama-cloud';
 }
 
-function inferVersion(id: string, family: string): string {
+export function inferVersion(id: string, family: string): string {
   if (id.startsWith(`${family}-`)) {
     return id.slice(family.length + 1);
   }
@@ -745,7 +745,7 @@ function inferVersion(id: string, family: string): string {
   return id;
 }
 
-function inferMaxInputTokens(id: string): number {
+export function inferMaxInputTokens(id: string): number {
   if (
     id.startsWith('deepseek-v4-') ||
     id.startsWith('gemini-3-flash-preview') ||
@@ -794,7 +794,7 @@ function inferMaxInputTokens(id: string): number {
   return 131072;
 }
 
-function inferMaxOutputTokens(id: string): number {
+export function inferMaxOutputTokens(id: string): number {
   if (id.startsWith('deepseek-v4-')) {
     return 384000;
   }
@@ -844,7 +844,7 @@ function inferMaxOutputTokens(id: string): number {
   return 32768;
 }
 
-function inferImageInput(id: string): boolean {
+export function inferImageInput(id: string): boolean {
   return (
     id.includes('-vl:') ||
     id.startsWith('gemma3:') ||
@@ -859,7 +859,7 @@ function inferImageInput(id: string): boolean {
   );
 }
 
-function inferToolCalling(id: string): boolean {
+export function inferToolCalling(id: string): boolean {
   if (id.startsWith('gemma3:')) {
     return false;
   }
@@ -867,7 +867,7 @@ function inferToolCalling(id: string): boolean {
   return true;
 }
 
-function inferReasoning(id: string): boolean {
+export function inferReasoning(id: string): boolean {
   // DeepSeek: v4 and v3.1 support thinking, v3.2 does not
   if (id.startsWith('deepseek-v4-') || id.startsWith('deepseek-v3.1')) {
     return true;
