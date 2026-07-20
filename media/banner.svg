@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="Ollama Cloud Provider banner">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="320" viewBox="0 0 1200 320" role="img" aria-label="Ollama Cloud Provider banner">
   <defs>
     <linearGradient id="bgGradB" x1="0" y1="0" x2="1" y2="0">
       <stop offset="0%" stop-color="#0D1117"/>
@@ -9,10 +9,6 @@
       <stop offset="0%" stop-color="#F4F4F4"/>
       <stop offset="100%" stop-color="#D2D2D2"/>
     </linearGradient>
-    <linearGradient id="llamaGradB" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#F5E6D3"/>
-      <stop offset="100%" stop-color="#C9A57A"/>
-    </linearGradient>
     <linearGradient id="shieldGradB" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#3FB950"/>
       <stop offset="100%" stop-color="#1A7F37"/>
@@ -21,58 +17,31 @@
 
   <rect x="0" y="0" width="1200" height="320" rx="24" ry="24" fill="url(#bgGradB)"/>
 
-  <!-- Llama motif (left third) — same anatomy as icon, scaled to fit -->
+  <!-- Llama icon group (left third): cloud + llama image + shield -->
   <g transform="translate(40, 40) scale(0.95)">
-    <!-- Cloud base -->
-    <path d="M 32 196 C 22 196 14 188 14 178 C 14 170 20 164 28 162 C 30 152 40 146 50 146 C 56 142 64 140 72 142 C 80 136 92 134 104 138 C 114 134 126 134 136 138 C 148 136 160 140 168 148 C 184 148 198 158 200 172 C 218 172 232 182 232 196 C 232 202 228 206 222 206 L 32 206 Z"
-          fill="url(#cloudGradB)" stroke="#8B949E" stroke-width="2.5" stroke-linejoin="round"/>
-    <!-- Body -->
-    <ellipse cx="138" cy="150" rx="36" ry="22" fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2.5"/>
-    <!-- Long neck -->
-    <path d="M 162 138 C 168 110 174 88 180 76 C 184 70 188 70 190 76 C 188 86 184 102 178 120 C 175 132 172 140 170 145 Z"
-          fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
-    <!-- Head -->
-    <ellipse cx="184" cy="70" rx="14" ry="11" fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2.5"/>
-    <!-- Long snout -->
-    <path d="M 196 64 C 210 62 222 66 224 74 C 224 80 220 84 214 84 C 206 84 200 80 196 76 C 193 72 193 66 196 64 Z"
-          fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
-    <!-- Nostrils + mouth -->
-    <ellipse cx="220" cy="74" rx="1.2" ry="1.5" fill="#3D2817"/>
-    <ellipse cx="218" cy="78" rx="1" ry="1.2" fill="#3D2817"/>
-    <path d="M 216 80 Q 220 82 222 80" stroke="#3D2817" stroke-width="1" fill="none" stroke-linecap="round"/>
-    <!-- Left ear -->
-    <path d="M 178 60 C 172 42 168 28 172 20 C 176 18 180 22 182 32 C 184 44 184 54 184 62 Z"
-          fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
-    <path d="M 178 56 C 174 44 173 32 175 26 C 177 26 179 32 180 42 C 181 50 182 56 182 60 Z" fill="#D4A896"/>
-    <!-- Right ear -->
-    <path d="M 190 60 C 196 42 200 28 196 20 C 192 18 188 22 186 32 C 184 44 184 54 184 62 Z"
-          fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
-    <path d="M 190 56 C 194 44 195 32 193 26 C 191 26 189 32 188 42 C 187 50 186 56 186 60 Z" fill="#D4A896"/>
-    <!-- Eye -->
-    <circle cx="186" cy="68" r="1.8" fill="#3D2817"/>
-    <circle cx="186.5" cy="67.4" r="0.6" fill="#F4F4F4"/>
-    <!-- Forelock -->
-    <path d="M 182 58 Q 184 54 186 58 Q 188 54 190 58 Q 186 56 182 58 Z" fill="#7A5C3A"/>
-    <!-- Legs -->
-    <rect x="118" y="166" width="6" height="32" rx="2" fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2"/>
-    <rect x="132" y="168" width="6" height="30" rx="2" fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2"/>
-    <rect x="152" y="166" width="6" height="32" rx="2" fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2"/>
-    <rect x="166" y="168" width="6" height="30" rx="2" fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2"/>
-    <!-- Hooves -->
-    <rect x="117" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
-    <rect x="131" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
-    <rect x="151" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
-    <rect x="165" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
-    <!-- Tail -->
-    <path d="M 104 138 C 96 132 90 134 88 140 C 92 144 100 144 106 142 Z"
-          fill="url(#llamaGradB)" stroke="#7A5C3A" stroke-width="2" stroke-linejoin="round"/>
+    <!-- Cloud -->
+    <path d="
+      M 56 192
+      C 30 192 14 176 14 156
+      C 14 138 28 124 48 122
+      C 52 100 76 86 104 86
+      C 128 86 148 100 156 122
+      C 180 122 200 138 204 160
+      C 224 162 240 174 240 192
+      C 240 200 234 206 226 206
+      L 56 206
+      C 50 206 56 198 56 192
+      Z
+    " fill="url(#cloudGradB)" stroke="#8B949E" stroke-width="3" stroke-linejoin="round"/>
+    <!-- Llama image (real Ollama llama) -->
+    <image href="llama.png" x="76" y="86" width="124" height="124" preserveAspectRatio="xMidYMid meet"/>
     <!-- Shield -->
-    <path d="M 200 30 L 200 50 C 200 60 210 66 220 68 C 230 66 240 60 240 50 L 240 30 L 220 24 Z"
-          fill="url(#shieldGradB)" stroke="#0D1117" stroke-width="2.5" stroke-linejoin="round"/>
-    <rect x="212" y="44" width="16" height="14" rx="2.5" fill="#0D1117"/>
-    <path d="M 215 44 L 215 40 C 215 36 218 34 220 34 C 222 34 225 36 225 40 L 225 44"
-          fill="none" stroke="#0D1117" stroke-width="2.5" stroke-linecap="round"/>
-    <circle cx="220" cy="50" r="1.5" fill="#3FB950"/>
+    <path d="M 172 178 L 172 206 C 172 220 186 230 200 234 C 214 230 228 220 228 206 L 228 178 L 200 170 Z"
+          fill="url(#shieldGradB)" stroke="#0D1117" stroke-width="3" stroke-linejoin="round"/>
+    <rect x="190" y="196" width="20" height="16" rx="3" fill="#0D1117"/>
+    <path d="M 194 196 L 194 190 C 194 186 198 183 200 183 C 202 183 206 186 206 190 L 206 196"
+          fill="none" stroke="#0D1117" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="200" cy="204" r="2" fill="#3FB950"/>
   </g>
 
   <!-- Text (right two-thirds) -->
