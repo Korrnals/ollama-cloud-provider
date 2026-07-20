@@ -19,6 +19,26 @@
   <!-- Rounded square background (Marketplace style) -->
   <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="url(#bgGrad)"/>
 
+  <!-- Llama head: peeking from behind cloud (drawn before cloud for z-order).
+       Original geometric interpretation — not the official Ollama logo.
+       Two long banana-curved ears (signature llama feature) + rounded head
+       + snout tucking behind the cloud. Recognizable at 16x16 via ear silhouette. -->
+  <g id="llama-head">
+    <!-- Left ear: long, banana-curved, upright -->
+    <path d="M 126 54 C 114 30 114 6 128 2 C 140 12 138 32 142 54 Z"
+          fill="#E8D5B7" stroke="#8B7355" stroke-width="3" stroke-linejoin="round"/>
+    <!-- Right ear: long, banana-curved, upright, slight outward lean -->
+    <path d="M 170 54 C 182 30 182 6 168 2 C 156 12 158 32 154 54 Z"
+          fill="#E8D5B7" stroke="#8B7355" stroke-width="3" stroke-linejoin="round"/>
+    <!-- Head: rounded, bottom tucks behind cloud -->
+    <path d="M 128 52 C 122 38 124 20 140 14 C 158 14 176 22 170 52 C 166 72 156 84 144 84 C 132 84 126 72 128 52 Z"
+          fill="#E8D5B7" stroke="#8B7355" stroke-width="3" stroke-linejoin="round"/>
+    <!-- Eye (visible on upper face, above cloud line) -->
+    <circle cx="148" cy="32" r="3.5" fill="#3D2817"/>
+    <!-- Snout hint: darker cream ellipse at bottom (mostly hidden behind cloud) -->
+    <ellipse cx="146" cy="76" rx="9" ry="6" fill="#D4B896" stroke="#8B7355" stroke-width="2"/>
+  </g>
+
   <!-- Cloud shape: minimalist, centered -->
   <path d="
     M 96 150
