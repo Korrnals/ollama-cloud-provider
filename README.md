@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="media/banner.svg" alt="Ollama Cloud Provider — Security-hardened fork" width="100%" />
+</p>
+
 # Ollama Cloud Provider
 
 **Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.**
