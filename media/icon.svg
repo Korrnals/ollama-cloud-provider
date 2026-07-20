@@ -5,6 +5,10 @@
       <stop offset="0%" stop-color="#F4F4F4"/>
       <stop offset="100%" stop-color="#D2D2D2"/>
     </linearGradient>
+    <linearGradient id="llamaGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#F5E6D3"/>
+      <stop offset="100%" stop-color="#C9A57A"/>
+    </linearGradient>
     <linearGradient id="shieldGrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#3FB950"/>
       <stop offset="100%" stop-color="#1A7F37"/>
@@ -15,96 +19,103 @@
     </linearGradient>
   </defs>
 
-  <!-- Rounded square background (Marketplace style) -->
   <rect x="8" y="8" width="240" height="240" rx="48" ry="48" fill="url(#bgGrad)"/>
 
-  <!-- Cloud shape: enlarged to frame the llama. Bumps top-left, top-center, top-right, right; flat bottom. -->
-  <path d="
-    M 64 172
-    C 40 172 24 158 24 138
-    C 24 120 38 108 58 106
-    C 60 86 82 72 110 72
-    C 132 72 152 84 160 104
-    C 180 106 196 118 200 136
-    C 220 138 232 150 232 166
-    C 232 170 228 172 224 172
-    L 64 172
-    Z
-  " fill="url(#cloudGrad)" stroke="#8B949E" stroke-width="3" stroke-linejoin="round"/>
+  <!-- Cloud: bottom, frames the llama from below. Top is open. -->
+  <path d="M 32 196 C 22 196 14 188 14 178 C 14 170 20 164 28 162 C 30 152 40 146 50 146 C 56 142 64 140 72 142 C 80 136 92 134 104 138 C 114 134 126 134 136 138 C 148 136 160 140 168 148 C 184 148 198 158 200 172 C 218 172 232 182 232 196 C 232 202 228 206 222 206 L 32 206 C 28 206 32 200 32 196 Z"
+        fill="url(#cloudGrad)" stroke="#8B949E" stroke-width="2.5" stroke-linejoin="round"/>
 
-  <!-- LLAMA HEAD — based on Ollama mascot (long muzzle, two long ears, eyes). INSIDE the cloud.
-       Centered at (128, 128). Head: top at y~80, muzzle bottom at y~160.
-       Two large upright ears at top (banana-curved, leaning slightly outward).
-       Elongated face/muzzle (the signature llama feature) — round forehead → narrowing toward snout → wide nostrils. -->
-  <g id="llama-head">
-    <!-- Left ear: upright, leaning slightly outward (banana-curve) -->
-    <path d="M 116 88 C 108 78 104 64 110 56 C 118 60 122 74 122 90 Z"
-          fill="#E8D5B7" stroke="#8B7355" stroke-width="3" stroke-linejoin="round"/>
-    <!-- Inner left ear (pink, smaller, inside the ear) -->
-    <path d="M 115 84 C 111 78 109 70 112 65 C 116 68 118 76 119 86 Z"
-          fill="#D4A896" stroke="none"/>
-    <!-- Right ear: upright, leaning slightly outward -->
-    <path d="M 140 88 C 148 78 152 64 146 56 C 138 60 134 74 134 90 Z"
-          fill="#E8D5B7" stroke="#8B7355" stroke-width="3" stroke-linejoin="round"/>
-    <!-- Inner right ear (pink) -->
-    <path d="M 141 84 C 145 78 147 70 144 65 C 140 68 138 76 137 86 Z"
-          fill="#D4A896" stroke="none"/>
-    <!-- Head/skull: rounded top, two slight bumps for the forehead/cheeks -->
-    <path d="M 128 78
-             C 112 78 104 88 102 102
-             C 100 116 104 130 112 142
-             C 116 148 120 152 128 152
-             C 136 152 140 148 144 142
-             C 152 130 156 116 154 102
-             C 152 88 144 78 128 78 Z"
-          fill="#E8D5B7" stroke="#8B7355" stroke-width="3" stroke-linejoin="round"/>
-    <!-- Forehead tuft (small tuft of fur on top, between ears) -->
-    <path d="M 122 78 C 124 72 126 70 128 70 C 130 70 132 72 134 78
-             C 132 76 130 75 128 75 C 126 75 124 76 122 78 Z"
-          fill="#8B7355" stroke="none"/>
-    <!-- Elongated muzzle: extends down from the head, the signature llama feature.
-         Wider at the top (where it joins the head), narrowing to the nose, then widening at the nostrils. -->
-    <path d="M 118 138
-             C 116 144 116 152 120 158
-             C 122 162 126 164 128 164
-             C 130 164 134 162 136 158
-             C 140 152 140 144 138 138
-             C 136 134 132 132 128 132
-             C 124 132 120 134 118 138 Z"
-          fill="#F0E2C9" stroke="#8B7355" stroke-width="2.5" stroke-linejoin="round"/>
-    <!-- Nostrils: two small dark ovals at the bottom of the muzzle -->
-    <ellipse cx="124" cy="160" rx="1.5" ry="2" fill="#3D2817"/>
-    <ellipse cx="132" cy="160" rx="1.5" ry="2" fill="#3D2817"/>
-    <!-- Mouth: small line below nostrils -->
-    <path d="M 124 162 Q 128 164 132 162" stroke="#3D2817" stroke-width="1.5" fill="none" stroke-linecap="round"/>
-    <!-- Left eye: dark oval (positioned on the upper face, looking forward) -->
-    <ellipse cx="118" cy="108" rx="3" ry="4" fill="#3D2817"/>
-    <!-- Right eye -->
-    <ellipse cx="138" cy="108" rx="3" ry="4" fill="#3D2817"/>
-    <!-- Eye highlights (small white dots) -->
-    <circle cx="119" cy="106" r="1" fill="#F4F4F4"/>
-    <circle cx="139" cy="106" r="1" fill="#F4F4F4"/>
-    <!-- Eyebrow tufts (above eyes, slightly angled) -->
-    <path d="M 113 100 Q 118 98 123 100" stroke="#8B7355" stroke-width="2" fill="none" stroke-linecap="round"/>
-    <path d="M 133 100 Q 138 98 143 100" stroke="#8B7355" stroke-width="2" fill="none" stroke-linecap="round"/>
-  </g>
+  <!-- LLAMA (proper silhouette).
+       Anatomy: small rounded head, two long curved "banana" ears pointing up-and-out,
+       LONG arched NECK, standing body, four thin legs, small tail.
+       Color: warm cream/tan gradient. -->
 
-  <!-- Shield overlay (bottom-right, overlapping cloud edge — security accent) -->
-  <path d="
-    M 172 178
-    L 172 206
-    C 172 220 186 230 200 234
-    C 214 230 228 220 228 206
-    L 228 178
-    L 200 170
-    Z
-  " fill="url(#shieldGrad)" stroke="#0D1117" stroke-width="3" stroke-linejoin="round"/>
+  <!-- Body: oval, with a slight hunch -->
+  <ellipse cx="138" cy="150" rx="36" ry="22" fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2.5"/>
 
-  <!-- Lock body inside shield -->
-  <rect x="190" y="196" width="20" height="16" rx="3" fill="#0D1117"/>
+  <!-- LONG arched NECK: rises from body up-and-forward, narrowing to head -->
+  <path d="M 162 138
+           C 168 110 174 88 180 76
+           C 184 70 188 70 190 76
+           C 188 86 184 102 178 120
+           C 175 132 172 140 170 145 Z"
+        fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
+
+  <!-- Head: small, rounded, on top of the long neck, slight forward tilt -->
+  <ellipse cx="184" cy="70" rx="14" ry="11" fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2.5"/>
+
+  <!-- Long SNOUT/MUZZLE: extends forward from the head (the signature llama feature) -->
+  <path d="M 196 64
+           C 210 62 222 66 224 74
+           C 224 80 220 84 214 84
+           C 206 84 200 80 196 76
+           C 193 72 193 66 196 64 Z"
+        fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
+
+  <!-- Nostrils (two small dark dots at end of snout) -->
+  <ellipse cx="220" cy="74" rx="1.2" ry="1.5" fill="#3D2817"/>
+  <ellipse cx="218" cy="78" rx="1" ry="1.2" fill="#3D2817"/>
+
+  <!-- Mouth: tiny line -->
+  <path d="M 216 80 Q 220 82 222 80" stroke="#3D2817" stroke-width="1" fill="none" stroke-linecap="round"/>
+
+  <!-- Left ear: long banana curve, points up-and-out from the top of the head -->
+  <path d="M 178 60
+           C 172 42 168 28 172 20
+           C 176 18 180 22 182 32
+           C 184 44 184 54 184 62 Z"
+        fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Inner left ear (pink) -->
+  <path d="M 178 56 C 174 44 173 32 175 26 C 177 26 179 32 180 42 C 181 50 182 56 182 60 Z" fill="#D4A896"/>
+
+  <!-- Right ear: long banana curve, points up-and-out -->
+  <path d="M 190 60
+           C 196 42 200 28 196 20
+           C 192 18 188 22 186 32
+           C 184 44 184 54 184 62 Z"
+        fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Inner right ear (pink) -->
+  <path d="M 190 56 C 194 44 195 32 193 26 C 191 26 189 32 188 42 C 187 50 186 56 186 60 Z" fill="#D4A896"/>
+
+  <!-- Eye: small dark dot on the side of the head, looking forward -->
+  <circle cx="186" cy="68" r="1.8" fill="#3D2817"/>
+  <circle cx="186.5" cy="67.4" r="0.6" fill="#F4F4F4"/>
+
+  <!-- Forelock: small tuft of fur on top of head between ears -->
+  <path d="M 182 58 Q 184 54 186 58 Q 188 54 190 58 Q 186 56 182 58 Z" fill="#7A5C3A"/>
+
+  <!-- Front legs: two thin legs going down from the front of body -->
+  <rect x="118" y="166" width="6" height="32" rx="2" fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2"/>
+  <rect x="132" y="168" width="6" height="30" rx="2" fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2"/>
+
+  <!-- Back legs: two thin legs going down from the back of body -->
+  <rect x="152" y="166" width="6" height="32" rx="2" fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2"/>
+  <rect x="166" y="168" width="6" height="30" rx="2" fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2"/>
+
+  <!-- Hooves (small dark caps at bottom of legs) -->
+  <rect x="117" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
+  <rect x="131" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
+  <rect x="151" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
+  <rect x="165" y="196" width="8" height="4" rx="1" fill="#3D2817"/>
+
+  <!-- Small tail: tiny upward curve at the back -->
+  <path d="M 104 138 C 96 132 90 134 88 140 C 92 144 100 144 106 142 Z"
+        fill="url(#llamaGrad)" stroke="#7A5C3A" stroke-width="2" stroke-linejoin="round"/>
+
+  <!-- Shield (security accent, top-right) -->
+  <path d="M 200 30
+           L 200 50
+           C 200 60 210 66 220 68
+           C 230 66 240 60 240 50
+           L 240 30
+           L 220 24
+           Z"
+        fill="url(#shieldGrad)" stroke="#0D1117" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- Lock body -->
+  <rect x="212" y="44" width="16" height="14" rx="2.5" fill="#0D1117"/>
   <!-- Lock shackle -->
-  <path d="M 194 196 L 194 190 C 194 186 198 183 200 183 C 202 183 206 186 206 190 L 206 196"
-        fill="none" stroke="#0D1117" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 215 44 L 215 40 C 215 36 218 34 220 34 C 222 34 225 36 225 40 L 225 44"
+        fill="none" stroke="#0D1117" stroke-width="2.5" stroke-linecap="round"/>
   <!-- Lock keyhole -->
-  <circle cx="200" cy="204" r="2" fill="#3FB950"/>
+  <circle cx="220" cy="50" r="1.5" fill="#3FB950"/>
 </svg>
