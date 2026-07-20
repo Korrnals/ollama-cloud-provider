@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="media/banner.svg" alt="Ollama Cloud Provider — Security-hardened fork" width="100%" />
+  <img src="media/banner.png" alt="Ollama Cloud Provider — Security-hardened fork" width="100%" />
 </p>
 
 # Ollama Cloud Provider
