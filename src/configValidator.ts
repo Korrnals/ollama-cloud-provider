@@ -24,6 +24,11 @@ const DEFAULT_ALLOWED_BASE_URLS: readonly string[] = ['https://ollama.com/v1'];
 const REQUEST_TIMEOUT_MIN_MS = 5000;
 const REQUEST_TIMEOUT_MAX_MS = 600000;
 const MAX_RETRIES_MAX = 10;
+// MEDIUM-2 — reachability probe uses a short 10s timeout (mirrors
+// healthCheck.ts) NOT the full REQUEST_TIMEOUT_MAX_MS (10 min). A
+// validation probe should fail fast, not hang for 10 minutes on an
+// unreachable host.
+const VALIDATE_REACHABILITY_TIMEOUT_MS = 10000;
 
 /**
  * Issue 16 — `Validate Configuration` command result.
@@ -103,7 +108,7 @@ export async function validateConfiguration(
       const controller = new AbortController();
       const timeoutHandle = setTimeout(
         () => controller.abort(),
-        REQUEST_TIMEOUT_MAX_MS,
+        VALIDATE_REACHABILITY_TIMEOUT_MS,
       );
       try {
         const response = await fetch(`${baseUrl}/models`, {
