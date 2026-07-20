@@ -39,7 +39,7 @@ const REDACTION_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }
   { pattern: /sk-[A-Za-z0-9]{20,}/gi, replacement: 'sk-[REDACTED]' },
 ];
 
-function redactSensitive(input: string): string {
+export function redactSensitive(input: string): string {
   let result = input;
   for (const { pattern, replacement } of REDACTION_PATTERNS) {
     result = result.replace(pattern, replacement);

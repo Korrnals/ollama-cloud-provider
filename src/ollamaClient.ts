@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import type { CancellationToken } from 'vscode';
 import { assertBaseUrlAllowed } from './configValidator.js';
-import { logger } from './logger.js';
+import { logger, redactSensitive } from './logger.js';
 import type {
   OpenAICompatibleMessage,
   OpenAICompatibleTool,
@@ -376,7 +376,17 @@ async function extractErrorMessage(response: Response): Promise<string> {
       error?: { message?: string };
       message?: string;
     };
-    return parsed.error?.message || parsed.message || `HTTP ${response.status}`;
+    // MEDIUM-1 — redact the parsed error message before it propagates
+    // to the user-facing `Error.message` (via `HttpError` →
+    // `callbacks.onError` → VS Code notification). A malicious proxy
+    // can reflect the caller's `Authorization: Bearer <key>` header in
+    // a JSON `error.message` string; without this redaction the key
+    // would surface in the VS Code error notification. `logger.warn`
+    // already redacts its own output, but the `Error.message` path is
+    // separate and was unfiltered.
+    return redactSensitive(
+      parsed.error?.message || parsed.message || `HTTP ${response.status}`,
+    );
   } catch (error) {
     // Issue 10 — full-response parse failure is UNEXPECTED. A non-JSON
     // error body (e.g. an HTML error page from a proxy, a partial
@@ -394,7 +404,13 @@ async function extractErrorMessage(response: Response): Promise<string> {
     if (!body) {
       return `HTTP ${response.status}`;
     }
-    return `HTTP ${response.status} (non-JSON body, first 200 chars logged): ${preview}`;
+    // MEDIUM-1 — the preview is raw upstream body and may carry a
+    // reflected secret (e.g. an HTML page echoing the Authorization
+    // header). Redact before the preview is embedded in the message
+    // that flows to the user-facing notification.
+    return redactSensitive(
+      `HTTP ${response.status} (non-JSON body, first 200 chars logged): ${preview}`,
+    );
   }
 }
 
