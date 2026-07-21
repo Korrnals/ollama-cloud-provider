@@ -295,6 +295,58 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     );
   });
 
+  it('routes to vision fallback when enabled and primary cannot handle image', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Enable the pass-through fallback (ADR 0004). The configured
+    // vision model is gemma3:12b — vision-capable, lives on the cloud
+    // connection. The primary (gpt-oss:120b) cannot handle images, so
+    // the provider must route the turn to gemma3:12b instead of
+    // throwing.
+    setConfig({
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+    });
+
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"vision answer"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The fallback fired: fetch was called exactly once, targeting
+    // the vision model (gemma3:12b), not the primary. The user sees
+    // the vision model's streamed text, not the throw.
+    assert.equal(fetchCalls.length, 1, 'fallback issued a single vision call');
+    const body = fetchCalls[0].body as { model: string };
+    assert.equal(body.model, 'gemma3:12b', 'request targeted the vision model');
+    assert.equal(progress.parts.length, 1, 'one text delta reported');
+    assert.equal(
+      (progress.parts[0] as vscode.LanguageModelTextPart).value,
+      'vision answer',
+    );
+  });
+
   it('forwards the image as a data URL when the model supports vision', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
 
