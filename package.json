@@ -129,7 +129,12 @@
               },
               "type": {
                 "type": "string",
-                "enum": ["cloud", "local", "remote", "custom"],
+                "enum": [
+                  "cloud",
+                  "local",
+                  "remote",
+                  "custom"
+                ],
                 "description": "Connection type. Drives the origin label (Cloud/Local/VPS/custom) and the default allowedBaseUrls."
               },
               "enabled": {
@@ -148,12 +153,16 @@
               },
               "allowedBaseUrls": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "Per-connection whitelist. The extension refuses to send the connection's API key to any baseUrl not in this list. Defaults to [baseUrl] (fail-closed)."
               },
               "visionModels": {
                 "type": "array",
-                "items": { "type": "string" },
+                "items": {
+                  "type": "string"
+                },
                 "description": "Per-connection vision wildcard patterns. A model id matching any pattern is treated as image-capable."
               },
               "requiresApiKey": {
@@ -161,7 +170,10 @@
                 "description": "Whether an API key is required for this connection. Defaults to true for cloud/remote/custom, false for local."
               }
             },
-            "required": ["id", "baseUrl"]
+            "required": [
+              "id",
+              "baseUrl"
+            ]
           },
           "default": [],
           "description": "Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint (Cloud, Local, VPS, or custom) with its own allowedBaseUrls whitelist and API key. When empty, the extension uses the legacy single-connection settings.",
@@ -169,7 +181,9 @@
         },
         "ollamaCloud.visionModels": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection visionModels override this list for that connection's models.",
           "scope": "application"
@@ -201,6 +215,7 @@
     "eslint": "9.39.2",
     "globals": "17.0.0",
     "mocha": "^11.7.6",
+    "sharp": "^0.35.3",
     "typescript": "5.9.3"
   }
 }
