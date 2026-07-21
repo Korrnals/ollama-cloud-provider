@@ -70,6 +70,14 @@
       {
         "command": "ollamaCloud.validateConfig",
         "title": "Ollama Cloud: Validate Configuration"
+      },
+      {
+        "command": "ollamaCloud.setVisionFallbackModel",
+        "title": "Ollama Cloud: Set Vision Fallback Model"
+      },
+      {
+        "command": "ollamaCloud.setVisionFallbackConnection",
+        "title": "Ollama Cloud: Set Vision Fallback Connection"
       }
     ],
     "configuration": {
@@ -186,6 +194,24 @@
           },
           "default": [],
           "description": "Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection visionModels override this list for that connection's models.",
+          "scope": "application"
+        },
+        "ollamaCloud.visionFallback.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Vision Fallback Pass-through (ADR 0004). When the primary model cannot handle an image, route the turn to a vision-capable model. Opt-in, default off. See `ollamaCloud.visionFallback.model` and `ollamaCloud.visionFallback.connection`.",
+          "scope": "application"
+        },
+        "ollamaCloud.visionFallback.model": {
+          "type": "string",
+          "default": "",
+          "description": "Vision-capable model id used for the fallback turn. When empty, the extension auto-searches the primary connection's catalog for the first vision-capable model. Set via the command palette (Ollama Cloud: Set Vision Fallback Model) or enter a model id manually.",
+          "scope": "application"
+        },
+        "ollamaCloud.visionFallback.connection": {
+          "type": "string",
+          "default": "",
+          "description": "Optional connection id for the vision fallback. When empty, the extension uses the primary connection (where the primary model lives). Set via the command palette (Ollama Cloud: Set Vision Fallback Connection) when the primary connection has no vision models.",
           "scope": "application"
         }
       }

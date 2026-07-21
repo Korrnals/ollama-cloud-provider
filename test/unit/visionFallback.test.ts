@@ -374,6 +374,15 @@ describe('visionFallback.executePassThrough', () => {
     global.fetch = (async (_input: string | URL, init?: RequestInit) => {
       const signal = init?.signal;
       if (signal) {
+        // Faithful to real fetch: an already-aborted signal rejects
+        // synchronously. The abort event fired before fetch was called
+        // (during streamChat's entry, when it observed the token was
+        // already cancelled), so a late-registered listener would miss
+        // it — real fetch checks `signal.aborted` directly. The mock
+        // must do the same or it masks the production race fix.
+        if (signal.aborted) {
+          abortSeen = true;
+        }
         signal.addEventListener('abort', () => {
           abortSeen = true;
         });

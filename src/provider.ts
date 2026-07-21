@@ -23,6 +23,7 @@ import {
 } from './modelCatalog.js';
 import { OllamaClient } from './ollamaClient.js';
 import { loadConnections, openAiBaseUrl } from './connections.js';
+import { executePassThrough, shouldFallback } from './visionFallback.js';
 import type { UsageInfo } from './protocolTypes.js';
 
 const AUTH_REQUIRED_DETAIL =
@@ -142,6 +143,14 @@ export class OllamaCloudChatProvider
     }
   }
 
+  /**
+   * Read-only access to the catalog list. Exposed for the vision
+   * fallback command handlers (QuickPick of vision-capable models).
+   */
+  modelCatalogList(): readonly ModelDefinition[] {
+    return this.modelCatalog.list();
+  }
+
   async showRegisteredModels(): Promise<void> {
     const hasApiKey = await this.authManager.hasApiKey();
     const models = this.modelCatalog.list();
@@ -222,14 +231,37 @@ export class OllamaCloudChatProvider
     }
 
     // Vision gate — SEC-03 complement: do NOT silently drop image
-    // attachments sent to a text-only model. Throw a clear error so
-    // the user sees why the request failed and can switch to a
-    // vision-capable model. Uses `resolveVisionSupport` (metadata +
-    // family markers + manual `visionModels` patterns).
+    // attachments sent to a text-only model. Two outcomes:
+    //   - Fallback ENABLED (ADR 0004): when the primary model cannot
+    //     handle the image, route the turn to a vision-capable model
+    //     via `executePassThrough` (single-hop pass-through). The vision
+    //     model answers the user directly; the primary is not involved.
+    //   - Fallback DISABLED: throw a clear error so the user sees why
+    //     the request failed and can switch to a vision-capable model
+    //     (constraint 9 — no silent degradation; current behaviour).
     const requestHasImages = messages.some((m) => hasImageParts(m.content));
     const connectionVisionPatterns = connection?.visionModels ?? [];
     const supportsImages = resolveVisionSupport(model, connectionVisionPatterns);
     if (requestHasImages && !supportsImages) {
+      const fallbackEnabled = vscode.workspace
+        .getConfiguration('ollamaCloud')
+        .get<boolean>('visionFallback.enabled', false);
+      if (fallbackEnabled && shouldFallback(model, messages)) {
+        // ADR 0004 — pass-through. The vision model streams to the
+        // user via the same progress reporter + CancellationToken.
+        // Returns from here; the primary path below is not reached.
+        return await executePassThrough({
+          primaryModel: model,
+          primaryConnection: connection,
+          messages,
+          options,
+          progress,
+          token,
+          authManager: this.authManager,
+          catalog: this.modelCatalog.list(),
+          connections,
+        });
+      }
       throw new Error(
         `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
       );
