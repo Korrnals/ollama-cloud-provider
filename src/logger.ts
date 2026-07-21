@@ -14,11 +14,17 @@ const OUTPUT_CHANNEL_NAME = 'Ollama Cloud';
  *   4. `"apiKey":"<value>"`  (JSON)          → `"apiKey":"[REDACTED]"`
  *   5. `api_key=<value>` (query/CLI form)    → `api_key=[REDACTED]`
  *   6. `sk-<20+ alphanumeric chars>`         → `sk-[REDACTED]`
+ *   7. `data:image/<mime>;base64,<payload>` → `data:image/[mime];base64,[REDACTED]`
  *
  * Why: a naive logger calls `JSON.stringify(detail)` unconditionally. If
  * a detail object carried an `Authorization` header or an `api_key` field,
  * the secret landed in the output channel log in cleartext. This layer
  * guarantees no secret pattern reaches the log, regardless of caller.
+ *
+ * Pattern 7 is defense-in-depth for the v0.4.0 security audit finding #1.
+ * No active leak exists today (converted messages are not logged), but the
+ * upcoming vision fallback feature will forward base64 image data URLs,
+ * expanding the surface that could reach this logger.
  */
 const REDACTION_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }> = [
   // 1. Full Authorization header — most specific, apply before generic Bearer.
@@ -37,6 +43,11 @@ const REDACTION_PATTERNS: ReadonlyArray<{ pattern: RegExp; replacement: string }
   { pattern: /api_key=[^\s&"']+/gi, replacement: 'api_key=[REDACTED]' },
   // 6. OpenAI-style key prefix sk- followed by 20+ alphanumeric chars.
   { pattern: /sk-[A-Za-z0-9]{20,}/gi, replacement: 'sk-[REDACTED]' },
+  // 7. Base64 image data URLs (data:image/<mime>;base64,<payload>).
+  // Defense-in-depth for v0.4.0 audit finding #1 — masks the entire base64
+  // payload so vision-bound image bytes never reach the output channel,
+  // regardless of the mime type (png, jpeg, webp, gif, svg+xml).
+  { pattern: /data:image\/[a-z+]+;base64,[A-Za-z0-9+/=]+/gi, replacement: 'data:image/[mime];base64,[REDACTED]' },
 ];
 
 export function redactSensitive(input: string): string {
