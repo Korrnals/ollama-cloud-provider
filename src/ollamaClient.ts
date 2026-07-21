@@ -135,9 +135,20 @@ export class OllamaClient {
 
     // Combine the caller's CancellationToken with the timeout: if the
     // caller cancels, abort. The timeout's abort is wired above.
+    // Race fix — the listener is registered synchronously here, before
+    // any `await`, but the caller may have already cancelled during the
+    // async setup that ran BEFORE `streamChat` was entered (e.g. the
+    // vision-fallback path awaits `getApiKeyForConnection` before
+    // calling us). `onCancellationRequested` does not fire retroactively
+    // for an already-cancelled token, so we must check synchronously
+    // and abort now. Without this, a cancel that arrives during setup
+    // is silently lost — both in production and in tests.
     const cancelListener = cancellationToken?.onCancellationRequested(() =>
       controller.abort(),
     );
+    if (cancellationToken?.isCancellationRequested) {
+      controller.abort();
+    }
 
     let done = false;
 

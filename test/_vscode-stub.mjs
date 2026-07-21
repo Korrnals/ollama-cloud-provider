@@ -114,6 +114,7 @@ export const window = {
   showWarningMessage: async () => undefined,
   showErrorMessage: async () => undefined,
   showInputBox: async () => undefined,
+  showQuickPick: async () => undefined,
 };
 
 export const workspace = {
@@ -232,6 +233,12 @@ export const ThemeIcon = {
   File: 'file',
 };
 
+export const ConfigurationTarget = {
+  Global: 1,
+  Workspace: 2,
+  WorkspaceFolder: 3,
+};
+
 export function createExtensionContext() {
   return {
     subscriptions: [],
@@ -279,6 +286,7 @@ export default {
   commands,
   lm,
   ThemeIcon,
+  ConfigurationTarget,
   createExtensionContext,
   setWorkspaceConfig,
   resetWorkspaceConfig,

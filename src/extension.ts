@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { logger } from './logger.js';
 import { OllamaCloudChatProvider } from './provider.js';
+import { pickVisionFallbackModel, pickVisionFallbackConnection } from './visionFallbackCommands.js';
 
 /**
  * Issue 17 — smart "Set API Key" notification.
@@ -114,6 +115,12 @@ export function activate(context: vscode.ExtensionContext): void {
       ),
       vscode.commands.registerCommand('ollamaCloud.validateConfig', () =>
         provider.validateConfig(),
+      ),
+      vscode.commands.registerCommand('ollamaCloud.setVisionFallbackModel', () =>
+        pickVisionFallbackModel(provider),
+      ),
+      vscode.commands.registerCommand('ollamaCloud.setVisionFallbackConnection', () =>
+        pickVisionFallbackConnection(),
       ),
       vscode.lm.registerLanguageModelChatProvider('ollama-cloud', provider),
     );
