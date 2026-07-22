@@ -54,15 +54,85 @@ The extension is designed around three security invariants:
 git clone https://github.com/Korrnals/ollama-cloud-provider.git
 cd ollama-cloud-provider
 npm ci
+npm run compile
 npm run package
-code --install-extension ollama-cloud-provider-*.vsix
+code --install-extension ollama-cloud-provider-0.5.0.vsix
 ```
+
+`npm run package` is an alias for `vsce package` (see `package.json` `scripts.package`). It respects `.vscodeignore` and produces `ollama-cloud-provider-<version>.vsix` in the repo root. The current version is `0.5.0`.
+
+### Update from a local VSIX
+
+If you installed from a GitHub Release VSIX or built one locally, update by reinstalling:
+
+```bash
+code --install-extension ollama-cloud-provider-0.5.0.vsix --force
+```
+
+The `--force` flag overwrites the existing version. Without it, VS Code reports "extension already installed" and skips.
 
 ## Setup
 
-1. Get an Ollama Cloud API key at [ollama.com](https://ollama.com/).
-2. Run `Ollama Cloud: Set API Key` from the VS Code command palette.
-3. Open Copilot Chat and select an Ollama Cloud model from the model picker.
+### 1. Get an API key
+
+Get an Ollama Cloud API key at [ollama.com](https://ollama.com/).
+
+### 2. Configure the extension — three ways
+
+#### Via Command Palette (recommended for first-time setup)
+
+1. Press `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (macOS) to open the Command Palette.
+2. Run `Ollama Cloud: Set API Key`.
+3. Enter your API key. It is stored in OS-backed `SecretStorage` — never written to `settings.json` or workspace files.
+4. Run `Ollama Cloud: Check Connection` to verify the extension can reach your endpoint and discover models.
+5. Open Copilot Chat and select an Ollama Cloud model from the model picker.
+
+Multi-connection endpoints (Cloud, Local, VPS, custom) are configured via `ollamaCloud.connections` in `settings.json` (see below). Per-connection API keys are stored under separate `SecretStorage` keys (`ollamaCloud.apiKey.<connectionId>`); set them by running `Ollama Cloud: Set API Key` after switching the active connection, or by calling the extension API. The Command Palette flow covers the default Cloud connection end-to-end.
+
+#### Via Settings UI
+
+1. Open Settings (`Ctrl+,` or `Cmd+,`).
+2. Search for `ollamaCloud`.
+3. Set `Ollama Cloud: Base Url` — must be in the `Allowed Base Urls` whitelist.
+4. Set `Ollama Cloud: Allowed Base Urls` — add your endpoint if not already listed.
+5. Note: the `Ollama Cloud: Api Key` setting is a fallback only. Prefer the Command Palette (`Ollama Cloud: Set API Key`), which stores the key in `SecretStorage` instead of plaintext settings.
+
+#### Via settings.json
+
+```json
+{
+  "ollamaCloud.baseUrl": "https://ollama.com/v1",
+  "ollamaCloud.allowedBaseUrls": ["https://ollama.com/v1"],
+  "ollamaCloud.requestTimeoutMs": 120000,
+  "ollamaCloud.maxRetries": 3,
+  "ollamaCloud.connections": [
+    {
+      "id": "cloud",
+      "label": "Cloud",
+      "type": "cloud",
+      "enabled": true,
+      "baseUrl": "https://ollama.com",
+      "openaiCompatiblePath": "/v1",
+      "requiresApiKey": true
+    }
+  ]
+}
+```
+
+For the API key, still use the Command Palette (`Ollama Cloud: Set API Key`) — it stores the key in `SecretStorage`, not in `settings.json`. All settings are `scope: "application"`, so workspace folders cannot override them.
+
+### 3. Enable Vision Fallback (optional)
+
+If you want the extension to automatically use a vision-capable model when the selected model cannot handle images:
+
+1. Set `ollamaCloud.visionFallback.enabled` to `true`.
+2. Run `Ollama Cloud: Set Vision Fallback Model` to pick a vision-capable model from the catalog (QuickPick).
+3. Optionally run `Ollama Cloud: Set Vision Fallback Connection` if the vision model lives on a different connection.
+4. When you send an image to a non-vision model, the extension swaps to the vision model for that turn and notifies you.
+
+### 4. Verify
+
+Run `Ollama Cloud: Check Connection` to confirm the extension can reach your endpoint and discover models. Then open Copilot Chat and select a model from the picker.
 
 ## Configuration
 
