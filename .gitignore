@@ -57,6 +57,9 @@ test-results/
 *.spdx.xml
 cosign.pub
 
+# === Code review (team-local, never commit) ===
+.cr/
+
 # === Local development state ===
 .ollama-cloud-dev/
 local-settings.json
