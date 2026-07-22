@@ -7,6 +7,14 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 _No changes yet. Merged PRs add bullets here; the Git Workflow Specialist promotes this section to a dated release at cut time (see `git-workflow.instructions.md` versioning cadence)._
 
+## [0.5.1] - 2026-07-23
+
+### Changed
+- README rewritten as professional public-facing page (Marketplace + GitHub). Removed internal/dev/CI noise. Marketplace install added as recommended path.
+
+### Notes
+- Docs-only release. No code changes. Version bump to refresh Marketplace README (Marketplace reads README from VSIX, not from GitHub).
+
 ## [0.5.0] - 2026-07-22
 
 ### Added
