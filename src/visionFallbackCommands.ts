@@ -99,12 +99,23 @@ export async function pickVisionFallbackConnection(): Promise<void> {
     return;
   }
 
-  const items: ConnectionQuickPickItem[] = connections.map((connection) => ({
+  // M3: "Clear" option first — lets the user reset the setting
+  // back to empty (use primary connection). Without this, once set,
+  // the user is stuck with no UI way to clear it.
+  const clearItem: ConnectionQuickPickItem = {
+    label: '$(clear-all) Clear — use primary connection',
+    description: 'reset vision fallback connection',
+    connectionId: '',
+  };
+
+  const connectionItems: ConnectionQuickPickItem[] = connections.map((connection) => ({
     label: connection.label,
     description: connection.type,
     detail: connection.baseUrl,
     connectionId: connection.id,
   }));
+
+  const items: ConnectionQuickPickItem[] = [clearItem, ...connectionItems];
 
   const selected = await vscode.window.showQuickPick(items, {
     title: 'Ollama Cloud: Vision Fallback Connection',
@@ -122,8 +133,16 @@ export async function pickVisionFallbackConnection(): Promise<void> {
       selected.connectionId,
       vscode.ConfigurationTarget.Global,
     );
-  logger.info(`vision fallback connection set to ${selected.connectionId}`);
-  void vscode.window.showInformationMessage(
-    `Vision fallback connection set to ${selected.label}.`,
-  );
+
+  if (selected.connectionId === '') {
+    logger.info('vision fallback connection cleared — using primary connection');
+    void vscode.window.showInformationMessage(
+      'Vision fallback connection cleared — using primary connection.',
+    );
+  } else {
+    logger.info(`vision fallback connection set to ${selected.connectionId}`);
+    void vscode.window.showInformationMessage(
+      `Vision fallback connection set to ${selected.label}.`,
+    );
+  }
 }

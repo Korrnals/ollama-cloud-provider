@@ -176,8 +176,14 @@ function resolveVisionConnection(
     if (configured) {
       return configured;
     }
-    // Fall back to the vision model's own connection if the
-    // configured connection id is stale.
+    // M2: configured connection id is stale (user deleted the
+    // connection). Warn so the user can diagnose, then fall back
+    // to the vision model's own connection — graceful degrade, no
+    // throw (stale config must not break the fallback turn).
+    logger.warn(
+      `visionFallback.connection "${configuredConnectionId.trim()}" not found — falling back to primary connection`,
+      { configuredConnection: configuredConnectionId.trim() },
+    );
   }
   // The vision model's own connection is the safest default — its
   // allowedBaseUrls whitelist matches the model's host.
