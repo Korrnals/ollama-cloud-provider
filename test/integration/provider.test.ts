@@ -446,3 +446,104 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.equal(userEntry.content, 'hi');
   });
 });
+
+/**
+ * ADR 0004 constraint 9 — no silent degradation. When the user enables
+ * `visionFallback.enabled` but the configured `visionFallback.model`
+ * points at a non-existent (or non-vision) id, the provider must throw
+ * an actionable error to the user, not silently drop the image or fall
+ * back to the text-only primary.
+ */
+describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — fallback enabled but no vision model', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+    });
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    setConfig({});
+  });
+
+  function imageMsg(): vscode.LanguageModelChatRequestMessage {
+    return {
+      role: vscode.LanguageModelChatMessageRole.User,
+      content: [
+        new vscode.LanguageModelTextPart('what is this?'),
+        new vscode.LanguageModelDataPart(
+          new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          'image/png',
+        ),
+      ] as unknown as vscode.LanguageModelChatRequestMessage['content'],
+      name: undefined,
+    };
+  }
+
+  it('throws when fallback is enabled but visionFallback.model is a non-existent id', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      'visionFallback.enabled': true,
+      // No catalog model has this id → resolveVisionModel falls through
+      // to auto-search. Auto-search also fails because the catalog was
+      // refreshed to contain ONLY the non-vision primary (see the
+      // stubbed /v1/models response below) → executePassThrough throws
+      // (ADR 0004 constraint 9 — no silent degradation).
+      'visionFallback.model': 'ollama-cloud/totally-fake-vision-model',
+    });
+
+    // First fetch: the catalog refresh (/v1/models). Return ONLY the
+    // primary model id so the catalog has no vision-capable model to
+    // auto-search. Subsequent fetches (the chat stream) must never
+    // happen — the provider must throw before reaching them.
+    let fetchCount = 0;
+    global.fetch = (async (input: string | URL) => {
+      fetchCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/models')) {
+        return new Response(
+          JSON.stringify({ data: [{ id: 'gpt-oss:120b' }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      throw new Error(
+        'chat fetch must not be called when no vision model resolves',
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    // Refresh the catalog so `list()` returns only the primary model.
+    // Without this, the default KNOWN_MODELS snapshot includes
+    // gemma3:12b (vision-capable, cloud) and auto-search would find it.
+    await provider.syncModelCatalog(true);
+
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [imageMsg()],
+          {
+            modelOptions: {},
+            justification: 'test',
+          } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      /No vision-capable model found/,
+    );
+    // Exactly one fetch — the catalog refresh. The chat fetch must
+    // never have been issued.
+    assert.equal(fetchCount, 1, 'only the catalog refresh fetch may occur');
+  });
+});
