@@ -2,53 +2,64 @@
   <img src="media/banner.png" alt="Ollama Cloud Provider" width="100%" />
 </p>
 
+[![Version](https://img.shields.io/visual-studio-marketplace/v/Korrnals.ollama-cloud-provider?style=flat-square&label=Marketplace)](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/Korrnals.ollama-cloud-provider?style=flat-square)](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider)
+
 # Ollama Cloud Provider
 
-**Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.**
+**Use Ollama Cloud models in VS Code Copilot Chat.**
 
-Ollama Cloud Provider registers Ollama Cloud models as native VS Code language models, making them available in Copilot Chat. It is built with supply-chain hardening, secret-handling safeguards, and reliability features from the ground up.
+## Overview
+
+Ollama Cloud Provider registers Ollama Cloud models as native VS Code language models, making them available in the Copilot Chat model picker. Configure an API key, select a model, and chat — no wrappers, no extra UI, no separate chat window.
+
+The extension is built for reliability and safety: API keys live in OS-backed secret storage, requests only go to URLs you explicitly allow, and every release is signed and checksummed.
+
+## Key features
+
+- **Native Copilot Chat integration** — Ollama Cloud models appear in the Copilot Chat model picker as first-class VS Code language models.
+- **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
+- **Streaming responses** — token streaming with reasoning/thinking support.
+- **Tool calling** — handled natively by VS Code, with no shell execution from the extension.
+- **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
+- **Retry and timeout** — exponential backoff for transient failures, configurable request timeout.
+- **Health check** — probe the endpoint and discover models before chatting.
+- **Configuration validation** — catch misconfiguration (missing key, URL not whitelisted) before it breaks a chat.
 
 ## Security posture
 
-The extension is designed around three security invariants:
+Security is a first-class concern:
 
-1. **Verifiable supply chain** — every VSIX is signed with Sigstore (keyless) + GPG, with SHA256 checksums and SBOM. Releases are cut locally via `scripts/local-ci/run-release-local.sh` (GitHub Actions CI is disabled due to billing lock, 2026-07-22).
-2. **Logger redaction** — `Bearer` tokens, `api_key` patterns, and `data:image/*;base64,...` payloads are masked before any `JSON.stringify`.
-3. **baseUrl whitelist** — the extension refuses to send requests to any host not in `ollamaCloud.allowedBaseUrls`.
-
-## Features
-
-- Native VS Code `LanguageModelChatProvider` — Ollama Cloud models appear in Copilot Chat model picker.
-- API key stored in OS-backed `SecretStorage` (not plaintext settings).
-- `scope: "application"` on all config — workspace `.vscode/settings.json` cannot override keys or redirect traffic.
-- Streaming responses with thinking/reasoning support.
-- Tool calling (handled by VS Code, not the extension — no `child_process`).
-- Multi-connection support — distinct OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection `allowedBaseUrls` whitelist and API key isolation.
-- Health check and configuration validation commands.
-- Retry with exponential backoff for transient failures.
-- Configurable request timeout.
-- **Vision Fallback Pass-through** (ADR 0004) — when the selected model cannot handle image input and the user enables `ollamaCloud.visionFallback`, the extension automatically uses a user-configured vision-capable model for that turn. The vision model answers directly; the next turn returns to the primary model. Opt-in, single-hop, with routing disclosure notification.
+- **Supply chain integrity** — every release is signed and checksummed.
+- **Secret safety** — API keys live in OS-backed secret storage, never in settings files or logs.
+- **Network boundary** — requests only go to URLs you explicitly allow.
 
 ## Installation
 
-### From GitHub Release (recommended)
+### From the VS Code Marketplace (recommended)
 
-1. Go to [Releases](https://github.com/Korrnals/ollama-cloud-provider/releases).
-2. Download the `.vsix` for the latest release.
-3. Verify the SHA256 checksum:
-   ```bash
-   sha256sum -c sha256.txt
-   ```
-4. Verify the Sigstore signature (optional, requires [cosign](https://github.com/sigstore/cosign)):
-   ```bash
-   cosign verify-blob --certificate-identity-regexp 'https://github\.com/Korrnals/ollama-cloud-provider/.+' --certificate-oidc-issuer https://token.actions.githubusercontent.com --signature ollama-cloud-provider-*.vsix.sig ollama-cloud-provider-*.vsix
-   ```
-5. Install:
-   ```bash
-   code --install-extension ollama-cloud-provider-*.vsix
-   ```
+Open the [Ollama Cloud Provider page](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider) and click **Install**. VS Code opens and installs the extension automatically.
+
+Or install from the command line:
+
+```bash
+code --install-extension Korrnals.ollama-cloud-provider
+```
+
+### From a GitHub Release (signed VSIX)
+
+Download the `.vsix` and checksum file from [Releases](https://github.com/Korrnals/ollama-cloud-provider/releases), verify the SHA256 checksum, and install:
+
+```bash
+sha256sum -c sha256.txt
+code --install-extension ollama-cloud-provider-*.vsix
+```
+
+Releases are signed; see the release notes for signature verification details.
 
 ### From source
+
+For developers who want to build locally:
 
 ```bash
 git clone https://github.com/Korrnals/ollama-cloud-provider.git
@@ -56,20 +67,8 @@ cd ollama-cloud-provider
 npm ci
 npm run compile
 npm run package
-code --install-extension ollama-cloud-provider-0.5.0.vsix
+code --install-extension ollama-cloud-provider-*.vsix
 ```
-
-`npm run package` is an alias for `vsce package` (see `package.json` `scripts.package`). It respects `.vscodeignore` and produces `ollama-cloud-provider-<version>.vsix` in the repo root. The current version is `0.5.0`.
-
-### Update from a local VSIX
-
-If you installed from a GitHub Release VSIX or built one locally, update by reinstalling:
-
-```bash
-code --install-extension ollama-cloud-provider-0.5.0.vsix --force
-```
-
-The `--force` flag overwrites the existing version. Without it, VS Code reports "extension already installed" and skips.
 
 ## Setup
 
@@ -77,27 +76,27 @@ The `--force` flag overwrites the existing version. Without it, VS Code reports 
 
 Get an Ollama Cloud API key at [ollama.com](https://ollama.com/).
 
-### 2. Configure the extension — three ways
+### 2. Configure the extension
 
-#### Via Command Palette (recommended for first-time setup)
+Three ways to configure — pick one.
 
-1. Press `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (macOS) to open the Command Palette.
+#### Command Palette (recommended)
+
+1. Open the Command Palette: `Ctrl+Shift+P` (Windows/Linux) or `Cmd+Shift+P` (macOS).
 2. Run `Ollama Cloud: Set API Key`.
-3. Enter your API key. It is stored in OS-backed `SecretStorage` — never written to `settings.json` or workspace files.
-4. Run `Ollama Cloud: Check Connection` to verify the extension can reach your endpoint and discover models.
-5. Open Copilot Chat and select an Ollama Cloud model from the model picker.
+3. Enter the key. It is stored in OS-backed secret storage — never written to `settings.json`.
+4. Run `Ollama Cloud: Check Connection` to verify the endpoint and discover models.
+5. Open Copilot Chat and select an Ollama Cloud model from the picker.
 
-Multi-connection endpoints (Cloud, Local, VPS, custom) are configured via `ollamaCloud.connections` in `settings.json` (see below). Per-connection API keys are stored under separate `SecretStorage` keys (`ollamaCloud.apiKey.<connectionId>`); set them by running `Ollama Cloud: Set API Key` after switching the active connection, or by calling the extension API. The Command Palette flow covers the default Cloud connection end-to-end.
+#### Settings UI
 
-#### Via Settings UI
-
-1. Open Settings (`Ctrl+,` or `Cmd+,`).
+1. Open Settings: `Ctrl+,` or `Cmd+,`.
 2. Search for `ollamaCloud`.
-3. Set `Ollama Cloud: Base Url` — must be in the `Allowed Base Urls` whitelist.
-4. Set `Ollama Cloud: Allowed Base Urls` — add your endpoint if not already listed.
-5. Note: the `Ollama Cloud: Api Key` setting is a fallback only. Prefer the Command Palette (`Ollama Cloud: Set API Key`), which stores the key in `SecretStorage` instead of plaintext settings.
+3. Set `Ollama Cloud: Base Url` — must be in the allowed URLs list.
+4. Add the endpoint to `Ollama Cloud: Allowed Base Urls` if not already listed.
+5. Prefer `Ollama Cloud: Set API Key` over the `Ollama Cloud: Api Key` setting — the command stores the key in secret storage instead of plaintext.
 
-#### Via settings.json
+#### settings.json
 
 ```json
 {
@@ -119,33 +118,24 @@ Multi-connection endpoints (Cloud, Local, VPS, custom) are configured via `ollam
 }
 ```
 
-For the API key, still use the Command Palette (`Ollama Cloud: Set API Key`) — it stores the key in `SecretStorage`, not in `settings.json`. All settings are `scope: "application"`, so workspace folders cannot override them.
+For the API key, use `Ollama Cloud: Set API Key` — it stores the key in secret storage, not in `settings.json`. All settings are `scope: "application"`, so workspace folders cannot override them.
 
-### 3. Enable Vision Fallback (optional)
+### 3. Verify
 
-If you want the extension to automatically use a vision-capable model when the selected model cannot handle images:
-
-1. Set `ollamaCloud.visionFallback.enabled` to `true`.
-2. Run `Ollama Cloud: Set Vision Fallback Model` to pick a vision-capable model from the catalog (QuickPick).
-3. Optionally run `Ollama Cloud: Set Vision Fallback Connection` if the vision model lives on a different connection.
-4. When you send an image to a non-vision model, the extension swaps to the vision model for that turn and notifies you.
-
-### 4. Verify
-
-Run `Ollama Cloud: Check Connection` to confirm the extension can reach your endpoint and discover models. Then open Copilot Chat and select a model from the picker.
+Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endpoint and discover models. Then open Copilot Chat and select a model from the picker.
 
 ## Configuration
 
 | Setting | Default | Description |
 |---|---|---|
-| `ollamaCloud.apiKey` | `""` | Fallback API key. Prefer the command palette (stores in SecretStorage). |
+| `ollamaCloud.apiKey` | `""` | Fallback API key. Prefer `Ollama Cloud: Set API Key` (stores in secret storage). |
 | `ollamaCloud.baseUrl` | `https://ollama.com/v1` | API base URL. Must be in `allowedBaseUrls`. |
 | `ollamaCloud.allowedBaseUrls` | `["https://ollama.com/v1"]` | Whitelist of permitted base URLs. |
-| `ollamaCloud.requestTimeoutMs` | `120000` | Request timeout in ms. |
-| `ollamaCloud.maxRetries` | `3` | Max retries for transient failures (429, 5xx). |
-| `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own `allowedBaseUrls` whitelist and API key. When empty, the legacy single-connection settings are used. |
+| `ollamaCloud.requestTimeoutMs` | `120000` | Request timeout, in milliseconds. |
+| `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx). |
+| `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. |
 | `ollamaCloud.visionModels` | `[]` | Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection `visionModels` override this list. |
-| `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback Pass-through (ADR 0004). Opt-in. |
+| `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback. Opt-in. |
 | `ollamaCloud.visionFallback.model` | `""` | Vision-capable model id for fallback. If empty, auto-searches the primary connection's catalog for the first vision-capable model. |
 | `ollamaCloud.visionFallback.connection` | `""` | Connection id for the vision model. If empty, uses the primary connection. |
 
@@ -153,31 +143,27 @@ All settings are `scope: "application"` — workspace folders cannot override th
 
 ## Commands
 
-- `Ollama Cloud: Set API Key` — store the API key in OS-backed SecretStorage.
-- `Ollama Cloud: Clear API Key` — remove the stored key.
-- `Ollama Cloud: Show Registered Models` — list models registered with VS Code.
-- `Ollama Cloud: Show Logs` — open the extension output channel.
-- `Ollama Cloud: Check Connection` — probe the configured endpoint.
-- `Ollama Cloud: Validate Configuration` — validate settings (baseUrl in whitelist, key present).
-- `Ollama Cloud: Set Vision Fallback Model` — QuickPick from vision-capable models in the catalog.
-- `Ollama Cloud: Set Vision Fallback Connection` — QuickPick from configured connections (includes a "Clear — use primary connection" option).
+| Command | Description |
+|---|---|
+| `Ollama Cloud: Set API Key` | Store the API key in OS-backed secret storage. |
+| `Ollama Cloud: Clear API Key` | Remove the stored key. |
+| `Ollama Cloud: Check Connection` | Probe the configured endpoint. |
+| `Ollama Cloud: Validate Configuration` | Validate settings (URL in whitelist, key present). |
+| `Ollama Cloud: Set Vision Fallback Model` | Pick a vision-capable model from the catalog. |
+| `Ollama Cloud: Set Vision Fallback Connection` | Pick a connection for the vision model (includes a "Clear — use primary connection" option). |
+| `Ollama Cloud: Show Registered Models` | List models registered with VS Code. |
+| `Ollama Cloud: Show Logs` | Open the extension output channel. |
 
-## Architecture decisions
+## Vision Fallback
 
-This extension follows a set of recorded architectural decisions:
+When the selected model cannot handle images, the extension can automatically use a vision-capable model you configure. The vision model answers for that turn only; the next turn returns to the primary model. Opt-in, with a routing disclosure notification.
 
-- [ADR 0001 — Security goals and non-goals](docs/adr/0001-security-goals.md)
-- [ADR 0002 — Signing strategy](docs/adr/0002-signing-strategy.md)
-- [ADR 0003 — Native provider UX](docs/adr/0003-native-provider-ux.md)
-- [ADR 0004 — Vision Fallback Pass-through](docs/adr/0004-vision-fallback-pass-through.md)
+To enable:
 
-## CI
-
-CI runs locally via `scripts/local-ci/` — see [DEVELOPMENT.md](DEVELOPMENT.md). External GitHub Actions CI is disabled due to billing lock (2026-07-22); re-enable when billing is resolved.
-
-## Security
-
-See [SECURITY.md](SECURITY.md) for the security policy and responsible disclosure.
+1. Set `ollamaCloud.visionFallback.enabled` to `true`.
+2. Run `Ollama Cloud: Set Vision Fallback Model` to pick a vision-capable model from the catalog.
+3. Optionally run `Ollama Cloud: Set Vision Fallback Connection` if the vision model lives on a different connection.
+4. Send an image to a non-vision model — the extension swaps to the vision model for that turn and notifies.
 
 ## License
 
