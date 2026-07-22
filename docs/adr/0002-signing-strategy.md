@@ -47,6 +47,12 @@ gpg --verify sha256.txt.sig sha256.txt
 
 **What it proves:** The release was authored by the maintainer, not just built by CI. This protects against a compromised CI secret that doesn't also have the GPG key.
 
+## Note (2026-07-22) — local signing fallback
+
+GitHub Actions release workflow is disabled due to billing lock (see `.github/workflows/release.yml`). Signing is performed locally via `scripts/local-ci/run-release-local.sh` until billing is resolved.
+
+The three-layer signing strategy (SHA256 + Sigstore keyless + GPG) is **unchanged** — only the execution environment moved from GitHub Actions to local. The Sigstore keyless identity in local mode is the maintainer's OIDC identity (not the GitHub Actions run identity); the verification command in Layer 2 must be adjusted to match the local signing identity when verifying locally-built VSIX artifacts.
+
 ## Rejected alternatives
 
 - **L4: Paid code-signing certificate (Authenticode)** — VS Code does not use Authenticode verification for extension trust. The cost ($200-400/year) buys a marketing badge, not a security guarantee VS Code enforces. Overkill for a community extension.

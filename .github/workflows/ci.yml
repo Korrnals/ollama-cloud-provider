@@ -1,10 +1,15 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+# DISABLED: GitHub Actions billing is locked (2026-07-22).
+# Re-enable when billing is resolved: uncomment the `on:` block below
+# and remove the `on: []` line.
+# CI runs locally via scripts/local-ci/ — see DEVELOPMENT.md.
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
+#     branches: [main]
+on: []
 
 permissions:
   contents: read

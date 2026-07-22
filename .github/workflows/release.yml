@@ -1,9 +1,15 @@
 name: Release
 
-on:
-  push:
-    tags:
-      - 'v*'
+# DISABLED: GitHub Actions billing is locked (2026-07-22).
+# Re-enable when billing is resolved: uncomment the `on:` block below
+# and remove the `on: []` line.
+# Releases are cut locally via scripts/local-ci/run-release-local.sh
+# (signed VSIX + SBOM + Sigstore + GPG) — see DEVELOPMENT.md.
+# on:
+#   push:
+#     tags:
+#       - 'v*'
+on: []
 
 permissions:
   contents: write
