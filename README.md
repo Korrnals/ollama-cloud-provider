@@ -2,6 +2,9 @@
   <img src="media/banner.png" alt="Ollama Cloud Provider" width="100%" />
 </p>
 
+[![Version](https://img.shields.io/visual-studio-marketplace/v/Korrnals.ollama-cloud-provider?style=flat-square&label=Marketplace)](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/Korrnals.ollama-cloud-provider?style=flat-square)](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider)
+
 # Ollama Cloud Provider
 
 **Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.**
@@ -31,7 +34,18 @@ The extension is designed around three security invariants:
 
 ## Installation
 
-### From GitHub Release (recommended)
+### From VS Code Marketplace (recommended)
+
+1. Open the [Ollama Cloud Provider page](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider) on the VS Code Marketplace.
+2. Click **Install** — VS Code opens and installs the extension automatically.
+
+Or install from the command line:
+
+```bash
+code --install-extension Korrnals.ollama-cloud-provider
+```
+
+### From GitHub Release (fallback — signed VSIX with provenance)
 
 1. Go to [Releases](https://github.com/Korrnals/ollama-cloud-provider/releases).
 2. Download the `.vsix` for the latest release.
