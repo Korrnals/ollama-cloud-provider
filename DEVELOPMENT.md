@@ -1,29 +1,47 @@
-# Development Plan — ollama-cloud-provider v0.2.0
+# Development Plan — ollama-cloud-provider
 
 **Project:** Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat
 **Owner:** Korrnals
 **Repo:** https://github.com/Korrnals/ollama-cloud-provider
 **Local:** /var/home/abyss/.distrobox/vscode-box/home/LABs/Projects/ollama-cloud-provider
 
+## Completed milestones
+
+| Version | Date | Theme | Highlights |
+|---|---|---|---|
+| v0.2.0 | 2026-07-16 | Port + security hardening | Fork from `sidharth-sachdeva/ollama-vscode-extension`; trimmed to provider-only; logger redaction; `allowedBaseUrls` whitelist; `scope: application` on all config; no `child_process`/`eval`/`webview`/`telemetry`. |
+| v0.2.1 | 2026-07-17 | Error redaction | `safeJsonParse` surfaces malformed responses; error-path redaction hardened. |
+| v0.3.0 | 2026-07-19 | Test scaffold + 75 tests | Unit, integration, e2e, race-condition suites; 9 local CI gates wired; `run-release-local.sh` for signed local releases. |
+| v0.4.0 | 2026-07-20 | Vision + multi-connection + fork-attribution cleanup | Per-model vision capability inference; `ConnectionConfig` multi-connection (Cloud/Local/VPS/custom) with per-connection `allowedBaseUrls` + key isolation; fork attribution cleaned up in source comments and README. |
+| v0.5.0 | 2026-07-22 | Vision Fallback Pass-through + base64 redaction + CancellationToken race fix | ADR 0004 single-hop vision fallback (opt-in, pass-through); `redactSensitive` masks `data:image/*;base64,...`; synchronous `isCancellationRequested` check before first await in `ollamaClient.streamChat`; 305 tests passing. |
+
+## CI and release
+
+External GitHub Actions CI is **disabled** (billing lock, 2026-07-22). All CI runs locally via `scripts/local-ci/run-all.sh`. Releases are cut locally via `scripts/local-ci/run-release-local.sh` (produces signed VSIX + SBOM + Sigstore + GPG). Re-enable GitHub Actions (`.github/workflows/ci.yml` and `release.yml`) when billing is resolved — uncomment the `on:` block and remove the `on: []` line in each file.
+
+The 9 local CI gates are unchanged: `compile`, `lint`, `no-rce-primitives`, `no-telemetry`, `no-webview-uri`, `npm-audit`, `scope-application`, `secrets-scan`, `test`.
+
 ## Architecture
 
 ```
 src/
-  extension.ts          — activation, command registration, provider wiring
-  provider.ts           — LanguageModelChatProvider implementation
-  auth.ts               — API key management via SecretStorage
-  ollamaClient.ts       — HTTP client, SSE streaming
-  logger.ts             — Output channel logger WITH REDACTION (hardened)
-  modelCatalog.ts       — Model list management
-  modelConfiguration.ts — Per-model config schema
-  convert.ts            — VS Code ↔ OpenAI message/tool conversion
-  protocolTypes.ts      — TypeScript types
-  configValidator.ts    — validate config (baseUrl in whitelist, key present)
-  healthCheck.ts        — check connection to Ollama Cloud
-  retry.ts              — exponential backoff retry wrapper
+  extension.ts                 — activation, command registration, provider wiring
+  provider.ts                  — LanguageModelChatProvider implementation (vision gate, fallback hook)
+  auth.ts                      — API key management via SecretStorage
+  ollamaClient.ts              — HTTP client, SSE streaming (CancellationToken race-fixed)
+  logger.ts                    — Output channel logger WITH REDACTION (Bearer, api_key, base64 image)
+  modelCatalog.ts              — Model list management + vision-capability inference
+  modelConfiguration.ts        — Per-model config schema
+  convert.ts                   — VS Code ↔ OpenAI message/tool conversion
+  protocolTypes.ts             — TypeScript types
+  configValidator.ts           — validate config (baseUrl in whitelist, key present)
+  healthCheck.ts               — check connection to Ollama Cloud
+  retry.ts                     — exponential backoff retry wrapper
+  connections.ts               — Multi-connection list (ConnectionConfig: per-connection baseUrl + key isolation)
+  visionFallback.ts            — Vision Fallback Pass-through core (ADR 0004: single-hop routing)
+  visionFallbackCommands.ts    — QuickPick commands: Set Vision Fallback Model / Connection
 test/
-  runTest.ts            — test runner
-  suite/                — test suites
+  unit/ integration/ e2e/ race/ — test suites (305 tests)
 ```
 
 ## Issues backlog (execution order)

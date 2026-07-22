@@ -53,3 +53,5 @@ Every release VSIX is signed with:
 3. **GPG signature** — identity (the release was signed by the maintainer's GPG key).
 
 See [ADR-0002](docs/adr/0002-signing-strategy.md) for the full rationale.
+
+> **Note (2026-07-22):** GitHub Actions release workflow is disabled due to billing lock. Signing is performed locally via `scripts/local-ci/run-release-local.sh` until billing is resolved. The three-layer strategy is unchanged; only the execution environment moved from GitHub Actions to local.

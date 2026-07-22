@@ -3,6 +3,10 @@
 All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
+## [Unreleased]
+
+_No changes yet. Merged PRs add bullets here; the Git Workflow Specialist promotes this section to a dated release at cut time (see `git-workflow.instructions.md` versioning cadence)._
+
 ## [0.5.0] - 2026-07-22
 
 ### Added
