@@ -234,6 +234,42 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
     // controller throws ERR_INVALID_STATE. The stream is terminated.
   });
 
+  it('aborts synchronously when token is already cancelled before streamChat entry', async () => {
+    // Pin the v0.5.0 race fix: a cancel that arrives during async
+    // setup (before streamChat registers its onCancellationRequested
+    // listener) must still abort the fetch. `onCancellationRequested`
+    // does NOT fire retroactively for an already-cancelled token, so
+    // the synchronous `isCancellationRequested` check at entry is the
+    // only thing that wires the abort before fetch runs.
+    const cts = new vscode.CancellationTokenSource();
+    cts.cancel(); // cancel BEFORE calling streamChat
+
+    let abortObserved = false;
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      if (init?.signal?.aborted) abortObserved = true;
+      // Real fetch rejects on an aborted signal — mimic that so the
+      // client's reader loop sees the AbortError and finalises.
+      throw new DOMException('The user aborted a request.', 'AbortError');
+    }) as typeof fetch;
+
+    try {
+      const recorder = makeCallbacks();
+      const client = new OllamaClient(BASE_URL, 'sk-test-key');
+      await client.streamChat(
+        { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+        recorder,
+        cts.token,
+      );
+
+      assert.equal(abortObserved, true, 'fetch signal.aborted must be true for pre-entry cancel');
+      assert.equal(recorder.doneCount, 1, 'onDone must fire exactly once');
+      assert.equal(recorder.errors.length, 0, 'onError must not fire for user-cancel');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('processes a well-formed SSE stream end-to-end and fires onDone', async () => {
     const chunks = [
       encode('data: {"choices":[{"delta":{"content":"hello"}}]}\n'),

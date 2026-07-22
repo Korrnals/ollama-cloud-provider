@@ -1,0 +1,58 @@
+# .vscodeignore — controls what `vsce package` bundles into the VSIX.
+# Ship ONLY runtime files to end users; exclude dev artifacts, tests,
+# source, CI, signing material, and dev docs.
+# Pre-Marketplace publish finding B1 (code review blocker).
+
+# Test files
+test/**
+.vscode-test/**
+
+# Source (ship compiled out/ only)
+src/**
+tsconfig.json
+tsconfig.test.json
+eslint.config.js
+
+# CI / scripts
+scripts/**
+.github/**
+.cr/
+
+# Build artifacts
+out/test/**
+dist/
+*.vsix
+*.tsbuildinfo
+
+# Dev docs (keep README, CHANGELOG, LICENSE, SECURITY)
+DEVELOPMENT.md
+HANDOFF.md
+CONTRIBUTING.md
+docs/**
+
+# GPG / signing
+gpg-public-key.asc
+*.sig
+*.asc
+*.pem
+
+# IDE / OS
+.vscode/**
+.idea/
+.DS_Store
+Thumbs.db
+
+# Dependencies (already in out/)
+node_modules/**
+
+# Dev tooling
+Makefile
+.nvmrc
+.mocharc.json
+
+# VS Code local history (editor artifacts — must never ship)
+.history/**
+
+# Misc
+.gitignore
+.gitattributes
