@@ -95,10 +95,21 @@ ok "CI gates pass"
 echo
 
 # ─── Step 2: Build VSIX ────────────────────────────────────────────────────
+# Select VSIX by explicit version, not by glob. A glob like `ls *.vsix |
+# head -1` picks the lexicographically-first VSIX — if a stale VSIX from a
+# previous release (e.g. ollama-cloud-provider-0.4.0.vsix) remains in the
+# root, the glob misselects it and downstream checksums/signatures are
+# created for the wrong file (mnemos e7f57431).
+VSIX_FILE="ollama-cloud-provider-${VERSION_NUM}.vsix"
+
 step 2 "Build VSIX (npm ci → lint → compile → package)"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: npm ci && npm run lint && npm run compile && npm run package"
+  echo "  expected VSIX: $VSIX_FILE"
 else
+  # Defence-in-depth: remove stale VSIX from previous runs so the only
+  # VSIX in the root after packaging is the freshly-built one.
+  rm -f *.vsix
   if [ -f package-lock.json ]; then
     npm ci || fail 2 "npm ci failed"
   else
@@ -107,13 +118,10 @@ else
   npm run lint    || fail 2 "lint failed"
   npm run compile || fail 2 "compile failed"
   npm run package || fail 2 "vsce package failed"
-fi
-VSIX_FILE="$(ls *.vsix 2>/dev/null | head -1 || true)"
-if [ -z "$VSIX_FILE" ]; then
-  if [ "$DRY_RUN" -eq 1 ]; then
-    VSIX_FILE="ollama-cloud-provider-0.2.0.vsix (projected)"
-  else
-    fail 2 "no .vsix produced"
+  if [[ ! -f "$VSIX_FILE" ]]; then
+    err "expected VSIX $VSIX_FILE not found"
+    ls -la *.vsix 2>/dev/null || echo "(no .vsix files in cwd)"
+    fail 2 "expected VSIX $VSIX_FILE not produced"
   fi
 fi
 ok "VSIX: $VSIX_FILE"
@@ -123,12 +131,19 @@ echo
 step 3 "Compute SHA256 (L1 — integrity, required)"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: sha256sum '$VSIX_FILE' > sha256.txt"
+  echo "  would assert: sha256.txt references $VSIX_FILE"
 else
   sha256sum "$VSIX_FILE" > sha256.txt
   SHA="$(awk '{print $1}' sha256.txt)"
   echo "  SHA256: $SHA"
+  # Assert sha256.txt references the expected VSIX (not a stale one).
+  if ! grep -q "$VSIX_FILE" sha256.txt; then
+    err "sha256.txt does not reference $VSIX_FILE — aborting"
+    cat sha256.txt >&2
+    fail 3 "checksum references wrong VSIX — stale misselection detected"
+  fi
 fi
-ok "L1 checksum written to sha256.txt"
+ok "L1 checksum written to sha256.txt (verified: references $VSIX_FILE)"
 echo
 
 # ─── Step 4: Sigstore cosign (L2 — build provenance, optional) ─────────────
