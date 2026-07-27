@@ -457,6 +457,7 @@ describe('connections.modelIdPrefix / connectionOriginLabel — model picker', (
       allowedBaseUrls: ['https://example.com/v1'],
       visionModels: [],
       requiresApiKey: true,
+      preferredEndpoint: 'auto',
     };
   }
 
@@ -522,6 +523,7 @@ describe('connections.openAiBaseUrl — baseUrl + openaiCompatiblePath', () => {
       allowedBaseUrls: [baseUrl],
       visionModels: [],
       requiresApiKey: true,
+      preferredEndpoint: 'auto',
     };
   }
 

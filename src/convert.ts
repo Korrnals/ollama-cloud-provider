@@ -5,59 +5,27 @@ import type {
   OpenAICompatibleToolCall,
   OpenAIContentPart,
 } from './protocolTypes.js';
+// ADR 0006 — shared primitives now live in `convertPrimitives.ts` so
+// both the `/chat/completions` converter and the `/v1/responses`
+// converter use the same security-sensitive helpers (image detection,
+// data-URL encoding, tool-result serialization). Re-exported below for
+// backward compatibility — existing imports from `./convert.js` keep
+// working and the 322-test regression suite is untouched.
+import {
+  hasImageParts as sharedHasImageParts,
+  isImageDataPart as sharedIsImageDataPart,
+  toDataUrl as sharedToDataUrl,
+  serializeToolResultContent as sharedSerializeToolResultContent,
+  mapRole as sharedMapRole,
+} from './convertPrimitives.js';
 
-/**
- * Returns true when the message's content array contains at least one
- * `vscode.LanguageModelDataPart` with an `image/*` mime type. Used by
- * the provider to detect image-bearing requests and reject them when
- * the selected model does not support vision.
- *
- * The duck-typing fallback mirrors the canonical `LanguageModelDataPart`
- * shape so the stub-based tests can construct data parts without a real
- * `vscode.LanguageModelDataPart` constructor.
- */
-export function hasImageParts(
-  content: readonly unknown[],
-): boolean {
-  return content.some(isImageDataPart);
-}
-
-/**
- * Returns true if `part` is an `image/*` data part — either a real
- * `vscode.LanguageModelDataPart` or a duck-typed object with `mimeType`
- * (string starting with `image/`) and `data` (Uint8Array).
- */
-export function isImageDataPart(
-  part: unknown,
-): boolean {
-  return isDataPart(part) && part.mimeType.toLowerCase().startsWith('image/');
-}
-
-function isDataPart(
-  part: unknown,
-): part is vscode.LanguageModelDataPart {
-  if (part instanceof vscode.LanguageModelDataPart) {
-    return true;
-  }
-  if (!part || typeof part !== 'object') {
-    return false;
-  }
-  const candidate = part as { mimeType?: unknown; data?: unknown };
-  return (
-    typeof candidate.mimeType === 'string' &&
-    candidate.data instanceof Uint8Array
-  );
-}
-
-/**
- * Converts a `LanguageModelDataPart` (image) to a `data:` URL — the
- * form the OpenAI-compatible chat completions endpoint expects in the
- * `image_url.url` field. The base64 encoding is deterministic and
- * synchronous; large images still go through `Buffer.from(...).toString('base64')`.
- */
-export function toDataUrl(part: vscode.LanguageModelDataPart): string {
-  return `data:${part.mimeType};base64,${Buffer.from(part.data).toString('base64')}`;
-}
+// Backward-compatibility re-exports — existing imports from
+// `./convert.js` keep working; the 322-test regression suite is
+// untouched. The canonical implementations live in
+// `convertPrimitives.ts` and are shared with `convertResponses.ts`.
+export const hasImageParts = sharedHasImageParts;
+export const isImageDataPart = sharedIsImageDataPart;
+export const toDataUrl = sharedToDataUrl;
 
 export function convertMessagesToOpenAI(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -65,7 +33,7 @@ export function convertMessagesToOpenAI(
   const result: OpenAICompatibleMessage[] = [];
 
   for (const message of messages) {
-    const role = mapRole(message.role);
+    const role = sharedMapRole(message.role);
     let text = '';
     const imageParts: OpenAIContentPart[] = [];
     const toolCalls: OpenAICompatibleToolCall[] = [];
@@ -88,7 +56,7 @@ export function convertMessagesToOpenAI(
       } else if (part instanceof vscode.LanguageModelToolResultPart) {
         toolResults.push({
           callId: part.callId,
-          content: serializeToolResultContent(part.content),
+          content: sharedSerializeToolResultContent(part.content),
         });
       }
 
@@ -217,29 +185,9 @@ function contentLength(content: OpenAICompatibleMessage['content']): number {
   return total;
 }
 
-function mapRole(
-  role: vscode.LanguageModelChatMessageRole,
-): 'user' | 'assistant' {
-  if (role === vscode.LanguageModelChatMessageRole.Assistant) {
-    return 'assistant';
-  }
-
-  return 'user';
-}
-
-function serializeToolResultContent(parts: readonly unknown[]): string {
-  const text = extractText(parts);
-  return text || JSON.stringify(parts);
-}
-
-function extractText(parts: readonly unknown[]): string {
-  let text = '';
-
-  for (const part of parts) {
-    if (part instanceof vscode.LanguageModelTextPart) {
-      text += part.value;
-    }
-  }
-
-  return text;
-}
+// The local `mapRole` and `serializeToolResultContent` helpers were
+// moved to `convertPrimitives.ts` (ADR 0006) so the `/v1/responses`
+// converter shares the same security-sensitive logic. The shared
+// helpers are imported above as `sharedMapRole` /
+// `sharedSerializeToolResultContent` and called directly from
+// `convertMessagesToOpenAI`. No local duplicates remain.
