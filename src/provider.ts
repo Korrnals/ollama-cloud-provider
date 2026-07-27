@@ -22,6 +22,17 @@ import {
   type ModelDefinition,
 } from './modelCatalog.js';
 import { OllamaClient } from './ollamaClient.js';
+import { ResponsesClient } from './responsesClient.js';
+import {
+  convertToResponsesInput,
+  convertToolsToResponses,
+} from './convertResponses.js';
+import {
+  isResponsesKnownUnavailable,
+  markResponsesAvailable,
+  markResponsesUnavailable,
+} from './capabilityCache.js';
+import { HttpError } from './retry.js';
 import { loadConnections, openAiBaseUrl } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
 import type { UsageInfo } from './protocolTypes.js';
@@ -232,6 +243,22 @@ export class OllamaCloudChatProvider
     // the 192 existing tests exercise this branch). Non-cloud
     // connection models resolve their connection via `connectionId`.
     const connections = loadConnections();
+    // ADR 0006 — resolve the cloud connection object too (not just
+    // non-cloud). Cloud models keep the legacy apiKey path
+    // (`getApiKey()` + `connection = undefined` semantics for the
+    // 192 existing tests), but the dispatch block below reads
+    // `connection?.preferredEndpoint` to decide between
+    // `/v1/responses` and `/chat/completions`. Without the cloud
+    // connection object here, `preferredEndpoint: 'chat'` set on the
+    // cloud connection is invisible to dispatch and every cloud
+    // request routes to `/v1/responses` regardless of the override.
+    // `apiKeyForCloud` keeps the legacy resolution; `connection` is
+    // only used for endpoint selection + baseUrl (which already
+    // fall back to `getBaseUrl()` when undefined).
+    const cloudConnection =
+      model.connectionId === 'cloud'
+        ? connections.find((c) => c.id === model.connectionId)
+        : undefined;
     const connection =
       model.connectionId === 'cloud'
         ? undefined
@@ -300,48 +327,89 @@ export class OllamaCloudChatProvider
     const openaiMessages = convertMessagesToOpenAI(messages);
     const requestChars = countOpenAIRequestChars(openaiMessages);
 
-    await new Promise<void>((resolve, reject) => {
-      void client.streamChat(
-        {
-          model: model.apiModel,
-          messages: openaiMessages,
-          tools: convertToolsToOpenAI(options.tools),
-          tool_choice: resolveToolChoice(options.toolMode, options.tools),
-          extraBody: requestConfiguration.openaiBody,
-        },
-        {
-          onText: (text: string) => {
-            progress.report(new vscode.LanguageModelTextPart(text));
+    // ADR 0006 — endpoint selection. Cloud connections prefer
+    // `/v1/responses` (structured reasoning, typed events, first-class
+    // tool calling). Local Ollama only implements `/chat/completions`,
+    // so local connections route there directly. `preferredEndpoint:
+    // 'chat'` is an explicit user override. The capability cache
+    // short-circuits the `/v1/responses` attempt once a prior 404 has
+    // been memoized for the connection (avoids the per-request 404
+    // round-trip). No mid-stream fallback — POST is non-idempotent and
+    // a retry would bill twice (ADR 0001/0005).
+    // Cloud models keep `connection = undefined` for the legacy apiKey
+    // path, so read `preferredEndpoint` / `type` / `id` from either the
+    // resolved non-cloud connection or the cloud connection object.
+    const endpointConnection = connection ?? cloudConnection;
+    const preferredEndpoint = endpointConnection?.preferredEndpoint ?? 'auto';
+    const isLocal = endpointConnection?.type === 'local';
+    const connectionId = endpointConnection?.id ?? 'cloud';
+    const useResponses =
+      !isLocal &&
+      preferredEndpoint !== 'chat' &&
+      !isResponsesKnownUnavailable(connectionId);
+
+    if (useResponses) {
+      try {
+        const responsesClient = new ResponsesClient(
+          clientBaseUrl,
+          apiKey ?? '',
+          connection,
+        );
+        const { input, instructions } = convertToResponsesInput(messages);
+        const responsesTools = convertToolsToResponses(options.tools);
+        await this.runStream(
+          (callbacks) =>
+            responsesClient.streamResponses(
+              {
+                model: model.apiModel ?? model.id,
+                input,
+                ...(instructions !== undefined ? { instructions } : {}),
+                ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
+                tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                extraBody: requestConfiguration.openaiBody,
+              },
+              callbacks,
+              token,
+            ),
+          progress,
+          model,
+          requestChars,
+          () => markResponsesAvailable(connectionId),
+        );
+        return; // success — no fallback needed
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) {
+          markResponsesUnavailable(connectionId);
+          logger.info(
+            `Falling back to /chat/completions (/v1/responses returned 404) for connection "${connectionId}"`,
+          );
+          // fall through to /chat/completions below
+        } else {
+          throw error; // non-404 — surface, no fallback (no double billing)
+        }
+      }
+    }
+
+    // /chat/completions path (fallback for cloud + 404, primary for
+    // local and `preferredEndpoint: 'chat'`). Unchanged.
+    await this.runStream(
+      (callbacks) =>
+        client.streamChat(
+          {
+            model: model.apiModel,
+            messages: openaiMessages,
+            tools: convertToolsToOpenAI(options.tools),
+            tool_choice: resolveToolChoice(options.toolMode, options.tools),
+            extraBody: requestConfiguration.openaiBody,
           },
-          onThinking: (text: string) => {
-            const thinkingPart = createThinkingPart(text);
-            if (thinkingPart) {
-              progress.report(thinkingPart);
-            }
-          },
-          onToolCall: (toolCall: {
-            id: string;
-            name: string;
-            input: Record<string, unknown>;
-          }) => {
-            progress.report(
-              new vscode.LanguageModelToolCallPart(
-                toolCall.id,
-                toolCall.name,
-                toolCall.input,
-              ),
-            );
-          },
-          onUsage: (usage: UsageInfo) => {
-            this.updateTokenEstimate(requestChars, usage);
-            logger.info(formatUsageLog(model.id, usage));
-          },
-          onDone: () => resolve(),
-          onError: (error: Error) => reject(error),
-        },
-        token,
-      );
-    });
+          callbacks,
+          token,
+        ),
+      progress,
+      model,
+      requestChars,
+      undefined,
+    );
   }
 
   async provideTokenCount(
@@ -360,6 +428,76 @@ export class OllamaCloudChatProvider
 
     const observed = requestChars / usage.inputTokens;
     this.charsPerToken = this.charsPerToken * 0.7 + observed * 0.3;
+  }
+
+  /**
+   * ADR 0006 — runs a streaming client (`streamChat` or
+   * `streamResponses`) and resolves when the client calls `onDone`,
+   * rejects when it calls `onError`. Both clients use the same
+   * `StreamCallbacks` interface (see `protocolTypes.ts`) and never
+   * resolve their returned promise with a value — termination is
+   * signalled via the callbacks. This helper bridges that callback
+   * contract to `async`/`await` at the call site.
+   *
+   * `onSuccess` runs after `onDone` fires and BEFORE the promise
+   * resolves — used by the `/v1/responses` path to memoize
+   * capability (`markResponsesAvailable`) only on a clean completion,
+   * not on a fallback that re-throws.
+   *
+   * Structured reasoning: `onThinking` → `LanguageModelThinkingPart`
+   * when the API is present (VS Code 1.103+), otherwise the part is
+   * silently dropped — the `/chat/completions` client never emits
+   * `onThinking`, so this only fires on the `/v1/responses` path.
+   */
+  private async runStream(
+    invoke: (
+      callbacks: import('./protocolTypes.js').StreamCallbacks,
+    ) => Promise<void>,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    model: ModelDefinition,
+    requestChars: number,
+    onSuccess: (() => void) | undefined,
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      void invoke({
+        onText: (text: string) => {
+          progress.report(new vscode.LanguageModelTextPart(text));
+        },
+        onThinking: (text: string) => {
+          const thinkingPart = createThinkingPart(text);
+          if (thinkingPart) {
+            progress.report(thinkingPart);
+          }
+        },
+        onToolCall: (toolCall: {
+          id: string;
+          name: string;
+          input: Record<string, unknown>;
+        }) => {
+          progress.report(
+            new vscode.LanguageModelToolCallPart(
+              toolCall.id,
+              toolCall.name,
+              toolCall.input,
+            ),
+          );
+        },
+        onUsage: (usage: UsageInfo) => {
+          this.updateTokenEstimate(requestChars, usage);
+          logger.info(formatUsageLog(model.id, usage));
+        },
+        onDone: () => {
+          onSuccess?.();
+          resolve();
+        },
+        onError: (error: Error) => reject(error),
+      }).catch((error: unknown) => {
+        // Safety net: if the client rejects its own promise instead
+        // of calling onError (shouldn't happen, but defence-in-depth),
+        // surface it as a rejection so the caller's try/catch fires.
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
   }
 }
 
