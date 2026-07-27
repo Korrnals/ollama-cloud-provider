@@ -722,4 +722,81 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
     }
     global.fetch = originalFetch;
   });
+
+  it('connect timeout retries with a fresh AbortController and succeeds on the 3rd attempt', async function () {
+    // Regression test for the per-attempt AbortController fix
+    // (ADR 0005). Before the fix, the connect timer aborted the MAIN
+    // controller. Once aborted, `fetch(url, { signal: aborted })`
+    // rejected instantly on every retry — all attempts wasted, user
+    // saw "connect timeout after 30000ms". With the fix, each attempt
+    // gets its own fresh `attemptController`; only the connect timer
+    // aborts it (per-attempt), so retry actually re-issues fetch.
+    //
+    // Mock fetch to hang (never resolve) for the first 2 attempts,
+    // then resolve a clean SSE stream on the 3rd. connectTimeoutMs
+    // is short (100ms) so each hang triggers a ConnectTimeoutError
+    // quickly. maxRetries=3 → fetch called 3 times (2 timeouts + 1
+    // success). This test would FAIL with the old bug: after the
+    // first connect timeout aborted the main controller, attempts 2
+    // and 3 would reject instantly with AbortError — fetch would be
+    // called 3 times but the 3rd would never reach the success
+    // branch because its signal is already aborted, so onDone would
+    // never fire and onError would fire instead.
+    this.timeout(15000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 100,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 3,
+    });
+
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1;
+      const signal = init?.signal;
+      // Attempts 1 and 2: hang until the connect timer aborts the
+      // per-attempt signal. Attempt 3: resolve a clean stream.
+      if (fetchCalls < 3) {
+        return new Promise<Response>((_resolve, reject) => {
+          if (signal) {
+            if (signal.aborted) {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+              return;
+            }
+            signal.addEventListener('abort', () => {
+              const err = new Error('aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          }
+        });
+      }
+      // Attempt 3 — success. Return a minimal well-formed SSE stream.
+      const body = streamFromChunks([
+        encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
+        encode('data: [DONE]\n'),
+      ]);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(fetchCalls, 3, 'fetch must be called 3 times (2 connect timeouts + 1 success)');
+    assert.equal(recorder.doneCount, 1, 'onDone must fire after the 3rd attempt succeeds');
+    assert.equal(recorder.errors.length, 0, 'onError must NOT fire — retry recovered');
+    assert.equal(recorder.text.join(''), 'ok', 'stream text from the 3rd attempt is delivered');
+
+    global.fetch = originalFetch;
+  });
 });

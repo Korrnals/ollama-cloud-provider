@@ -203,6 +203,12 @@ export class OllamaClient {
 
     let done = false;
 
+    // ADR 0005 — per-attempt abort wiring. See the comment above
+    // `withRetry` for the full rationale. Declared in the function
+    // scope (not inside `try`) so the outer `finally` can detach the
+    // main→attempt listener once the stream is done.
+    let streamMainAbortListener: (() => void) | undefined;
+
     try {
       this.assertBaseUrlAllowedOrThrow();
 
@@ -233,15 +239,45 @@ export class OllamaClient {
         return defaultRetryOn(error);
       };
 
+      // ADR 0005 — connect timer uses a PER-ATTEMPT AbortController,
+      // NOT the main `controller`. Reusing the main controller was a
+      // bug: when the connect timer fired (30s), `controller.abort()`
+      // marked the signal as aborted permanently. `withRetry` retried,
+      // but `fetch(url, { signal: aborted })` failed instantly on
+      // every subsequent attempt — all retries wasted, user saw
+      // "connect timeout after 30000ms" even though retry should have
+      // attempted a fresh connection.
+      //
+      // Each retry attempt gets its own fresh `attemptController`. The
+      // main `controller` (cancel / maxDuration / inactivity) is wired
+      // to abort the attempt controller too, so a caller cancel or
+      // max-duration fire still short-circuits the in-flight fetch AND
+      // the stream reader loop. The wire must stay live for the entire
+      // stream phase (not just the connect phase) because the stream
+      // body is tied to `attemptController.signal` — that is how the
+      // inactivity / maxDuration / cancel aborts reach `reader.read()`.
+      // The connect timer fires only the per-attempt controller; retry
+      // gets a fresh signal on the next iteration.
+      //
+      // `streamMainAbortListener` (declared in the function scope
+      // above) holds the successful attempt's main→attempt wire so the
+      // outer `finally` can detach the listener once the stream is
+      // done. On a retried attempt the previous wire is detached
+      // before the next attempt installs its own.
       const response = await withRetry(
         async () => {
-          // Connect timer — wraps ONLY this fetch attempt. Cleared
-          // when fetch resolves (ok or not). A separate AbortController
-          // would also work; we reuse the main controller and tag the
-          // reason so the outer catch can distinguish connect-timeout
-          // from inactivity/maxDuration. If fetch does not return a
-          // Response in connectTimeoutMs → ConnectTimeoutError (retriable
-          // via defaultRetryOn).
+          // Detach any previous attempt's main→attempt wire before
+          // installing a fresh one. On the first attempt there is no
+          // previous wire; on retries the prior attempt's controller
+          // is dead (its connect timer aborted it) but its listener
+          // is still attached to the main controller — remove it so
+          // we do not leak one listener per retry.
+          if (streamMainAbortListener) {
+            controller.signal.removeEventListener('abort', streamMainAbortListener);
+            streamMainAbortListener = undefined;
+          }
+
+          const attemptController = new AbortController();
           const connectHandle = setTimeout(() => {
             // Only tag as connect if no higher-priority reason fired.
             // (cancel is set synchronously above; maxDuration is
@@ -249,8 +285,26 @@ export class OllamaClient {
             if (abortReason === null) {
               abortReason = 'connect';
             }
-            controller.abort();
+            attemptController.abort();
           }, connectTimeoutMs);
+
+          // If the main controller already aborted (caller cancel or
+          // maxDuration fired before this attempt started), abort the
+          // attempt immediately so fetch rejects right away rather
+          // than hanging until the connect timer fires.
+          if (controller.signal.aborted) {
+            attemptController.abort();
+          }
+          // Propagate a mid-attempt main-controller abort (cancel or
+          // maxDuration firing while fetch is in flight) to the
+          // attempt controller so fetch rejects promptly. The same
+          // wire keeps the stream reader abortable after fetch
+          // resolves — see the comment above `withRetry`.
+          const mainAbortListener = (): void => {
+            attemptController.abort();
+          };
+          controller.signal.addEventListener('abort', mainAbortListener);
+          streamMainAbortListener = mainAbortListener;
 
           try {
             const headers: Record<string, string> = {
@@ -263,7 +317,7 @@ export class OllamaClient {
               method: 'POST',
               headers,
               body,
-              signal: controller.signal,
+              signal: attemptController.signal,
             });
             if (!res.ok) {
               const message = await extractErrorMessage(res);
@@ -271,15 +325,36 @@ export class OllamaClient {
             }
             return res;
           } catch (error) {
-            // If the connect timer fired, surface a typed
-            // ConnectTimeoutError so defaultRetryOn can retry. Do not
-            // override a cancel or maxDuration abort.
-            if (abortReason === 'connect' && error instanceof Error && error.name === 'AbortError') {
+            // If the connect timer fired (and ONLY the connect timer
+            // — not a cancel/maxDuration that also aborted the
+            // attempt controller via the main→attempt wire), surface
+            // a typed ConnectTimeoutError so defaultRetryOn can
+            // retry. When abortReason is 'cancel' or 'maxDuration',
+            // rethrow the raw AbortError unchanged — retryOn returns
+            // false for bare AbortError, so withRetry stops and the
+            // outer catch routes by abortReason.
+            if (
+              abortReason === 'connect' &&
+              error instanceof Error &&
+              error.name === 'AbortError'
+            ) {
               throw new ConnectTimeoutError(connectTimeoutMs);
             }
             throw error;
           } finally {
             clearTimeout(connectHandle);
+            // Do NOT remove the listener here on a successful fetch —
+            // it must stay attached so the stream reader remains
+            // abortable. On a failed attempt (connect timeout /
+            // cancel / maxDuration) detach now; the next attempt (if
+            // any) installs a fresh wire at its top.
+            if (
+              streamMainAbortListener === mainAbortListener &&
+              abortReason !== null
+            ) {
+              controller.signal.removeEventListener('abort', mainAbortListener);
+              streamMainAbortListener = undefined;
+            }
           }
         },
         { retryOn },
@@ -418,6 +493,16 @@ export class OllamaClient {
       clearTimeout(maxDurationHandle);
       clearInactivity();
       cancelListener?.dispose();
+      // Detach any lingering main→attempt abort wire from the last
+      // `withRetry` attempt. On a clean stream the wire is still
+      // attached (it kept the reader abortable); on a failed stream
+      // it may already have been detached by the attempt's finally —
+      // removeEventListener is a no-op if the listener was not added,
+      // so calling it unconditionally is safe.
+      if (streamMainAbortListener) {
+        controller.signal.removeEventListener('abort', streamMainAbortListener);
+        streamMainAbortListener = undefined;
+      }
     }
   }
 }
