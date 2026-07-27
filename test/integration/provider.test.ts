@@ -116,6 +116,13 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — happy pat
       requestTimeoutMs: 120000,
       maxRetries: 0,
       apiKey: '',
+      // ADR 0006 — cloud defaults to /v1/responses. These legacy
+      // tests exercise the /chat/completions SSE format (`choices[].delta`
+      // + `[DONE]`), so pin the cloud connection to `preferredEndpoint: 'chat'`
+      // to keep testing the fallback path.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
     });
     originalFetch = global.fetch;
   });
@@ -243,6 +250,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
       maxRetries: 0,
       apiKey: '',
       visionModels: [],
+      // ADR 0006 — pin cloud to /chat/completions for the tests that
+      // assert the chat-format request body and SSE chunks.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
     });
     originalFetch = global.fetch;
     fetchCalls = [];
