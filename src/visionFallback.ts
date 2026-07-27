@@ -12,9 +12,17 @@ import {
   countOpenAIRequestChars,
   hasImageParts,
 } from './convert.js';
+import { convertToResponsesInput } from './convertResponses.js';
+import {
+  isResponsesKnownUnavailable,
+  markResponsesAvailable,
+  markResponsesUnavailable,
+} from './capabilityCache.js';
 import { logger } from './logger.js';
 import type { ModelDefinition } from './modelCatalog.js';
 import { OllamaClient } from './ollamaClient.js';
+import { ResponsesClient } from './responsesClient.js';
+import { HttpError } from './retry.js';
 import type { UsageInfo } from './protocolTypes.js';
 
 /**
@@ -276,37 +284,129 @@ export async function executePassThrough(
   const openaiMessages = convertMessagesToOpenAI(params.messages);
   const requestChars = countOpenAIRequestChars(openaiMessages);
 
-  // Single-hop (constraint 1) — one streamChat call, the same
-  // CancellationToken + progress reporter the primary path uses. The
-  // user sees the vision model's stream directly.
-  await new Promise<void>((resolve, reject) => {
-    void client.streamChat(
-      {
-        model: visionModel.apiModel,
-        messages: openaiMessages,
-        // Pass-through forwards the user's message + image unchanged.
-        // No prompt injection (constraint 7 clarification for B).
-        // Tool calling is not part of the fallback turn — the user
-        // asked about an image, not for tool orchestration.
-      },
-      {
-        onText: (text: string) => {
-          params.progress.report(new vscode.LanguageModelTextPart(text));
-        },
-        onToolCall: () => {
-          // Vision fallback turns do not surface tool calls.
-        },
-        onUsage: (usage: UsageInfo) => {
-          logger.info(
-            `vision fallback usage tokens=${usage.totalTokens ?? 0} chars=${requestChars}`,
-          );
-        },
-        onDone: () => resolve(),
-        onError: (error: Error) => reject(error),
-      },
-      params.token,
+  // ADR 0006 Phase 3 — endpoint dispatch mirrors `provider.ts`.
+  // Cloud vision connections prefer `/v1/responses` (structured
+  // reasoning, typed events); local Ollama only implements
+  // `/chat/completions`. `preferredEndpoint: 'chat'` is an explicit
+  // override. The capability cache short-circuits the `/v1/responses`
+  // attempt once a prior 404 has been memoized. No mid-stream
+  // fallback — POST is non-idempotent and a retry would bill twice
+  // (ADR 0001/0005). The vision model answers directly
+  // (pass-through), so the same dispatch applies.
+  const connectionId = visionConnection?.id ?? 'cloud';
+  const isLocal = visionConnection?.type === 'local';
+  const preferredEndpoint = visionConnection?.preferredEndpoint ?? 'auto';
+  const useResponses =
+    !isLocal &&
+    preferredEndpoint !== 'chat' &&
+    !isResponsesKnownUnavailable(connectionId);
+
+  const runResponsesStream = (): Promise<void> => {
+    const responsesClient = new ResponsesClient(
+      clientBaseUrl,
+      apiKey ?? '',
+      visionConnection,
     );
-  });
+    const { input, instructions } = convertToResponsesInput(params.messages);
+    return new Promise<void>((resolve, reject) => {
+      void responsesClient
+        .streamResponses(
+          {
+            model: visionModel.apiModel,
+            input,
+            ...(instructions !== undefined ? { instructions } : {}),
+            // Pass-through forwards the user's message + image
+            // unchanged. No prompt injection (constraint 7
+            // clarification for B). Tool calling is not part of the
+            // fallback turn — the user asked about an image, not for
+            // tool orchestration.
+          },
+          {
+            onText: (text: string) => {
+              params.progress.report(new vscode.LanguageModelTextPart(text));
+            },
+            onThinking: (text: string) => {
+              const thinkingPart = createThinkingPart(text);
+              if (thinkingPart) {
+                params.progress.report(thinkingPart);
+              }
+            },
+            onToolCall: () => {
+              // Vision fallback turns do not surface tool calls.
+            },
+            onUsage: (usage: UsageInfo) => {
+              logger.info(
+                `vision fallback usage tokens=${usage.totalTokens ?? 0} chars=${requestChars}`,
+              );
+            },
+            onDone: () => {
+              markResponsesAvailable(connectionId);
+              resolve();
+            },
+            onError: (error: Error) => reject(error),
+          },
+          params.token,
+        )
+        .catch((error: unknown) => {
+          reject(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        });
+    });
+  };
+
+  const runChatStream = (): Promise<void> => {
+    // Single-hop (constraint 1) — one streamChat call, the same
+    // CancellationToken + progress reporter the primary path uses.
+    return new Promise<void>((resolve, reject) => {
+      void client.streamChat(
+        {
+          model: visionModel.apiModel,
+          messages: openaiMessages,
+          // Pass-through forwards the user's message + image
+          // unchanged. No prompt injection (constraint 7
+          // clarification for B). Tool calling is not part of the
+          // fallback turn — the user asked about an image, not for
+          // tool orchestration.
+        },
+        {
+          onText: (text: string) => {
+            params.progress.report(new vscode.LanguageModelTextPart(text));
+          },
+          onToolCall: () => {
+            // Vision fallback turns do not surface tool calls.
+          },
+          onUsage: (usage: UsageInfo) => {
+            logger.info(
+              `vision fallback usage tokens=${usage.totalTokens ?? 0} chars=${requestChars}`,
+            );
+          },
+          onDone: () => resolve(),
+          onError: (error: Error) => reject(error),
+        },
+        params.token,
+      );
+    });
+  };
+
+  if (useResponses) {
+    try {
+      await runResponsesStream();
+      return; // success — no fallback needed
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) {
+        markResponsesUnavailable(connectionId);
+        logger.info(
+          `Vision fallback: /v1/responses returned 404 for connection "${connectionId}" — falling back to /chat/completions`,
+        );
+        // fall through to /chat/completions below
+      } else {
+        throw error; // non-404 — surface, no fallback (no double billing)
+      }
+    }
+  }
+
+  await runChatStream();
 }
 
 /**
@@ -314,6 +414,27 @@ export async function executePassThrough(
  * request. SHA256 first 16 hex chars. NEVER returns the image data
  * or data URL — this is for log correlation only (security).
  */
+/**
+ * ADR 0006 Phase 3 — structured reasoning. Maps `onThinking` text to
+ * `vscode.LanguageModelThinkingPart` when the API is present
+ * (VS Code 1.103+), otherwise falls back to `LanguageModelTextPart`
+ * so the reasoning content is still surfaced to the user on older
+ * VS Code versions. Mirrors `provider.ts` semantics.
+ */
+function createThinkingPart(
+  text: string,
+): vscode.LanguageModelResponsePart {
+  const vscodeWithThinking = vscode as typeof vscode & {
+    LanguageModelThinkingPart?: new (
+      value: string,
+    ) => vscode.LanguageModelResponsePart;
+  };
+  if (typeof vscodeWithThinking.LanguageModelThinkingPart === 'function') {
+    return new vscodeWithThinking.LanguageModelThinkingPart(text);
+  }
+  return new vscode.LanguageModelTextPart(text);
+}
+
 function computeImageHash(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
 ): string {

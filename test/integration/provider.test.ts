@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import { OllamaCloudChatProvider } from '../../src/provider.js';
+import { clearCapabilityCache } from '../../src/capabilityCache.js';
 
 const BASE_URL = 'https://ollama.com/v1';
 
@@ -243,6 +244,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
   let fetchCalls: Array<{ url: string; body: unknown }>;
 
   beforeEach(() => {
+    // ADR 0006 — the capability cache is process-global; a prior
+    // suite's 404 may have marked the cloud connection's
+    // /v1/responses unavailable. Clear it so this suite's
+    // preferredEndpoint: 'chat' pin is the only endpoint signal.
+    clearCapabilityCache();
     setConfig({
       baseUrl: BASE_URL,
       allowedBaseUrls: [BASE_URL],
@@ -313,8 +319,20 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     // vision model is gemma3:12b — vision-capable, lives on the cloud
     // connection. The primary (gpt-oss:120b) cannot handle images, so
     // the provider must route the turn to gemma3:12b instead of
-    // throwing.
+    // throwing. Pin the cloud connection to /chat/completions so the
+    // mock's chat-format SSE stream is consumed correctly (the test
+    // asserts the fallback fires, not which endpoint is used).
+    clearCapabilityCache();
     setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
       'visionFallback.enabled': true,
       'visionFallback.model': 'ollama-cloud/gemma3:12b',
     });
@@ -349,9 +367,12 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     // The fallback fired: fetch was called exactly once, targeting
     // the vision model (gemma3:12b), not the primary. The user sees
     // the vision model's streamed text, not the throw.
+    console.log('DEBUG fetchCalls=', JSON.stringify(fetchCalls.map(c => ({url: c.url, bodyKeys: c.body ? Object.keys(c.body) : null}))), 'parts=', progress.parts.length);
     assert.equal(fetchCalls.length, 1, 'fallback issued a single vision call');
     const body = fetchCalls[0].body as { model: string };
     assert.equal(body.model, 'gemma3:12b', 'request targeted the vision model');
+    // DEBUG: surface the URL + body shape to diagnose zero parts.
+    console.log('DEBUG url=', fetchCalls[0].url, 'body keys=', Object.keys(body), 'parts=', progress.parts.length);
     assert.equal(progress.parts.length, 1, 'one text delta reported');
     assert.equal(
       (progress.parts[0] as vscode.LanguageModelTextPart).value,
@@ -557,5 +578,386 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — fallback 
     // Exactly one fetch — the catalog refresh. The chat fetch must
     // never have been issued.
     assert.equal(fetchCount, 1, 'only the catalog refresh fetch may occur');
+  });
+});
+
+/**
+ * ADR 0006 Phase 3 — structured reasoning wiring. The `/v1/responses`
+ * path emits `response.reasoning_summary_text.delta` events;
+ * `responsesClient` forwards them to `callbacks.onThinking`;
+ * `provider.runStream` maps `onThinking` to
+ * `vscode.LanguageModelThinkingPart` (VS Code 1.103+, TextPart fallback
+ * for older versions). These tests verify both ends of that chain via
+ * the public provider surface.
+ */
+describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', () => {
+  let originalFetch: typeof fetch;
+  let fetchCalls: Array<{ url: string; body: unknown }>;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      // Cloud defaults to /v1/responses (auto) so the reasoning
+      // events flow through the responses client.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    originalFetch = global.fetch;
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    setConfig({});
+  });
+
+  function sseEvent(type: string, json: string): Uint8Array {
+    return encode(`event: ${type}\ndata: ${json}\n\n`);
+  }
+
+  it('maps reasoning events to LanguageModelThinkingPart in progress.report', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+
+    const chunks = [
+      sseEvent('response.created', '{"response":{"id":"r1","status":"in_progress"}}'),
+      sseEvent(
+        'response.reasoning_summary_text.delta',
+        '{"delta":"reasoning step 1","item_id":"rs1"}',
+      ),
+      sseEvent(
+        'response.reasoning_summary_text.delta',
+        '{"delta":" step 2","item_id":"rs1"}',
+      ),
+      sseEvent('response.output_text.delta', '{"delta":"final answer","item_id":"m1"}'),
+      sseEvent(
+        'response.completed',
+        '{"response":{"id":"r1","status":"completed","usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}',
+      ),
+    ];
+
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      return mockResponse(streamFromChunks(chunks));
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('explain step by step')],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The request targeted /v1/responses (not /chat/completions).
+    assert.equal(fetchCalls.length, 1, 'one responses fetch');
+    assert.ok(
+      fetchCalls[0].url.endsWith('/responses'),
+      `expected /responses URL, got ${fetchCalls[0].url}`,
+    );
+
+    // Two reasoning deltas + one text delta = three parts reported.
+    assert.equal(progress.parts.length, 3, 'three parts reported');
+
+    // The stub defines LanguageModelThinkingPart, so the two
+    // reasoning deltas must surface as ThinkingPart instances.
+    const thinkingParts = progress.parts.filter(
+      (part) => part instanceof vscode.LanguageModelThinkingPart,
+    );
+    assert.equal(thinkingParts.length, 2, 'two thinking parts reported');
+    assert.equal(
+      (thinkingParts[0] as vscode.LanguageModelThinkingPart).value,
+      'reasoning step 1',
+    );
+    assert.equal(
+      (thinkingParts[1] as vscode.LanguageModelThinkingPart).value,
+      ' step 2',
+    );
+
+    // The text delta surfaces as a TextPart after the thinking parts.
+    const textParts = progress.parts.filter(
+      (part) => part instanceof vscode.LanguageModelTextPart,
+    );
+    assert.equal(textParts.length, 1, 'one text part reported');
+    assert.equal((textParts[0] as vscode.LanguageModelTextPart).value, 'final answer');
+  });
+
+  it('falls back to /chat/completions when /v1/responses returns 404 (no reasoning)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+
+    let callCount = 0;
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      callCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      // First call — /v1/responses → 404. Second call —
+      // /chat/completions → success stream.
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ error: { message: 'not found' } }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"chat answer"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('hi')],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // Two fetches: /v1/responses (404) then /chat/completions.
+    assert.equal(callCount, 2, 'fallback issued a second chat fetch');
+    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+    assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
+
+    // Only the chat text delta surfaces — no thinking parts on the
+    // /chat/completions path (it never emits onThinking).
+    assert.equal(progress.parts.length, 1, 'one text delta reported');
+    assert.equal(
+      (progress.parts[0] as vscode.LanguageModelTextPart).value,
+      'chat answer',
+    );
+  });
+});
+
+/**
+ * ADR 0006 Phase 3 — vision fallback endpoint dispatch. The vision
+ * pass-through must mirror `provider.ts`: a cloud vision connection
+ * routes the fallback turn to `/v1/responses` (with 404 fallback to
+ * `/chat/completions`); a local vision connection routes directly to
+ * `/chat/completions`.
+ */
+describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 0006 Phase 3)', () => {
+  let originalFetch: typeof fetch;
+  let fetchCalls: Array<{ url: string; body: unknown }>;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      // Cloud default endpoint is 'auto' — the vision fallback turn
+      // should try /v1/responses first for the cloud vision model.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    originalFetch = global.fetch;
+    fetchCalls = [];
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    setConfig({});
+  });
+
+  function imageMsg(): vscode.LanguageModelChatRequestMessage {
+    return {
+      role: vscode.LanguageModelChatMessageRole.User,
+      content: [
+        new vscode.LanguageModelTextPart('what is this?'),
+        new vscode.LanguageModelDataPart(
+          new Uint8Array([0x89, 0x50, 0x4e, 0x47]),
+          'image/png',
+        ),
+      ] as unknown as vscode.LanguageModelChatRequestMessage['content'],
+      name: undefined,
+    };
+  }
+
+  function sseEvent(type: string, json: string): Uint8Array {
+    return encode(`event: ${type}\ndata: ${json}\n\n`);
+  }
+
+  it('routes the vision turn to /v1/responses for a cloud vision connection', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+    });
+
+    const chunks = [
+      sseEvent('response.created', '{"response":{"id":"r1","status":"in_progress"}}'),
+      sseEvent(
+        'response.reasoning_summary_text.delta',
+        '{"delta":"analyzing image","item_id":"rs1"}',
+      ),
+      sseEvent('response.output_text.delta', '{"delta":"it is a png","item_id":"m1"}'),
+      sseEvent(
+        'response.completed',
+        '{"response":{"id":"r1","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}',
+      ),
+    ];
+
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      return mockResponse(streamFromChunks(chunks));
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // One fetch — the /v1/responses path (cloud + auto, no prior 404).
+    assert.equal(fetchCalls.length, 1, 'single vision fetch to /v1/responses');
+    assert.ok(
+      fetchCalls[0].url.endsWith('/responses'),
+      `expected /responses URL, got ${fetchCalls[0].url}`,
+    );
+
+    // The request body uses the /v1/responses input[] shape (not
+    // messages[]).
+    const body = fetchCalls[0].body as { input: unknown; messages?: unknown };
+    assert.ok(Array.isArray(body.input), 'request used input[] shape');
+    assert.equal(body.messages, undefined, 'no messages[] on /v1/responses');
+
+    // Reasoning + text both surfaced.
+    const thinkingParts = progress.parts.filter(
+      (part) => part instanceof vscode.LanguageModelThinkingPart,
+    );
+    assert.equal(thinkingParts.length, 1, 'one thinking part reported');
+    assert.equal(
+      (thinkingParts[0] as vscode.LanguageModelThinkingPart).value,
+      'analyzing image',
+    );
+    const textParts = progress.parts.filter(
+      (part) => part instanceof vscode.LanguageModelTextPart,
+    );
+    assert.equal(textParts.length, 1, 'one text part reported');
+    assert.equal((textParts[0] as vscode.LanguageModelTextPart).value, 'it is a png');
+  });
+
+  it('falls back to /chat/completions when the vision /v1/responses returns 404', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+    });
+
+    let callCount = 0;
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      callCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      if (callCount === 1) {
+        return new Response(JSON.stringify({ error: { message: 'not found' } }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"vision chat answer"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // Two fetches: /v1/responses (404) then /chat/completions.
+    assert.equal(callCount, 2, 'vision fallback issued a second chat fetch');
+    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+    assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
+
+    // The chat path surfaces the text delta; no thinking parts.
+    assert.equal(progress.parts.length, 1, 'one text delta reported');
+    assert.equal(
+      (progress.parts[0] as vscode.LanguageModelTextPart).value,
+      'vision chat answer',
+    );
   });
 });
