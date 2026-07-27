@@ -122,8 +122,18 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.commands.registerCommand('ollamaCloud.setVisionFallbackConnection', () =>
         pickVisionFallbackConnection(),
       ),
+      vscode.commands.registerCommand('ollamaCloud.refreshModels', () =>
+        provider.refreshModelsCommand(),
+      ),
       vscode.lm.registerLanguageModelChatProvider('ollama-cloud', provider),
     );
+
+    // Auto-refresh model catalog on startup to pick up new models
+    // (e.g. Kimi-K3) without requiring the user to change a setting
+    // or restart VS Code. Fire-and-forget: a failure here only means
+    // the catalog stays stale until the next setting change or the
+    // user runs "Ollama Cloud: Refresh Models".
+    void provider.syncModelCatalog(true);
 
     // Issue 17 — wire the smart API-key prompt.
     // MEDIUM-1 — push the handle's disposables (resetListener +

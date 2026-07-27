@@ -97,10 +97,12 @@ describe('extension.activate — smoke test', () => {
       'ollamaCloud.showLogs',
       'ollamaCloud.checkConnection',
       'ollamaCloud.validateConfig',
-      // ADR 0004 — Vision Fallback Pass-through commands (package.json
-      // declares 8 commands; the e2e list must match to catch drift).
+      // ADR 0004 — Vision Fallback Pass-through commands + ADR 0006
+      // refreshModels command (package.json declares 9 commands; the
+      // e2e list must match to catch drift).
       'ollamaCloud.setVisionFallbackModel',
       'ollamaCloud.setVisionFallbackConnection',
+      'ollamaCloud.refreshModels',
     ];
     for (const id of expectedCommands) {
       assert.ok(

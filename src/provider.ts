@@ -177,6 +177,27 @@ export class OllamaCloudChatProvider
     await runHealthCheckCommand(this.authManager);
   }
 
+  /**
+   * Command handler for `ollamaCloud.refreshModels` — force-syncs the
+   * model catalog with a progress notification, bypassing the 30s
+   * cooldown. After the sync completes, shows the model count so the
+   * user sees the result of the refresh.
+   */
+  async refreshModelsCommand(): Promise<void> {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'Ollama Cloud: Refreshing models...',
+        cancellable: false,
+      },
+      () => this.syncModelCatalog(true),
+    );
+    const count = this.modelCatalog.list().length;
+    vscode.window.showInformationMessage(
+      `Ollama Cloud: ${count} models available.`,
+    );
+  }
+
   async validateConfig(): Promise<void> {
     // Issue 16 — delegate to the configValidator module. It runs the
     // full validation suite (baseUrl whitelist, API key, reachability,
