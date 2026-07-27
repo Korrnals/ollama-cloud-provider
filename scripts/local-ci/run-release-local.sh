@@ -100,16 +100,25 @@ echo
 # previous release (e.g. ollama-cloud-provider-0.4.0.vsix) remains in the
 # root, the glob misselects it and downstream checksums/signatures are
 # created for the wrong file (mnemos e7f57431).
-VSIX_FILE="ollama-cloud-provider-${VERSION_NUM}.vsix"
+#
+# VSIX is built into releases/ (gitignored, .gitkeep tracked) so the
+# project root stays clean and artefacts have a single, predictable
+# resting place. SHA256/GPG/SBOM are generated alongside the VSIX in
+# releases/.
+RELEASES_DIR="$REPO_ROOT/releases"
+mkdir -p "$RELEASES_DIR"
+VSIX_FILE="$RELEASES_DIR/ollama-cloud-provider-${VERSION_NUM}.vsix"
+VSIX_BASENAME="$(basename "$VSIX_FILE")"
 
 step 2 "Build VSIX (npm ci → lint → compile → package)"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: npm ci && npm run lint && npm run compile && npm run package"
   echo "  expected VSIX: $VSIX_FILE"
 else
-  # Defence-in-depth: remove stale VSIX from previous runs so the only
-  # VSIX in the root after packaging is the freshly-built one.
-  rm -f *.vsix
+  # Defence-in-depth: remove stale VSIX from previous runs in both the
+  # project root and releases/ so the only VSIX after packaging is the
+  # freshly-built one in releases/.
+  rm -f releases/*.vsix *.vsix
   if [ -f package-lock.json ]; then
     npm ci || fail 2 "npm ci failed"
   else
@@ -117,10 +126,11 @@ else
   fi
   npm run lint    || fail 2 "lint failed"
   npm run compile || fail 2 "compile failed"
-  npm run package || fail 2 "vsce package failed"
+  # vsce package -o writes to the explicit path; no globbing ambiguity.
+  npx vsce package -o "$VSIX_FILE" || fail 2 "vsce package failed"
   if [[ ! -f "$VSIX_FILE" ]]; then
     err "expected VSIX $VSIX_FILE not found"
-    ls -la *.vsix 2>/dev/null || echo "(no .vsix files in cwd)"
+    ls -la releases/*.vsix 2>/dev/null || echo "(no .vsix files in releases/)"
     fail 2 "expected VSIX $VSIX_FILE not produced"
   fi
 fi
@@ -129,36 +139,38 @@ echo
 
 # ─── Step 3: Compute SHA256 ────────────────────────────────────────────────
 step 3 "Compute SHA256 (L1 — integrity, required)"
+SHA256_FILE="$RELEASES_DIR/sha256.txt"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  would run: sha256sum '$VSIX_FILE' > sha256.txt"
-  echo "  would assert: sha256.txt references $VSIX_FILE"
+  echo "  would run: sha256sum '$VSIX_FILE' > '$SHA256_FILE'"
+  echo "  would assert: $SHA256_FILE references $VSIX_BASENAME"
 else
-  sha256sum "$VSIX_FILE" > sha256.txt
-  SHA="$(awk '{print $1}' sha256.txt)"
+  sha256sum "$VSIX_FILE" > "$SHA256_FILE"
+  SHA="$(awk '{print $1}' "$SHA256_FILE")"
   echo "  SHA256: $SHA"
   # Assert sha256.txt references the expected VSIX (not a stale one).
-  if ! grep -q "$VSIX_FILE" sha256.txt; then
-    err "sha256.txt does not reference $VSIX_FILE — aborting"
-    cat sha256.txt >&2
+  # sha256sum writes the basename, so the assert checks basename match.
+  if ! grep -q "$VSIX_BASENAME" "$SHA256_FILE"; then
+    err "$SHA256_FILE does not reference $VSIX_BASENAME — aborting"
+    cat "$SHA256_FILE" >&2
     fail 3 "checksum references wrong VSIX — stale misselection detected"
   fi
 fi
-ok "L1 checksum written to sha256.txt (verified: references $VSIX_FILE)"
+ok "L1 checksum written to $SHA256_FILE (verified: references $VSIX_BASENAME)"
 echo
 
 # ─── Step 4: Sigstore cosign (L2 — build provenance, optional) ─────────────
 step 4 "Sigstore cosign signing (L2 — build provenance, optional)"
 if command -v cosign >/dev/null 2>&1; then
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  cosign installed — would sign: $VSIX_FILE, sha256.txt"
+    echo "  cosign installed — would sign: $VSIX_FILE, $SHA256_FILE"
   else
     cosign sign-blob --yes "$VSIX_FILE" --output-signature "${VSIX_FILE}.sig" \
       || fail 4 "cosign sign-blob VSIX failed"
-    cosign sign-blob --yes sha256.txt --output-signature "sha256.txt.sig" \
+    cosign sign-blob --yes "$SHA256_FILE" --output-signature "${SHA256_FILE}.sig" \
       || fail 4 "cosign sign-blob sha256.txt failed"
   fi
   COSIGN_OK=1
-  ARTIFACTS+=("${VSIX_FILE}.sig|L2 sigstore — VSIX")
+  ARTIFACTS+=("${VSIX_BASENAME}.sig|L2 sigstore — VSIX")
   ARTIFACTS+=("sha256.txt.sig|L2 sigstore — checksums")
   ok "L2 Sigstore signatures produced"
 else
@@ -215,13 +227,13 @@ fi
 if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_PASSPHRASE:-}" ]; then
   # Path 1: full env-var flow (CI portability) — import key, sign with passphrase
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  would import GPG_PRIVATE_KEY from env and sign sha256.txt"
+    echo "  would import GPG_PRIVATE_KEY from env and sign $SHA256_FILE"
     echo "  GPG_PASSPHRASE: $GPG_PASSPHRASE_ENCODING"
   else
     printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import \
       || fail 5 "gpg import from env failed"
     printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
-      --passphrase-fd 0 --sign --detach-sign --armor sha256.txt \
+      --passphrase-fd 0 --sign --detach-sign --armor "$SHA256_FILE" \
       || fail 5 "gpg sign (env key) failed"
   fi
   GPG_KEY_AVAILABLE=1
@@ -230,12 +242,12 @@ if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_PASSPHRASE:-}" ]; then
 elif [ -n "${GPG_PASSPHRASE:-}" ] && [ -n "$KEYRING_KEY_ID" ]; then
   # Path 2: passphrase env var + keyring key — local maintainer workflow
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  found key $KEYRING_KEY_ID in keyring + GPG_PASSPHRASE set — would sign sha256.txt"
+    echo "  found key $KEYRING_KEY_ID in keyring + GPG_PASSPHRASE set — would sign $SHA256_FILE"
     echo "  GPG_PASSPHRASE: $GPG_PASSPHRASE_ENCODING"
   else
     printf '%s' "$GPG_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback \
       --passphrase-fd 0 --local-user "$KEYRING_KEY_ID" \
-      --sign --detach-sign --armor sha256.txt \
+      --sign --detach-sign --armor "$SHA256_FILE" \
       || fail 5 "gpg sign (keyring key $KEYRING_KEY_ID + GPG_PASSPHRASE) failed"
   fi
   GPG_KEY_AVAILABLE=1
@@ -245,11 +257,11 @@ elif [ -n "$KEYRING_KEY_ID" ]; then
   # Path 3: keyring key only — rely on gpg-agent cache or unprotected key.
   # Empty --passphrase is required so gpg doesn't try to spawn pinentry-curses.
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  found key $KEYRING_KEY_ID in keyring — would sign sha256.txt via gpg-agent cache"
+    echo "  found key $KEYRING_KEY_ID in keyring — would sign $SHA256_FILE via gpg-agent cache"
   else
     if ! printf '' | gpg --batch --yes --pinentry-mode loopback \
         --passphrase-fd 0 --local-user "$KEYRING_KEY_ID" \
-        --sign --detach-sign --armor sha256.txt 2>/tmp/gpg-sign.err; then
+        --sign --detach-sign --armor "$SHA256_FILE" 2>/tmp/gpg-sign.err; then
       err "gpg sign (keyring key $KEYRING_KEY_ID, gpg-agent cache) failed:"
       sed 's/^/    /' /tmp/gpg-sign.err >&2
       fail 5 "GPG passphrase required. Set GPG_PASSPHRASE env var, or cache the passphrase in gpg-agent (gpg --sign once interactively), or set GPG_PRIVATE_KEY + GPG_PASSPHRASE for CI flow."
@@ -268,11 +280,12 @@ echo
 
 # ─── Step 6: SBOM ──────────────────────────────────────────────────────────
 step 6 "Generate SBOM (SPDX-JSON)"
+SBOM_FILE="$RELEASES_DIR/sbom.spdx.json"
 if command -v syft >/dev/null 2>&1; then
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  syft installed — would run: syft . -o spdx-json=sbom.spdx.json"
+    echo "  syft installed — would run: syft . -o spdx-json=$SBOM_FILE"
   else
-    syft . -o spdx-json=sbom.spdx.json || fail 6 "syft SBOM generation failed"
+    syft . -o spdx-json="$SBOM_FILE" || fail 6 "syft SBOM generation failed"
   fi
   SBOM_MODE="syft"
   ok "SBOM generated by syft"
@@ -280,7 +293,7 @@ else
   warn "syft not installed — generating minimal SPDX-JSON from package.json + lockfile."
   warn "Install: https://github.com/anchore/syft"
   if [ "$DRY_RUN" -ne 1 ]; then
-    node --input-type=module <<'NODE_EOF'
+    SBOM_OUTPUT="$SBOM_FILE" node --input-type=module <<'NODE_EOF'
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const pkg = JSON.parse(readFileSync('./package.json', 'utf8'));
@@ -348,7 +361,7 @@ const sbom = {
     })),
 };
 
-writeFileSync('./sbom.spdx.json', JSON.stringify(sbom, null, 2));
+writeFileSync(process.env.SBOM_OUTPUT, JSON.stringify(sbom, null, 2));
 console.log('  fallback SBOM packages: ' + packages.length);
 NODE_EOF
   fi
@@ -356,7 +369,7 @@ NODE_EOF
   ok "SBOM generated by inline Node.js fallback"
 fi
 ARTIFACTS+=("sbom.spdx.json|SBOM, $SBOM_MODE")
-echo "  SBOM generated: sbom.spdx.json"
+echo "  SBOM generated: $SBOM_FILE"
 echo
 
 # ─── Step 7: Create git tag (no push) ──────────────────────────────────────
@@ -420,7 +433,7 @@ else
       done
       echo "## Artifacts"
       echo
-      echo "- \`${VSIX_FILE}\` — packaged VS Code extension"
+      echo "- \`${VSIX_BASENAME}\` — packaged VS Code extension"
       echo "- \`sha256.txt\` — SHA256 checksums (L1)"
       echo "- \`sha256.txt.asc\` — GPG detached signature (L3)"
       [ "$COSIGN_OK" -eq 1 ] && echo "- \`*.vsix.sig\`, \`sha256.txt.sig\` — Sigstore signatures (L2)"
@@ -454,7 +467,7 @@ echo
 step 10 "Create GitHub Release and upload artifacts"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: gh release create '$VERSION' --title '$VERSION' --notes-file '$NOTES_FILE'"
-  echo "  would upload: $VSIX_FILE, sha256.txt, sha256.txt.sig (if exists), sha256.txt.asc, ${VSIX_FILE}.sig (if exists), sbom.spdx.json"
+  echo "  would upload: $VSIX_FILE, $SHA256_FILE, ${SHA256_FILE}.sig (if exists), ${SHA256_FILE}.asc, ${VSIX_FILE}.sig (if exists), $SBOM_FILE"
 else
   if ! command -v gh >/dev/null 2>&1; then
     fail 10 "gh CLI not installed — cannot create GitHub Release. Install: https://cli.github.com/"
@@ -464,8 +477,9 @@ else
     --notes-file "$NOTES_FILE" \
     || fail 10 "gh release create failed"
 
+  # Upload from releases/ — all artefacts are already staged there.
   UPLOAD_ARGS=()
-  for f in "$VSIX_FILE" sha256.txt sha256.txt.sig sha256.txt.asc "${VSIX_FILE}.sig" sbom.spdx.json; do
+  for f in "$VSIX_FILE" "$SHA256_FILE" "${SHA256_FILE}.sig" "${SHA256_FILE}.asc" "${VSIX_FILE}.sig" "$SBOM_FILE"; do
     [ -f "$f" ] && UPLOAD_ARGS+=("$f")
   done
   if [ "${#UPLOAD_ARGS[@]}" -gt 0 ]; then
@@ -476,37 +490,19 @@ else
 fi
 echo
 
-# ─── Step 11: Move artifacts to dist/ ──────────────────────────────────────
-# Release artefacts (VSIX, checksums, signatures, SBOM) are produced in the
-# project root during the build/sign flow because vsce and the signing tools
-# reference them by basename. After the GitHub release upload (step 10) has
-# consumed them, move everything into dist/ so the project root stays clean
-# and the artefacts have a single, predictable resting place.
-step 11 "Move release artifacts to dist/"
-DIST_DIR="$REPO_ROOT/dist"
-RELEASE_ARTIFACTS=(
-  "$VSIX_FILE"
-  "${VSIX_FILE}.sig"
-  "sha256.txt"
-  "sha256.txt.sig"
-  "sha256.txt.asc"
-  "sbom.spdx.json"
-)
+# ─── Step 11: Confirm artifacts in releases/ ───────────────────────────────
+# All release artefacts (VSIX, checksums, signatures, SBOM) are produced
+# directly in releases/ during the build/sign flow (steps 2-6). No post-hoc
+# move is needed — releases/ is the single resting place. This step simply
+# reports the final state for the operator.
+step 11 "Confirm release artifacts in releases/"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  would create: $DIST_DIR"
-  printf "  would move: %s\n" "${RELEASE_ARTIFACTS[@]}"
+  echo "  would list: $RELEASES_DIR"
 else
-  mkdir -p "$DIST_DIR"
-  MOVED=0
-  for f in "${RELEASE_ARTIFACTS[@]}"; do
-    if [ -f "$REPO_ROOT/$f" ]; then
-      mv -f "$REPO_ROOT/$f" "$DIST_DIR/$f"
-      MOVED=$((MOVED + 1))
-    fi
-  done
-  echo "  moved $MOVED artefact(s) to $DIST_DIR/"
+  echo "  artefacts in $RELEASES_DIR:"
+  ls -1 "$RELEASES_DIR" 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
 fi
-ok "Artifacts staged in dist/"
+ok "Artifacts staged in releases/"
 echo
 
 # ─── Summary ───────────────────────────────────────────────────────────────

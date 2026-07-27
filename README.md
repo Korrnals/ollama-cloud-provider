@@ -22,7 +22,8 @@ The extension is built for reliability and safety: API keys live in OS-backed se
 - **Streaming responses** — token streaming with reasoning/thinking support.
 - **Tool calling** — handled natively by VS Code, with no shell execution from the extension.
 - **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
-- **Retry and timeout** — exponential backoff for transient failures, configurable request timeout.
+- **Retry and timeout** — exponential backoff for transient failures, three-tier streaming timeout (see ADR 0005).
+- **Streaming timeout architecture** — three timers protect against dead connections without killing legitimate long-reasoning streams: connect timeout (30s, retried), inactivity timeout (90s, reset on each chunk), max-duration safety cap (30 min, prevents forgotten-tab token leaks).
 - **Health check** — probe the endpoint and discover models before chatting.
 - **Configuration validation** — catch misconfiguration (missing key, URL not whitelisted) before it breaks a chat.
 
@@ -102,7 +103,9 @@ Three ways to configure — pick one.
 {
   "ollamaCloud.baseUrl": "https://ollama.com/v1",
   "ollamaCloud.allowedBaseUrls": ["https://ollama.com/v1"],
-  "ollamaCloud.requestTimeoutMs": 120000,
+  "ollamaCloud.requestConnectTimeoutMs": 30000,
+  "ollamaCloud.requestInactivityTimeoutMs": 90000,
+  "ollamaCloud.requestMaxDurationMs": 1800000,
   "ollamaCloud.maxRetries": 3,
   "ollamaCloud.connections": [
     {
@@ -131,8 +134,11 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.apiKey` | `""` | Fallback API key. Prefer `Ollama Cloud: Set API Key` (stores in secret storage). |
 | `ollamaCloud.baseUrl` | `https://ollama.com/v1` | API base URL. Must be in `allowedBaseUrls`. |
 | `ollamaCloud.allowedBaseUrls` | `["https://ollama.com/v1"]` | Whitelist of permitted base URLs. |
-| `ollamaCloud.requestTimeoutMs` | `120000` | Request timeout, in milliseconds. |
-| `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx). |
+| `ollamaCloud.requestConnectTimeoutMs` | `30000` | Max time for initial connection. Retried via `maxRetries` on timeout. |
+| `ollamaCloud.requestInactivityTimeoutMs` | `90000` | Max gap between stream chunks. Reset on every chunk. No retry (mid-stream retry = double billing). |
+| `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (safety cap). Never reset. No retry. |
+| `ollamaCloud.requestTimeoutMs` | `120000` | **Deprecated** — use `requestMaxDurationMs`. Alias for backward compat. |
+| `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx, connect timeout). |
 | `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. |
 | `ollamaCloud.visionModels` | `[]` | Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection `visionModels` override this list. |
 | `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback. Opt-in. |
