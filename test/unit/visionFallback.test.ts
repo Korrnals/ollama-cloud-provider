@@ -71,6 +71,7 @@ function makeConnection(
     allowedBaseUrls: [`https://${id}.example/v1`],
     visionModels: [],
     requiresApiKey: type !== 'local',
+    preferredEndpoint: 'auto',
   };
 }
 
@@ -322,6 +323,7 @@ describe('visionFallback.executePassThrough', () => {
           baseUrl: 'https://vision-conn.example/v1',
           allowedBaseUrls: ['https://vision-conn.example/v1'],
           requiresApiKey: true,
+          preferredEndpoint: 'auto',
         },
       ],
     });

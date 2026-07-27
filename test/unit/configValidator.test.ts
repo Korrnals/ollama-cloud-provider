@@ -108,6 +108,7 @@ function makeConnection(
     allowedBaseUrls,
     visionModels: [],
     requiresApiKey: true,
+    preferredEndpoint: 'auto',
   };
 }
 

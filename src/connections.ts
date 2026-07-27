@@ -31,6 +31,11 @@ import * as vscode from 'vscode';
 export type ConnectionType = 'cloud' | 'local' | 'remote' | 'custom';
 
 /**
+ * ADR 0006 — preferred endpoint selection. See `ConnectionConfig.preferredEndpoint`.
+ */
+export type PreferredEndpoint = 'responses' | 'chat' | 'auto';
+
+/**
  * A normalized, validated connection configuration.
  *
  * `allowedBaseUrls` is the per-connection whitelist. It is ALWAYS
@@ -67,6 +72,16 @@ export interface ConnectionConfig {
   readonly visionModels: readonly string[];
   /** Whether an API key is required for this connection. */
   readonly requiresApiKey: boolean;
+  /**
+   * ADR 0006 — preferred endpoint for this connection. `'auto'` tries
+   * `/v1/responses` first for cloud/remote/custom connections and
+   * falls back to `/chat/completions` on 404; `'chat'` forces
+   * `/chat/completions` (used by default for local Ollama, which does
+   * not implement `/v1/responses`); `'responses'` forces
+   * `/v1/responses` and surfaces `onError` on 404 (explicit override,
+   * no silent fallback).
+   */
+  readonly preferredEndpoint: PreferredEndpoint;
 }
 
 /**
@@ -240,6 +255,9 @@ function synthesizeCloudConnection(
     allowedBaseUrls: globalAllowed.length > 0 ? globalAllowed : [baseUrl],
     visionModels: globalVision,
     requiresApiKey: true,
+    // Cloud connection defaults to 'auto' — try /v1/responses first,
+    // fall back to /chat/completions on 404 (ADR 0006).
+    preferredEndpoint: 'auto',
   };
 }
 
@@ -329,6 +347,7 @@ function normalizeConnection(
     allowedBaseUrls: allowed,
     visionModels,
     requiresApiKey,
+    preferredEndpoint: normalizePreferredEndpoint(record.preferredEndpoint, type),
   };
 }
 
@@ -427,6 +446,27 @@ function readStringList(
 
 function normalizeBaseUrl(value: string): string {
   return value.trim().replace(/\/+$/, '');
+}
+
+/**
+ * ADR 0006 — resolves the `preferredEndpoint` for a connection.
+ *
+ * - Explicit `'responses'` / `'chat'` are honoured verbatim.
+ * - `'auto'` is honoured verbatim (the provider resolves it at request
+ *   time using the capability cache).
+ * - Any other value (including `undefined`) falls back to the
+ *   type-based default: `local` connections default to `'chat'`
+ *   (local Ollama does not implement `/v1/responses`); cloud / remote
+ *   / custom connections default to `'auto'`.
+ */
+function normalizePreferredEndpoint(
+  value: unknown,
+  type: ConnectionType,
+): PreferredEndpoint {
+  if (value === 'responses' || value === 'chat' || value === 'auto') {
+    return value;
+  }
+  return type === 'local' ? 'chat' : 'auto';
 }
 
 function normalizePath(value: string): string {
