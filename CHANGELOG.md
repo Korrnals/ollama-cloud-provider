@@ -5,7 +5,8 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
-_No changes yet. Merged PRs add bullets here; the Git Workflow Specialist promotes this section to a dated release at cut time (see `git-workflow.instructions.md` versioning cadence)._
+### Fixed
+- Streaming timeout architecture (ADR 0005): replaced single 120s end-to-end timer with three timers — connect (30s, retry), inactivity (90s, reset per chunk), max-duration (30 min safety cap). Long-reasoning models (minimax-m3, 262K context) no longer killed by false timeout; dead connections detected; forgotten-tab budget protected. No mid-stream retry (double billing prevention).
 
 ## [0.5.1] - 2026-07-23
 

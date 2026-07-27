@@ -111,7 +111,31 @@
           "default": 120000,
           "minimum": 5000,
           "maximum": 600000,
-          "description": "Request timeout in milliseconds for chat completions.",
+          "description": "Deprecated — use ollamaCloud.requestMaxDurationMs. Alias for backward compat; mapped to requestMaxDurationMs when requestMaxDurationMs is unset.",
+          "scope": "application"
+        },
+        "ollamaCloud.requestConnectTimeoutMs": {
+          "type": "integer",
+          "default": 30000,
+          "minimum": 5000,
+          "maximum": 120000,
+          "description": "Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
+          "scope": "application"
+        },
+        "ollamaCloud.requestInactivityTimeoutMs": {
+          "type": "integer",
+          "default": 90000,
+          "minimum": 10000,
+          "maximum": 600000,
+          "description": "Inactivity timeout in milliseconds — reset on every stream chunk and :keep-alive SSE comment. NO retry (mid-stream retry = double billing). Detects dead connections vs slow reasoning. ADR 0005.",
+          "scope": "application"
+        },
+        "ollamaCloud.requestMaxDurationMs": {
+          "type": "integer",
+          "default": 1800000,
+          "minimum": 60000,
+          "maximum": 3600000,
+          "description": "Max stream duration in milliseconds — hard ceiling from streamChat entry, never reset. NO retry. Protects token budget from forgotten tabs / crashed callers. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.maxRetries": {

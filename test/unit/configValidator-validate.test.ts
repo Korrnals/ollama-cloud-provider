@@ -131,19 +131,23 @@ describe('configValidator.validateConfiguration', () => {
     assert.equal(retriesCheck!.passed, false);
   });
 
-  it('fails the suite on missing API key but reports reachability as skipped (5 checks emitted)', async () => {
+  it('fails the suite on missing API key but reports reachability as skipped (8 checks emitted)', async () => {
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
       requestTimeoutMs: 120000,
       maxRetries: 3,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
     });
     const auth = makeAuthManager();
     const result = await validateConfiguration(auth);
     // Missing API key fails the "API key set" check, so the suite
-    // is not ok — but all 5 checks are still emitted.
+    // is not ok — but all 8 checks are still emitted (5 original +
+    // 3 ADR 0005 streaming-timer checks).
     assert.equal(result.ok, false);
-    assert.equal(result.checks.length, 5);
+    assert.equal(result.checks.length, 8);
     const reachCheck = result.checks.find((c) => c.name === 'baseUrl reachable');
     assert.ok(reachCheck, 'reachable check missing');
     assert.ok(
