@@ -22,6 +22,17 @@ import {
   type ModelDefinition,
 } from './modelCatalog.js';
 import { OllamaClient } from './ollamaClient.js';
+import { ResponsesClient } from './responsesClient.js';
+import {
+  convertToResponsesInput,
+  convertToolsToResponses,
+} from './convertResponses.js';
+import {
+  isResponsesKnownUnavailable,
+  markResponsesAvailable,
+  markResponsesUnavailable,
+} from './capabilityCache.js';
+import { HttpError } from './retry.js';
 import { loadConnections, openAiBaseUrl } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
 import type { UsageInfo } from './protocolTypes.js';
@@ -291,7 +302,6 @@ export class OllamaCloudChatProvider
     const clientBaseUrl = connection
       ? openAiBaseUrl(connection)
       : this.authManager.getBaseUrl();
-    const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
     const modelOptions = options as ModelConfigurationOptions;
     const requestConfiguration = resolveModelRequestConfiguration(
       model,
@@ -299,6 +309,107 @@ export class OllamaCloudChatProvider
     );
     const openaiMessages = convertMessagesToOpenAI(messages);
     const requestChars = countOpenAIRequestChars(openaiMessages);
+
+    // ADR 0006 — endpoint selection. /v1/responses is primary for
+    // cloud connections (connection === undefined is the legacy cloud
+    // path, treated as preferredEndpoint 'auto'); /chat/completions
+    // is the fallback for local connections, HTTP 404, and user
+    // override (`preferredEndpoint: 'chat'`). No mid-stream fallback
+    // — POST is non-idempotent (ADR 0001/0005).
+    //
+    // Connection-type resolution: when `connection` is undefined
+    // (cloud legacy path) the connection id is 'cloud' and the type
+    // is non-local. When `connection` is set, use its declared type.
+    const connectionId = connection?.id ?? 'cloud';
+    const isLocal = connection?.type === 'local';
+    const preferredEndpoint = connection?.preferredEndpoint ?? 'auto';
+    const useResponses =
+      !isLocal &&
+      preferredEndpoint !== 'chat' &&
+      !isResponsesKnownUnavailable(connectionId);
+
+    if (useResponses) {
+      try {
+        const responsesClient = new ResponsesClient(
+          clientBaseUrl,
+          apiKey ?? '',
+          connection,
+        );
+        const { input, instructions } = convertToResponsesInput(messages);
+        const responsesTools = convertToolsToResponses(options.tools);
+        await new Promise<void>((resolve, reject) => {
+          void responsesClient.streamResponses(
+            {
+              model: model.apiModel,
+              input,
+              instructions,
+              tools: responsesTools,
+              tool_choice: resolveToolChoice(options.toolMode, options.tools),
+              extraBody: requestConfiguration.openaiBody,
+            },
+            {
+              onText: (text: string) => {
+                progress.report(new vscode.LanguageModelTextPart(text));
+              },
+              onThinking: (text: string) => {
+                const thinkingPart = createThinkingPart(text);
+                if (thinkingPart) {
+                  progress.report(thinkingPart);
+                }
+              },
+              onToolCall: (toolCall: {
+                id: string;
+                name: string;
+                input: Record<string, unknown>;
+              }) => {
+                progress.report(
+                  new vscode.LanguageModelToolCallPart(
+                    toolCall.id,
+                    toolCall.name,
+                    toolCall.input,
+                  ),
+                );
+              },
+              onUsage: (usage: UsageInfo) => {
+                this.updateTokenEstimate(requestChars, usage);
+                logger.info(formatUsageLog(model.id, usage));
+              },
+              onDone: () => resolve(),
+              onError: (error: Error) => reject(error),
+            },
+            token,
+          );
+        });
+        markResponsesAvailable(connectionId);
+        return; // success — /v1/responses handled the turn
+      } catch (error) {
+        // 404 at request start (before any chunk) → memoize
+        // unavailable and fall through to /chat/completions. A
+        // mid-stream 404 cannot happen (the status is on the initial
+        // response); non-404 errors (timeout, 5xx, network) are
+        // surfaced to the user with NO fallback — avoiding double
+        // billing and duplicate prefixes (ADR 0001/0005).
+        if (is404Error(error) && connection?.id) {
+          markResponsesUnavailable(connection.id);
+          logger.info(
+            `Falling back to /chat/completions for connection "${connection.id}" (/v1/responses returned 404)`,
+          );
+          // fall through to /chat/completions below
+        } else if (is404Error(error) && !connection) {
+          // Legacy cloud path — memoize under the 'cloud' id.
+          markResponsesUnavailable('cloud');
+          logger.info(
+            'Falling back to /chat/completions for cloud connection (/v1/responses returned 404)',
+          );
+          // fall through to /chat/completions below
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    // Fallback: /chat/completions (existing path — unchanged)
+    const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
 
     await new Promise<void>((resolve, reject) => {
       void client.streamChat(
@@ -441,4 +552,15 @@ function createThinkingPart(
   }
 
   return new vscodeWithThinking.LanguageModelThinkingPart(text);
+}
+
+/**
+ * ADR 0006 — returns true when `error` is an {@link HttpError} with
+ * status 404. Used by the endpoint dispatch to decide whether a
+ * `/v1/responses` failure should fall back to `/chat/completions`
+ * (404 → yes, memoize unavailable) or surface to the user
+ * (5xx/timeout/network → no, no double billing).
+ */
+function is404Error(error: unknown): boolean {
+  return error instanceof HttpError && error.status === 404;
 }
