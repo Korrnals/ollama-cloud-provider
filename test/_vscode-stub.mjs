@@ -142,6 +142,21 @@ export class LanguageModelTextPart {
   }
 }
 
+/**
+ * ADR 0006 Phase 3 — structured reasoning. The stub mirrors the real
+ * `vscode.LanguageModelThinkingPart` (VS Code 1.103+) so tests can
+ * assert reasoning events produce a `LanguageModelThinkingPart`. The
+ * production code probes for the class via `typeof` and falls back to
+ * `LanguageModelTextPart` when it is absent — keeping the stub here
+ * lets the e2e test verify the happy path; absence is covered by the
+ * fallback branch in `provider.ts`/`visionFallback.ts`.
+ */
+export class LanguageModelThinkingPart {
+  constructor(value) {
+    this.value = value;
+  }
+}
+
 export class LanguageModelToolCallPart {
   constructor(callId, name, input) {
     this.callId = callId;
@@ -278,6 +293,7 @@ export default {
   workspace,
   LanguageModelChatMessageRole,
   LanguageModelTextPart,
+  LanguageModelThinkingPart,
   LanguageModelToolCallPart,
   LanguageModelToolResultPart,
   LanguageModelDataPart,

@@ -300,7 +300,7 @@ export class OllamaCloudChatProvider
         // Returns from here; the primary path below is not reached.
         return await executePassThrough({
           primaryModel: model,
-          primaryConnection: connection,
+          primaryConnection: connection ?? cloudConnection,
           messages,
           options,
           progress,
@@ -567,16 +567,21 @@ function formatUsageLog(modelId: string, usage: UsageInfo): string {
 
 function createThinkingPart(
   text: string,
-): vscode.LanguageModelResponsePart | undefined {
+): vscode.LanguageModelResponsePart {
+  // ADR 0006 Phase 3 — structured reasoning. Prefer
+  // `LanguageModelThinkingPart` when the API is present (VS Code
+  // 1.103+). On older VS Code versions where the class is absent,
+  // fall back to `LanguageModelTextPart` so the reasoning content
+  // is still surfaced to the user rather than silently dropped.
   const vscodeWithThinking = vscode as typeof vscode & {
     LanguageModelThinkingPart?: new (
       value: string,
     ) => vscode.LanguageModelResponsePart;
   };
 
-  if (typeof vscodeWithThinking.LanguageModelThinkingPart !== 'function') {
-    return undefined;
+  if (typeof vscodeWithThinking.LanguageModelThinkingPart === 'function') {
+    return new vscodeWithThinking.LanguageModelThinkingPart(text);
   }
 
-  return new vscodeWithThinking.LanguageModelThinkingPart(text);
+  return new vscode.LanguageModelTextPart(text);
 }
