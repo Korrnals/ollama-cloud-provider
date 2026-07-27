@@ -24,6 +24,12 @@ import { logger } from './logger.js';
 const DEFAULT_ALLOWED_BASE_URLS: readonly string[] = ['https://ollama.com/v1'];
 const REQUEST_TIMEOUT_MIN_MS = 5000;
 const REQUEST_TIMEOUT_MAX_MS = 600000;
+const REQUEST_CONNECT_TIMEOUT_MIN_MS = 5000;
+const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
+const REQUEST_INACTIVITY_TIMEOUT_MIN_MS = 10000;
+const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
+const REQUEST_MAX_DURATION_MIN_MS = 60000;
+const REQUEST_MAX_DURATION_MAX_MS = 3600000;
 const MAX_RETRIES_MAX = 10;
 // MEDIUM-2 — reachability probe uses a short 10s timeout (mirrors
 // healthCheck.ts) NOT the full REQUEST_TIMEOUT_MAX_MS (10 min). A
@@ -134,7 +140,7 @@ export async function validateConfiguration(
     message: reachableMessage,
   });
 
-  // Check 4 — requestTimeoutMs valid.
+  // Check 4 — requestTimeoutMs valid (legacy / deprecated alias).
   const timeoutMs = vscode.workspace
     .getConfiguration('ollamaCloud')
     .get<number>('requestTimeoutMs');
@@ -150,8 +156,48 @@ export async function validateConfiguration(
       : `requestTimeoutMs=${timeoutMs} is outside [${REQUEST_TIMEOUT_MIN_MS}, ${REQUEST_TIMEOUT_MAX_MS}]`,
   });
 
-  // Check 5 — maxRetries valid (only if the key is declared).
+  // ADR 0005 — Check 4a/4b/4c: the three streaming timers.
   const config = vscode.workspace.getConfiguration('ollamaCloud');
+  const connectMs = config.get<number>('requestConnectTimeoutMs');
+  const connectValid =
+    typeof connectMs === 'number' &&
+    connectMs >= REQUEST_CONNECT_TIMEOUT_MIN_MS &&
+    connectMs <= REQUEST_CONNECT_TIMEOUT_MAX_MS;
+  checks.push({
+    name: 'requestConnectTimeoutMs valid',
+    passed: connectValid,
+    message: connectValid
+      ? `requestConnectTimeoutMs=${connectMs}`
+      : `requestConnectTimeoutMs=${connectMs} is outside [${REQUEST_CONNECT_TIMEOUT_MIN_MS}, ${REQUEST_CONNECT_TIMEOUT_MAX_MS}]`,
+  });
+
+  const inactivityMs = config.get<number>('requestInactivityTimeoutMs');
+  const inactivityValid =
+    typeof inactivityMs === 'number' &&
+    inactivityMs >= REQUEST_INACTIVITY_TIMEOUT_MIN_MS &&
+    inactivityMs <= REQUEST_INACTIVITY_TIMEOUT_MAX_MS;
+  checks.push({
+    name: 'requestInactivityTimeoutMs valid',
+    passed: inactivityValid,
+    message: inactivityValid
+      ? `requestInactivityTimeoutMs=${inactivityMs}`
+      : `requestInactivityTimeoutMs=${inactivityMs} is outside [${REQUEST_INACTIVITY_TIMEOUT_MIN_MS}, ${REQUEST_INACTIVITY_TIMEOUT_MAX_MS}]`,
+  });
+
+  const maxDurationMs = config.get<number>('requestMaxDurationMs');
+  const maxDurationValid =
+    typeof maxDurationMs === 'number' &&
+    maxDurationMs >= REQUEST_MAX_DURATION_MIN_MS &&
+    maxDurationMs <= REQUEST_MAX_DURATION_MAX_MS;
+  checks.push({
+    name: 'requestMaxDurationMs valid',
+    passed: maxDurationValid,
+    message: maxDurationValid
+      ? `requestMaxDurationMs=${maxDurationMs}`
+      : `requestMaxDurationMs=${maxDurationMs} is outside [${REQUEST_MAX_DURATION_MIN_MS}, ${REQUEST_MAX_DURATION_MAX_MS}]`,
+  });
+
+  // Check 5 — maxRetries valid (only if the key is declared).
   const maxRetries = config.get<number>('maxRetries');
   const retriesValid =
     typeof maxRetries === 'number' && maxRetries >= 0 && maxRetries <= MAX_RETRIES_MAX;

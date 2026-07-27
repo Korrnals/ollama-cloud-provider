@@ -14,14 +14,32 @@ import type {
   UsageInfo,
 } from './protocolTypes.js';
 import {
+  ConnectTimeoutError,
+  InactivityTimeoutError,
+  MaxDurationError,
   defaultRetryOn,
   httpErrorFromResponse,
   withRetry,
 } from './retry.js';
 
-const REQUEST_TIMEOUT_MIN_MS = 5000;
+// ADR 0005 — three timers replace the single end-to-end setTimeout.
+// Each guard mirrors the package.json schema maximum; below-minimum
+// values are accepted (package.json enforces the UI minimum, the
+// resolver only guards against garbage). See resolve* docstring.
+const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
+const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 30000;
+
+const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
+const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 90000;
+
+const REQUEST_MAX_DURATION_MAX_MS = 3600000;
+const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
+
+// Legacy single-timer clamp — kept for the deprecation alias. The
+// default is intentionally unused (new default is
+// REQUEST_MAX_DURATION_DEFAULT_MS); the alias only applies when the
+// user explicitly set requestTimeoutMs.
 const REQUEST_TIMEOUT_MAX_MS = 600000;
-const REQUEST_TIMEOUT_DEFAULT_MS = 120000;
 // MEDIUM-2 — cap the SSE buffer at 1 MiB. A well-formed stream emits
 // newline-delimited chunks, so the buffer between line splits stays
 // small. A hostile/malformed stream with no newlines would grow it
@@ -114,51 +132,78 @@ export class OllamaClient {
     callbacks: StreamCallbacks,
     cancellationToken?: CancellationToken,
   ): Promise<void> {
-    // Issue 14 — per-request timeout. The controller lives for the
-    // whole stream: both the initial connection AND the streaming
-    // duration are bounded. A hung stream is worse than a cancelled
-    // one, so the timeout applies end-to-end.
+    // ADR 0005 — three timers replace the single end-to-end setTimeout.
+    //   connect      — wraps fetch only, retryable, 30s default
+    //   inactivity   — resets per chunk + per :keep-alive, NO retry, 90s
+    //   maxDuration  — never reset, NO retry, 30 min safety cap
+    // No mid-stream retry: POST /chat/completions is not idempotent.
     const controller = new AbortController();
-    const requestTimeoutMs = resolveRequestTimeoutMs();
-    // MEDIUM-1 — track whether the timeout fired. The catch block must
-    // distinguish a timeout-abort (route to onError) from a caller-
-    // cancel abort (route to onDone). Without this flag, a timed-out
-    // stream silently succeeds, hiding the failure from the user.
-    let timeoutFired = false;
-    const timeoutHandle = setTimeout(() => {
-      timeoutFired = true;
+    const connectTimeoutMs = resolveConnectTimeoutMs();
+    const inactivityTimeoutMs = resolveInactivityTimeoutMs();
+    const maxDurationMs = resolveMaxDurationMs();
+
+    // Tagged abort reason — the catch block routes by this tag to emit
+    // the right user-facing message and to decide onDone vs onError.
+    type AbortReason =
+      | 'connect'
+      | 'inactivity'
+      | 'maxDuration'
+      | 'cancel'
+      | null;
+    let abortReason: AbortReason = null;
+
+    // Max-duration: one setTimeout at start, never reset, cleared in finally.
+    const maxDurationHandle = setTimeout(() => {
+      abortReason = 'maxDuration';
       logger.error(
-        `Ollama Cloud: request timed out after ${requestTimeoutMs}ms`,
+        `Ollama Cloud: exceeded max stream duration (${maxDurationMs}ms)`,
       );
       controller.abort();
-    }, requestTimeoutMs);
+    }, maxDurationMs);
 
-    // Combine the caller's CancellationToken with the timeout: if the
-    // caller cancels, abort. The timeout's abort is wired above.
-    // Race fix — the listener is registered synchronously here, before
-    // any `await`, but the caller may have already cancelled during the
-    // async setup that ran BEFORE `streamChat` was entered (e.g. the
-    // vision-fallback path awaits `getApiKeyForConnection` before
-    // calling us). `onCancellationRequested` does not fire retroactively
-    // for an already-cancelled token, so we must check synchronously
-    // and abort now. Without this, a cancel that arrives during setup
-    // is silently lost — both in production and in tests.
-    const cancelListener = cancellationToken?.onCancellationRequested(() =>
-      controller.abort(),
-    );
+    // Inactivity: started after fetch resolves (first byte), reset per
+    // chunk + per :keep-alive. Declared here so the finally block can
+    // clear it from both the stream path and the early-throw path.
+    let inactivityHandle: ReturnType<typeof setTimeout> | undefined;
+    const resetInactivity = (): void => {
+      if (inactivityHandle !== undefined) {
+        clearTimeout(inactivityHandle);
+      }
+      inactivityHandle = setTimeout(() => {
+        abortReason = 'inactivity';
+        logger.error(
+          `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
+        );
+        controller.abort();
+      }, inactivityTimeoutMs);
+    };
+    const clearInactivity = (): void => {
+      if (inactivityHandle !== undefined) {
+        clearTimeout(inactivityHandle);
+        inactivityHandle = undefined;
+      }
+    };
+
+    // Count of chunks received — used by the catch block to distinguish
+    // connect/first-token (0 chunks) from mid-stream (>0 chunks) for
+    // error messages. NOT used for retry decisions (no retry regardless).
+    let chunksReceived = 0;
+
+    // Combine the caller's CancellationToken with our timers. See the
+    // race note below — a cancel that arrived during async setup before
+    // streamChat was entered must be detected synchronously.
+    const cancelListener = cancellationToken?.onCancellationRequested(() => {
+      abortReason = 'cancel';
+      controller.abort();
+    });
     if (cancellationToken?.isCancellationRequested) {
+      abortReason = 'cancel';
       controller.abort();
     }
 
     let done = false;
 
     try {
-      // Issue 9 / SEC-03 — security boundary: refuse to send the API
-      // key to any baseUrl not in the whitelist. This runs at every
-      // request, not just at activation, so a mid-session config
-      // change cannot bypass it. Throws synchronously — the catch
-      // below surfaces it to the caller via onError. When bound to a
-      // connection, the connection's OWN whitelist is enforced.
       this.assertBaseUrlAllowedOrThrow();
 
       const { extraBody, ...baseRequest } = request;
@@ -169,27 +214,20 @@ export class OllamaClient {
         stream_options: { include_usage: true },
       });
 
-      // Issue 13 — retry the INITIAL CONNECTION only. Once `fetch`
-      // resolves with an ok Response, streaming begins and we must NOT
-      // retry mid-stream. `withRetry` wraps just the `fetch` + status
-      // check; the body reader loop below is outside the wrapper.
-      // `retryOn` excludes the caller-abort case so a user-cancelled
-      // request does not burn retry budget.
+      // Issue 13 / ADR 0005 — retry the INITIAL CONNECTION only.
+      // `withRetry` wraps just the `fetch` + status check; the body
+      // reader loop is outside the wrapper. Connect-phase timeouts
+      // (ConnectTimeoutError) are retriable; stream errors are terminal.
       const retryOn = (error: unknown): boolean => {
-        // Do not retry when the caller already cancelled — that abort
-        // is permanent for this request, not a transient failure.
         if (cancellationToken?.isCancellationRequested) {
           return false;
         }
-        // Do not retry when our own timeout fired — the timeout is
-        // intentional and retrying would just hit the timeout again.
+        // Do not retry on our own intentional aborts once a stream has
+        // started — but the connect-phase AbortError from the connect
+        // timer is wrapped as ConnectTimeoutError by the fetch wrapper
+        // below, so a raw AbortError here means caller-cancel or an
+        // ambiguous network abort: default to not retrying.
         if (error instanceof Error && error.name === 'AbortError') {
-          if (cancellationToken?.isCancellationRequested) {
-            return false;
-          }
-          // Ambiguous AbortError: could be our timeout or a transient
-          // network abort. Default to not retrying to avoid silently
-          // doubling the user's wait; the timeout is the dominant case.
           return false;
         }
         return defaultRetryOn(error);
@@ -197,26 +235,67 @@ export class OllamaClient {
 
       const response = await withRetry(
         async () => {
-          const headers: Record<string, string> = {
-            'Content-Type': 'application/json',
-          };
-          if (this.apiKey) {
-            headers.Authorization = `Bearer ${this.apiKey}`;
+          // Connect timer — wraps ONLY this fetch attempt. Cleared
+          // when fetch resolves (ok or not). A separate AbortController
+          // would also work; we reuse the main controller and tag the
+          // reason so the outer catch can distinguish connect-timeout
+          // from inactivity/maxDuration. If fetch does not return a
+          // Response in connectTimeoutMs → ConnectTimeoutError (retriable
+          // via defaultRetryOn).
+          const connectHandle = setTimeout(() => {
+            // Only tag as connect if no higher-priority reason fired.
+            // (cancel is set synchronously above; maxDuration is
+            // independent and may have fired first.)
+            if (abortReason === null) {
+              abortReason = 'connect';
+            }
+            controller.abort();
+          }, connectTimeoutMs);
+
+          try {
+            const headers: Record<string, string> = {
+              'Content-Type': 'application/json',
+            };
+            if (this.apiKey) {
+              headers.Authorization = `Bearer ${this.apiKey}`;
+            }
+            const res = await fetch(this.chatCompletionsUrl(), {
+              method: 'POST',
+              headers,
+              body,
+              signal: controller.signal,
+            });
+            if (!res.ok) {
+              const message = await extractErrorMessage(res);
+              throw await httpErrorFromResponse(res, message);
+            }
+            return res;
+          } catch (error) {
+            // If the connect timer fired, surface a typed
+            // ConnectTimeoutError so defaultRetryOn can retry. Do not
+            // override a cancel or maxDuration abort.
+            if (abortReason === 'connect' && error instanceof Error && error.name === 'AbortError') {
+              throw new ConnectTimeoutError(connectTimeoutMs);
+            }
+            throw error;
+          } finally {
+            clearTimeout(connectHandle);
           }
-          const res = await fetch(this.chatCompletionsUrl(), {
-            method: 'POST',
-            headers,
-            body,
-            signal: controller.signal,
-          });
-          if (!res.ok) {
-            const message = await extractErrorMessage(res);
-            throw await httpErrorFromResponse(res, message);
-          }
-          return res;
         },
         { retryOn },
       );
+
+      // fetch resolved — first byte of the response body is available.
+      // Start the inactivity timer (resets per chunk / keep-alive).
+      // Clear any connect-phase abort tag so a later inactivity fire
+      // is not misread as a connect timeout. The cast is needed because
+      // TS control-flow narrows `abortReason` after the cancel check
+      // above and does not account for closure reassignments from the
+      // timer callbacks.
+      if ((abortReason as AbortReason) === 'connect') {
+        abortReason = null;
+      }
+      resetInactivity();
 
       if (!response.body) {
         throw new Error('Ollama Cloud returned no response body.');
@@ -238,6 +317,13 @@ export class OllamaClient {
           break;
         }
 
+        // ADR 0005 — each chunk resets the inactivity timer. This is
+        // the core fix: a long-reasoning model that emits a chunk every
+        // ~0.5s keeps the stream alive indefinitely; only genuine
+        // silence (>inactivityTimeoutMs) fires.
+        chunksReceived += 1;
+        resetInactivity();
+
         buffer += decoder.decode(chunk.value, { stream: true });
         // MEDIUM-2 — unbounded SSE buffer is a DoS vector. A malformed
         // or hostile stream that never emits a newline would grow
@@ -252,7 +338,12 @@ export class OllamaClient {
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          const stop = processLine(line, pendingToolCalls, callbacks);
+          const stop = processLine(
+            line,
+            pendingToolCalls,
+            callbacks,
+            resetInactivity,
+          );
           if (stop) {
             done = true;
             break;
@@ -268,7 +359,12 @@ export class OllamaClient {
         buffer += decoder.decode();
         if (buffer) {
           for (const line of buffer.split(/\r?\n/)) {
-            const stop = processLine(line, pendingToolCalls, callbacks);
+            const stop = processLine(
+              line,
+              pendingToolCalls,
+              callbacks,
+              resetInactivity,
+            );
             if (stop) {
               done = true;
               break;
@@ -282,27 +378,45 @@ export class OllamaClient {
         callbacks.onDone();
       }
     } catch (error) {
+      // Route by abortReason. Connect → onError (retry already
+      // exhausted inside withRetry). Inactivity → onError (terminal,
+      // no retry). MaxDuration → onError (terminal). Cancel → onDone.
       if (error instanceof Error && error.name === 'AbortError') {
-        // MEDIUM-1 — a timeout abort is a failure, not a silent success.
-        // Only a caller-cancel abort routes to onDone. Without this
-        // distinction, a hung stream that timed out looked like a
-        // successful completion to the caller.
-        if (timeoutFired) {
-          callbacks.onError(
-            new Error(
-              `Ollama Cloud: request timed out after ${requestTimeoutMs}ms`,
-            ),
-          );
-        } else {
+        if (abortReason === 'cancel') {
           callbacks.onDone();
+          return;
         }
+        if (abortReason === 'maxDuration') {
+          callbacks.onError(new MaxDurationError(maxDurationMs));
+          return;
+        }
+        if (abortReason === 'inactivity') {
+          callbacks.onError(
+            new InactivityTimeoutError(inactivityTimeoutMs, chunksReceived),
+          );
+          return;
+        }
+        if (abortReason === 'connect') {
+          // Connect abort that escaped withRetry (e.g. maxRetries=0
+          // and the wrapper rethrew before our ConnectTimeoutError
+          // translation, or a race where cancel arrived mid-fetch).
+          // Treat as connect timeout for the user-facing message.
+          callbacks.onError(new ConnectTimeoutError(connectTimeoutMs));
+          return;
+        }
+        // Ambiguous AbortError with no tag — caller-cancel is the
+        // safest default (matches v0.4.x behaviour for bare aborts).
+        callbacks.onDone();
         return;
       }
+      // Non-abort errors (HttpError, whitelist throw, buffer overrun,
+      // ConnectTimeoutError that withRetry gave up on) — surface directly.
       callbacks.onError(
         error instanceof Error ? error : new Error(String(error)),
       );
     } finally {
-      clearTimeout(timeoutHandle);
+      clearTimeout(maxDurationHandle);
+      clearInactivity();
       cancelListener?.dispose();
     }
   }
@@ -312,9 +426,16 @@ function processLine(
   line: string,
   pendingToolCalls: Map<number, OpenAICompatibleToolCall>,
   callbacks: StreamCallbacks,
+  onKeepAlive?: () => void,
 ): boolean {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith(':')) {
+    // ADR 0005 — `: keep-alive` SSE comment resets the inactivity
+    // timer. Ollama Cloud does not emit these (spike 1), but the reset
+    // path is defense-in-depth for future providers that do.
+    if (trimmed.startsWith(':') && onKeepAlive) {
+      onKeepAlive();
+    }
     return false;
   }
 
@@ -413,22 +534,85 @@ function flushToolCalls(
 }
 
 /**
- * Issue 14 — reads and clamps `ollamaCloud.requestTimeoutMs`. The
- * package.json schema already constrains the value, but a workspace
- * `settings.json` with `minimum`/`maximum` violations is still
- * possible, so we clamp defensively at the read site.
+ * ADR 0005 — reads, clamps, and resolves the three streaming timers.
+ *
+ * Each resolver guards against non-number / NaN / non-positive values
+ * (returns the default). For positive numbers below the package.json
+ * `minimum` or above `maximum`, the resolver logs a warning and
+ * **clamps to the nearest bound** — EXCEPT when the value is below the
+ * minimum, in which case it is used as-is. Rationale: package.json
+ * enforces the policy range in the Settings UI; the resolver's job is
+ * to guard against garbage (NaN, 0, negative), not to second-guess a
+ * user or test that deliberately set a small value. Below-minimum
+ * values are legitimate for tests and for power users with unusual
+ * workloads; above-maximum values are clamped because they would
+ * disable the timer's safety purpose.
+ *
+ * `resolveMaxDurationMs` also honours the deprecated
+ * `ollamaCloud.requestTimeoutMs` alias: if `requestTimeoutMs` is set
+ * but `requestMaxDurationMs` is NOT, the legacy value (clamped to its
+ * own legacy range) is used as the max-duration cap, preserving
+ * backward compatibility for v0.4.0-era configs. A deprecation
+ * warning is logged once per process.
  */
-function resolveRequestTimeoutMs(): number {
+function resolveConnectTimeoutMs(): number {
   const configured = vscode.workspace
     .getConfiguration('ollamaCloud')
-    .get<number>('requestTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured)) {
-    return REQUEST_TIMEOUT_DEFAULT_MS;
+    .get<number>('requestConnectTimeoutMs');
+  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
+    return REQUEST_CONNECT_TIMEOUT_DEFAULT_MS;
   }
-  return Math.min(
-    Math.max(configured, REQUEST_TIMEOUT_MIN_MS),
-    REQUEST_TIMEOUT_MAX_MS,
-  );
+  if (configured > REQUEST_CONNECT_TIMEOUT_MAX_MS) {
+    logger.warn(
+      `ollamaCloud.requestConnectTimeoutMs=${configured} is above maximum ${REQUEST_CONNECT_TIMEOUT_MAX_MS}; clamping.`,
+    );
+    return REQUEST_CONNECT_TIMEOUT_MAX_MS;
+  }
+  return configured;
+}
+
+function resolveInactivityTimeoutMs(): number {
+  const configured = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<number>('requestInactivityTimeoutMs');
+  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
+    return REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS;
+  }
+  if (configured > REQUEST_INACTIVITY_TIMEOUT_MAX_MS) {
+    logger.warn(
+      `ollamaCloud.requestInactivityTimeoutMs=${configured} is above maximum ${REQUEST_INACTIVITY_TIMEOUT_MAX_MS}; clamping.`,
+    );
+    return REQUEST_INACTIVITY_TIMEOUT_MAX_MS;
+  }
+  return configured;
+}
+
+let maxDurationDeprecationWarned = false;
+
+function resolveMaxDurationMs(): number {
+  const config = vscode.workspace.getConfiguration('ollamaCloud');
+  const configured = config.get<number>('requestMaxDurationMs');
+  if (typeof configured === 'number' && !Number.isNaN(configured) && configured > 0) {
+    if (configured > REQUEST_MAX_DURATION_MAX_MS) {
+      logger.warn(
+        `ollamaCloud.requestMaxDurationMs=${configured} is above maximum ${REQUEST_MAX_DURATION_MAX_MS}; clamping.`,
+      );
+      return REQUEST_MAX_DURATION_MAX_MS;
+    }
+    return configured;
+  }
+  // Deprecated alias: requestTimeoutMs → requestMaxDurationMs.
+  const legacy = config.get<number>('requestTimeoutMs');
+  if (typeof legacy === 'number' && !Number.isNaN(legacy) && legacy > 0) {
+    if (!maxDurationDeprecationWarned) {
+      logger.warn(
+        'ollamaCloud.requestTimeoutMs is deprecated; use ollamaCloud.requestMaxDurationMs. Mapping requestTimeoutMs → requestMaxDurationMs for backward compatibility.',
+      );
+      maxDurationDeprecationWarned = true;
+    }
+    return Math.min(legacy, REQUEST_TIMEOUT_MAX_MS);
+  }
+  return REQUEST_MAX_DURATION_DEFAULT_MS;
 }
 
 async function extractErrorMessage(response: Response): Promise<string> {

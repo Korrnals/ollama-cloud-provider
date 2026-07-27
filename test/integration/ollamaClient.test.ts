@@ -97,6 +97,9 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
       baseUrl: BASE_URL,
       allowedBaseUrls: [BASE_URL],
       requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
       maxRetries: 0,
     });
   });
@@ -106,24 +109,27 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 
-  it('fires onError when the request times out', async function () {
-    // The production code clamps requestTimeoutMs to a 5000ms minimum
-    // (REQUEST_TIMEOUT_MIN_MS in ollamaClient.ts). We set 6000ms (above
-    // the clamp floor) and give mocha 15s so the request timeout fires
-    // before the test timeout. Using `function` (not arrow) so `this`
-    // binds to the mocha context for `this.timeout()`.
-    this.timeout(15000);
+  it('fires onError when the stream stalls (inactivity timeout, no chunks)', async function () {
+    // ADR 0005 — a hung connection (fetch resolves, no chunks) is
+    // detected by the inactivity timer. We set inactivity to 1000ms;
+    // the resolver accepts below-minimum values (package.json enforces
+    // the UI floor, the resolver only guards against garbage), so the
+    // test runs fast.
+    this.timeout(5000);
 
     setConfig({
       baseUrl: BASE_URL,
       allowedBaseUrls: [BASE_URL],
-      requestTimeoutMs: 6000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 1000,
+      requestMaxDurationMs: 1800000,
       maxRetries: 0,
     });
 
     // Stub fetch to return a stream that NEVER emits (simulates a hung
-    // connection). The timeout abort fires first; the wired signal errors
-    // the stream so reader.read() rejects with an AbortError.
+    // connection after the response headers arrive). The inactivity
+    // timer fires; the wired signal errors the stream so reader.read()
+    // rejects with an AbortError.
     let hungController: ReadableStreamDefaultController<Uint8Array> | null =
       null;
     const body = new ReadableStream<Uint8Array>({
@@ -148,9 +154,9 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
       recorder,
     );
 
-    assert.equal(recorder.errors.length, 1, 'onError must fire on timeout');
-    assert.match(recorder.errors[0]!.message, /timed out/);
-    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire on timeout');
+    assert.equal(recorder.errors.length, 1, 'onError must fire on inactivity timeout');
+    assert.match(recorder.errors[0]!.message, /stalled/);
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire on inactivity timeout');
 
     global.fetch = originalFetch;
   });
@@ -293,6 +299,427 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
     assert.equal(recorder.errors.length, 0, 'no errors on a clean stream');
 
     
+    global.fetch = originalFetch;
+  });
+});
+
+/**
+ * ADR 0005 — streaming timeout architecture tests.
+ *
+ * Three timers replace the single end-to-end setTimeout:
+ *   connect      — wraps fetch only, retryable, 30s default
+ *   inactivity   — resets per chunk + per :keep-alive, NO retry, 90s
+ *   maxDuration  — never reset, NO retry, 30 min safety cap
+ *
+ * Tests use small timer values (1000ms / 500ms) which the resolver
+ * accepts — package.json enforces the UI minimum, the resolver only
+ * guards against garbage (NaN, 0, negative). This keeps the suite
+ * fast without changing production behaviour.
+ */
+describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+    });
+  });
+
+  afterEach(() => {
+    const stub = global.fetch as any;
+    if (stub.__isStub && stub.__original) global.fetch = stub.__original;
+  });
+
+  it('connect timeout fires when fetch never resolves and retries', async function () {
+    // fetch hangs forever — the connect timer (1000ms) aborts it.
+    // maxRetries=2 → fetch called 3 times (1 + 2 retries). Each
+    // attempt hits the connect timeout → ConnectTimeoutError → retried
+    // via defaultRetryOn → after maxRetries exhausted → onError.
+    this.timeout(15000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 1000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 2,
+    });
+
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1;
+      // Never resolve — simulate an unreachable server. The connect
+      // timer aborts the signal; fetch rejects with AbortError.
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal) {
+          if (signal.aborted) {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+            return;
+          }
+          signal.addEventListener('abort', () => {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        }
+      });
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError must fire after retries exhausted');
+    assert.match(recorder.errors[0]!.message, /connect timeout/);
+    assert.equal(fetchCalls, 3, 'fetch must be called maxRetries+1 = 3 times');
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
+
+    global.fetch = originalFetch;
+  });
+
+  it('inactivity timer resets on each chunk — long stream does not false-trigger', async function () {
+    // Chunks every 50ms for 300ms; inactivity=1000ms. Each chunk
+    // resets the timer → onDone (not onError).
+    this.timeout(5000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 1000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+    });
+
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let count = 0;
+        const interval = setInterval(() => {
+          if (count < 5) {
+            controller.enqueue(
+              encode('data: {"choices":[{"delta":{"content":"x"}}]}\n'),
+            );
+            count += 1;
+          } else {
+            controller.enqueue(encode('data: [DONE]\n'));
+            controller.close();
+            clearInterval(interval);
+          }
+        }, 50);
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 0, 'no errors — timer keeps resetting');
+    assert.equal(recorder.doneCount, 1, 'onDone fires after stream completes');
+    assert.equal(recorder.text.join(''), 'xxxxx');
+
+    global.fetch = originalFetch;
+  });
+
+  it('mid-stream stall (chunk, then long gap) aborts without retry', async function () {
+    // Emit 1 chunk, then 90s gap (inactivity=1000ms test). Assert
+    // onError with "stalled" and NO retry (fetch called once).
+    this.timeout(5000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 1000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 2,
+    });
+
+    let fetchCalls = 0;
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(
+          encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n'),
+        );
+        // Do NOT close — stall after the first chunk.
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      fetchCalls += 1;
+      wireAbortSignal(init?.signal ?? undefined, streamController);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError must fire on stall');
+    assert.match(recorder.errors[0]!.message, /stalled/);
+    assert.equal(fetchCalls, 1, 'NO retry — fetch called once (mid-stream terminal)');
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire on stall');
+
+    global.fetch = originalFetch;
+  });
+
+  it('first-token timeout (fetch resolves, 0 chunks) → onError', async function () {
+    // fetch resolves, stream never emits, inactivity=500ms fires.
+    this.timeout(5000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 500,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+    });
+
+    let hungController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        hungController = controller;
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      wireAbortSignal(init?.signal ?? undefined, hungController);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError fires on first-token timeout');
+    assert.match(recorder.errors[0]!.message, /stalled/);
+    assert.equal(recorder.doneCount, 0);
+
+    global.fetch = originalFetch;
+  });
+
+  it('max stream duration fires after N ms of continuous chunks', async function () {
+    // Chunks every 50ms; maxDuration=300ms. The max-duration timer
+    // fires even though chunks keep coming (it never resets).
+    this.timeout(5000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 300,
+      maxRetries: 0,
+    });
+
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        const interval = setInterval(() => {
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"content":"x"}}]}\n'),
+          );
+        }, 50);
+        // Clean up after the test aborts the stream.
+        (controller as any)._testInterval = interval;
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      wireAbortSignal(init?.signal ?? undefined, streamController);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError fires on max duration');
+    assert.match(recorder.errors[0]!.message, /max stream duration/);
+    assert.equal(recorder.doneCount, 0);
+
+    if ((streamController as any)?._testInterval) {
+      clearInterval((streamController as any)._testInterval);
+    }
+    global.fetch = originalFetch;
+  });
+
+  it('CancellationToken still aborts immediately and routes to onDone', async function () {
+    // Existing cancel semantics must hold with the new timers.
+    this.timeout(5000);
+
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        controller.enqueue(
+          encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n'),
+        );
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      wireAbortSignal(init?.signal ?? undefined, streamController);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const cts = new vscode.CancellationTokenSource();
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+
+    setTimeout(() => cts.cancel(), 10);
+
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+      cts.token,
+    );
+
+    assert.equal(recorder.errors.length, 0, 'cancel routes to onDone, not onError');
+    assert.equal(recorder.doneCount, 1, 'onDone fires on cancel');
+    assert.ok(recorder.text.join('').includes('hi'));
+
+    global.fetch = originalFetch;
+  });
+
+  it('long-thinking model (chunks every 500ms for 3s) does not false-trigger inactivity', async function () {
+    // inactivity=1000ms, chunks every 500ms — each chunk resets the
+    // timer before it fires. Stream completes normally.
+    this.timeout(10000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 1000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+    });
+
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        let count = 0;
+        const interval = setInterval(() => {
+          if (count < 6) {
+            controller.enqueue(
+              encode('data: {"choices":[{"delta":{"reasoning":"..."}}]}\n'),
+            );
+            count += 1;
+          } else {
+            controller.enqueue(encode('data: [DONE]\n'));
+            controller.close();
+            clearInterval(interval);
+          }
+        }, 500);
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 0, 'no false inactivity trigger');
+    assert.equal(recorder.doneCount, 1, 'onDone fires normally');
+
+    global.fetch = originalFetch;
+  });
+
+  it('requestTimeoutMs (legacy) maps to requestMaxDurationMs — bounds total duration', async function () {
+    // Set ONLY requestTimeoutMs=400 (legacy), leave the new settings
+    // unset. The resolver maps legacy → maxDuration=400. A stream that
+    // emits chunks forever hits max-duration at 400ms.
+    this.timeout(5000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 400,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      // requestMaxDurationMs intentionally unset → alias kicks in
+      maxRetries: 0,
+    });
+
+    let streamController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        const interval = setInterval(() => {
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"content":"x"}}]}\n'),
+          );
+        }, 50);
+        (controller as any)._testInterval = interval;
+      },
+    });
+
+    const originalFetch = global.fetch;
+    global.fetch = (async (_input: unknown, init?: RequestInit) => {
+      wireAbortSignal(init?.signal ?? undefined, streamController);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'legacy timeout bounds total duration');
+    assert.match(
+      recorder.errors[0]!.message,
+      /max stream duration/,
+      'legacy requestTimeoutMs maps to maxDuration error',
+    );
+
+    if ((streamController as any)?._testInterval) {
+      clearInterval((streamController as any)._testInterval);
+    }
     global.fetch = originalFetch;
   });
 });
