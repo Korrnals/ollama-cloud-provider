@@ -78,6 +78,10 @@
       {
         "command": "ollamaCloud.setVisionFallbackConnection",
         "title": "Ollama Cloud: Set Vision Fallback Connection"
+      },
+      {
+        "command": "ollamaCloud.refreshModels",
+        "title": "Ollama Cloud: Refresh Models"
       }
     ],
     "configuration": {
