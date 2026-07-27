@@ -7,6 +7,12 @@ dist/
 *.vsix
 *.tsbuildinfo
 
+# === Release artifacts (local, never commit) ===
+# VSIX files built locally for Marketplace upload + GitHub Release.
+# Kept in releases/ for manual re-upload if needed.
+releases/*
+!releases/.gitkeep
+
 # === IDE / Editor (keep shared configs) ===
 .vscode/*
 !.vscode/extensions.json
