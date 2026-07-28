@@ -19,7 +19,8 @@ The extension is built for reliability and safety: API keys live in OS-backed se
 
 - **Native Copilot Chat integration** — Ollama Cloud models appear in the Copilot Chat model picker as first-class VS Code language models.
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
-- **Streaming responses** — token streaming with reasoning/thinking support via `/v1/responses` (structured reasoning events).
+- **`/v1/responses` primary endpoint** — cloud connections use the OpenAI Responses API by default, with structured streaming and reasoning shown as a collapsed thinking block in Copilot Chat (`LanguageModelThinkingPart`, VS Code 1.103+). `/chat/completions` is the automatic fallback on HTTP 404.
+- **Proxy-aware networking** — a native HTTP client bypasses VS Code's `global.fetch()` interception, fixing connect-timeout issues under `chat.agent.sandbox.enabled: "on"`. Respects the `http.proxy` VS Code setting.
 - **Tool calling** — fully supported via `/v1/responses` with top-level `function_call` / `function_call_output` input items (OpenAI Responses API spec). Handled natively by VS Code, with no shell execution from the extension.
 - **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
 - **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
