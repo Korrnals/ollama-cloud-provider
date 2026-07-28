@@ -108,9 +108,15 @@ export class MaxDurationError extends Error {
  * `Retry-After` header (supports both delta-seconds and HTTP-date forms).
  * The response body should already be consumed by the caller (the
  * `message` parameter carries the extracted error text).
+ *
+ * The `response` param is typed as a minimal structural subset
+ * (`{ status; headers: { get(name): string | null } }`) so both the
+ * native `HttpResponse` from `httpClient.ts` and a real `fetch()`
+ * `Response` are assignable without overlap-mismatch errors. This is
+ * the seam introduced by the proxy-aware HTTP client fix.
  */
 export async function httpErrorFromResponse(
-  response: Response,
+  response: { status: number; headers: { get(name: string): string | null } },
   message: string,
 ): Promise<HttpError> {
   let retryAfterMs: number | undefined;

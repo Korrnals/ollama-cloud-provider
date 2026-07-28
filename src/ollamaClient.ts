@@ -5,6 +5,7 @@ import {
   assertBaseUrlAllowedForConnection,
 } from './configValidator.js';
 import type { ConnectionConfig } from './connections.js';
+import { httpRequest, type HttpResponseLike } from './httpClient.js';
 import { logger, redactSensitive } from './logger.js';
 import type {
   OpenAICompatibleMessage,
@@ -313,7 +314,7 @@ export class OllamaClient {
             if (this.apiKey) {
               headers.Authorization = `Bearer ${this.apiKey}`;
             }
-            const res = await fetch(this.chatCompletionsUrl(), {
+            const res = await httpRequest(this.chatCompletionsUrl(), {
               method: 'POST',
               headers,
               body,
@@ -700,7 +701,7 @@ function resolveMaxDurationMs(): number {
   return REQUEST_MAX_DURATION_DEFAULT_MS;
 }
 
-async function extractErrorMessage(response: Response): Promise<string> {
+async function extractErrorMessage(response: HttpResponseLike): Promise<string> {
   const body = await response.text();
   try {
     const parsed = JSON.parse(body) as {

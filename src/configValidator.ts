@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { AuthManager } from './auth.js';
 import type { ConnectionConfig } from './connections.js';
+import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 
 /**
@@ -118,7 +119,7 @@ export async function validateConfiguration(
         VALIDATE_REACHABILITY_TIMEOUT_MS,
       );
       try {
-        const response = await fetch(`${baseUrl}/models`, {
+        const response = await httpRequest(`${baseUrl}/models`, {
           headers: { Authorization: `Bearer ${apiKey}` },
           signal: controller.signal,
         });

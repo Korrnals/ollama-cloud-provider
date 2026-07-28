@@ -25,6 +25,7 @@ import {
 } from './configValidator.js';
 import type { ConnectionConfig } from './connections.js';
 import { openAiBaseUrl } from './connections.js';
+import { httpRequest, type HttpResponseLike } from './httpClient.js';
 import { logger, redactSensitive } from './logger.js';
 import type {
   ResponsesInputItem,
@@ -232,7 +233,7 @@ export class ResponsesClient {
             if (this.apiKey) {
               headers.Authorization = `Bearer ${this.apiKey}`;
             }
-            const res = await fetch(this.responsesUrl(), {
+            const res = await httpRequest(this.responsesUrl(), {
               method: 'POST',
               headers,
               body,
@@ -593,7 +594,7 @@ function mapResponsesUsage(
   return { inputTokens, outputTokens, totalTokens };
 }
 
-async function extractErrorMessage(response: Response): Promise<string> {
+async function extractErrorMessage(response: HttpResponseLike): Promise<string> {
   const body = await response.text();
   try {
     const parsed = JSON.parse(body) as {
