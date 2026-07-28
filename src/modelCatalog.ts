@@ -7,6 +7,7 @@ import {
   openAiBaseUrl,
   rootUrlForConnection,
 } from './connections.js';
+import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
 
@@ -730,7 +731,7 @@ async function fetchModelIdsFromOpenAICatalog(
       CATALOG_FETCH_TIMEOUT_MS,
     );
     try {
-      const res = await fetch(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
+      const res = await httpRequest(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
         headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
         signal: controller.signal,
       });
@@ -773,7 +774,7 @@ async function fetchModelIdsFromTagsCatalog(
       CATALOG_FETCH_TIMEOUT_MS,
     );
     try {
-      const res = await fetch(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
+      const res = await httpRequest(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
         headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
         signal: controller.signal,
       });

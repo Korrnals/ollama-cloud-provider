@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { AuthManager } from './auth.js';
 import { assertBaseUrlAllowed, getEffectiveBaseUrl } from './configValidator.js';
+import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 
 /**
@@ -74,7 +75,7 @@ export async function performHealthCheck(
   const startedAt = Date.now();
 
   try {
-    const response = await fetch(`${baseUrl}${MODELS_ENDPOINT}`, {
+    const response = await httpRequest(`${baseUrl}${MODELS_ENDPOINT}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: controller.signal,
     });
