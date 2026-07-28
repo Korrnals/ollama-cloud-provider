@@ -8,6 +8,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ## [0.6.1] - 2026-07-28
 
 ### Fixed
+- **Proxy-aware HTTP client** — new `httpClient.ts` using Node.js native `https`/`http` modules, bypassing VS Code's `global.fetch()` interception. Fixes connect-timeout issues when `chat.agent.sandbox.enabled: "on"`. Reads the `http.proxy` VS Code setting (HTTPS via CONNECT tunnel, HTTP via direct proxy request). Both `OllamaClient` and `ResponsesClient` use the new `httpRequest()` instead of `fetch()`. Zero new dependencies.
 - **Critical regression**: `/v1/responses` tool calling completely broken in v0.6.0. Tool results (`LanguageModelToolResultPart`) were incorrectly wrapped as `tool_call_output` content parts inside a `role:'user'` message, which the Ollama Cloud server rejects with `unknown content type: tool_call_output`. Tool calls (`LanguageModelToolCallPart`) from assistant messages were silently dropped, breaking multi-turn tool use entirely. Both are now emitted as top-level `function_call` / `function_call_output` input items per the OpenAI Responses API spec.
 - `ResponsesInputItem` type changed from a single interface to a discriminated union (`message` | `function_call` | `function_call_output`) to accurately model the `/v1/responses` input schema.
 - `ResponsesContentPart` no longer includes `tool_call_output` — it was never a valid content part type.
