@@ -1,8 +1,8 @@
-// Per-connection capability cache for /v1/responses availability.
+// Per-connection capability cache for /v1/responses and /chat/completions.
 //
-// ADR 0006 — once a connection returns HTTP 404 from /v1/responses,
-// memoize "responses unavailable" for that connection's session
-// lifetime. Subsequent requests route directly to /chat/completions
+// ADR 0006 — once a connection returns HTTP 404 from an endpoint,
+// memoize "endpoint unavailable" for that connection's session
+// lifetime. Subsequent requests route directly to the other endpoint
 // without re-probing, avoiding the per-request 404 round-trip cost.
 //
 // The cache is process-in-memory only: it resets on VS Code restart
@@ -13,6 +13,7 @@ import { logger } from './logger.js';
 
 interface CapabilityEntry {
   responsesAvailable: boolean;
+  chatAvailable: boolean;
   checkedAt: number;
 }
 
@@ -43,13 +44,26 @@ export function isResponsesKnownAvailable(connectionId: string): boolean {
 }
 
 /**
+ * Returns true when the connection is KNOWN to NOT support
+ * /chat/completions (a prior 404 was memoized). Used by the
+ * symmetric fallback: when the user selects `chat` as primary and
+ * the server returns 404, the extension falls back to /v1/responses.
+ */
+export function isChatKnownUnavailable(connectionId: string): boolean {
+  const entry = cache.get(connectionId);
+  return entry?.chatAvailable === false;
+}
+
+/**
  * Memoize that the connection does NOT support /v1/responses (a 404
  * was observed). Subsequent `isResponsesKnownUnavailable` checks for
  * this connection return true for the rest of the session.
  */
 export function markResponsesUnavailable(connectionId: string): void {
+  const existing = cache.get(connectionId);
   cache.set(connectionId, {
     responsesAvailable: false,
+    chatAvailable: existing?.chatAvailable ?? true,
     checkedAt: Date.now(),
   });
   logger.info(
@@ -59,12 +73,44 @@ export function markResponsesUnavailable(connectionId: string): void {
 
 /**
  * Memoize that the connection DOES support /v1/responses (a request
- * succeeded). Subsequent `isResponsesKnownAvailable` checks for this
- * connection return true for the rest of the session.
+ * succeeded). Subsequent `isResponsesKnownAvailable` checks for
+ * this connection return true for the rest of the session.
  */
 export function markResponsesAvailable(connectionId: string): void {
+  const existing = cache.get(connectionId);
   cache.set(connectionId, {
     responsesAvailable: true,
+    chatAvailable: existing?.chatAvailable ?? true,
+    checkedAt: Date.now(),
+  });
+}
+
+/**
+ * Memoize that the connection does NOT support /chat/completions (a
+ * 404 was observed). Subsequent `isChatKnownUnavailable` checks for
+ * this connection return true for the rest of the session.
+ */
+export function markChatUnavailable(connectionId: string): void {
+  const existing = cache.get(connectionId);
+  cache.set(connectionId, {
+    responsesAvailable: existing?.responsesAvailable ?? true,
+    chatAvailable: false,
+    checkedAt: Date.now(),
+  });
+  logger.info(
+    `Capability cache: /chat/completions marked unavailable for connection "${connectionId}"`,
+  );
+}
+
+/**
+ * Memoize that the connection DOES support /chat/completions (a
+ * request succeeded).
+ */
+export function markChatAvailable(connectionId: string): void {
+  const existing = cache.get(connectionId);
+  cache.set(connectionId, {
+    responsesAvailable: existing?.responsesAvailable ?? true,
+    chatAvailable: true,
     checkedAt: Date.now(),
   });
 }

@@ -11,6 +11,7 @@
 // cache + `preferredEndpoint`); this module only shapes the request.
 import * as vscode from 'vscode';
 import type {
+  ResponsesContentPart,
   ResponsesInputItem,
   ResponsesTool,
 } from './protocolTypes.js';
@@ -46,10 +47,17 @@ export interface ResponsesConversionResult {
  *   token accounting apply.
  * - Assistant messages become `{ type:'message', role:'assistant',
  *   content[] }` with `output_text` parts.
- * - Tool results (`LanguageModelToolResultPart`) become
- *   `{ type:'message', role:'user', content:[{type:'tool_call_output',
- *   call_id, output}] }` items, ordered after the assistant message
- *   that requested the call.
+ * - Assistant tool calls (`LanguageModelToolCallPart`) become
+ *   top-level `{ type:'function_call', call_id, name, arguments }`
+ *   input items — NOT content parts inside a message. This matches
+ *   the OpenAI Responses API spec where function calls are
+ *   first-class input items.
+ * - Tool results (`LanguageModelToolResultPart`) become top-level
+ *   `{ type:'function_call_output', call_id, output }` input items,
+ *   NOT content parts inside a message. The v0.6.0 release
+ *   incorrectly wrapped them as `tool_call_output` content parts
+ *   inside a `role:'user'` message, which the server rejected with
+ *   `unknown content type: tool_call_output`.
  */
 export function convertToResponsesInput(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -67,7 +75,8 @@ export function convertToResponsesInput(
       continue;
     }
 
-    const contentParts: ResponsesInputItem['content'] = [];
+    const contentParts: ResponsesContentPart[] = [];
+    const toolCalls: Array<{ callId: string; name: string; arguments: string }> = [];
     const toolResults: Array<{ callId: string; output: string }> = [];
 
     for (const part of message.content) {
@@ -89,6 +98,18 @@ export function convertToResponsesInput(
         });
       }
 
+      // Tool calls from the assistant — top-level `function_call`
+      // input items (NOT content parts).
+      if (part instanceof vscode.LanguageModelToolCallPart) {
+        toolCalls.push({
+          callId: part.callId,
+          name: part.name,
+          arguments: JSON.stringify(part.input ?? {}),
+        });
+      }
+
+      // Tool results — top-level `function_call_output` input
+      // items (NOT content parts inside a message).
       if (part instanceof vscode.LanguageModelToolResultPart) {
         toolResults.push({
           callId: part.callId,
@@ -98,23 +119,31 @@ export function convertToResponsesInput(
     }
 
     // Emit the message item only when it has content (text/image).
-    // Empty assistant messages with no tool results are dropped,
+    // Empty assistant messages with no tool calls are dropped,
     // mirroring `convertMessagesToOpenAI`.
     if (contentParts.length > 0) {
       input.push({ type: 'message', role, content: contentParts });
     }
 
+    // Emit `function_call` items for assistant tool calls. These
+    // are top-level input items, emitted AFTER the assistant's
+    // text message (matching conversation order).
+    for (const toolCall of toolCalls) {
+      input.push({
+        type: 'function_call',
+        call_id: toolCall.callId,
+        name: toolCall.name,
+        arguments: toolCall.arguments,
+      });
+    }
+
+    // Emit `function_call_output` items for tool results. These
+    // are top-level input items, NOT content parts inside a message.
     for (const toolResult of toolResults) {
       input.push({
-        type: 'message',
-        role: 'user',
-        content: [
-          {
-            type: 'tool_call_output',
-            call_id: toolResult.callId,
-            output: toolResult.output,
-          },
-        ],
+        type: 'function_call_output',
+        call_id: toolResult.callId,
+        output: toolResult.output,
       });
     }
   }

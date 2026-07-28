@@ -28,7 +28,10 @@ import {
   convertToolsToResponses,
 } from './convertResponses.js';
 import {
+  isChatKnownUnavailable,
   isResponsesKnownUnavailable,
+  markChatAvailable,
+  markChatUnavailable,
   markResponsesAvailable,
   markResponsesUnavailable,
 } from './capabilityCache.js';
@@ -327,28 +330,40 @@ export class OllamaCloudChatProvider
     const openaiMessages = convertMessagesToOpenAI(messages);
     const requestChars = countOpenAIRequestChars(openaiMessages);
 
-    // ADR 0006 — endpoint selection. Cloud connections prefer
-    // `/v1/responses` (structured reasoning, typed events, first-class
-    // tool calling). Local Ollama only implements `/chat/completions`,
-    // so local connections route there directly. `preferredEndpoint:
-    // 'chat'` is an explicit user override. The capability cache
-    // short-circuits the `/v1/responses` attempt once a prior 404 has
-    // been memoized for the connection (avoids the per-request 404
-    // round-trip). No mid-stream fallback — POST is non-idempotent and
-    // a retry would bill twice (ADR 0001/0005).
-    // Cloud models keep `connection = undefined` for the legacy apiKey
-    // path, so read `preferredEndpoint` / `type` / `id` from either the
-    // resolved non-cloud connection or the cloud connection object.
+    // ADR 0006 — endpoint selection. The user picks a primary endpoint
+    // via `ollamaCloud.preferredEndpoint` (global setting, default
+    // `'responses'`). Per-connection `preferredEndpoint` overrides
+    // this: `'responses'`/`'chat'` are explicit; `'auto'` inherits the
+    // global setting.
+    //
+    // The OTHER endpoint is the automatic fallback on HTTP 404:
+    //   primary=responses → fallback=chat (and vice versa).
+    // Local Ollama always uses /chat/completions (no /v1/responses).
+    //
+    // The capability cache short-circuits the primary attempt once a
+    // prior 404 has been memoized for the connection. No mid-stream
+    // fallback — POST is non-idempotent and a retry would bill twice
+    // (ADR 0001/0005).
     const endpointConnection = connection ?? cloudConnection;
-    const preferredEndpoint = endpointConnection?.preferredEndpoint ?? 'auto';
+    const connectionPreferred = endpointConnection?.preferredEndpoint ?? 'auto';
     const isLocal = endpointConnection?.type === 'local';
     const connectionId = endpointConnection?.id ?? 'cloud';
-    const useResponses =
-      !isLocal &&
-      preferredEndpoint !== 'chat' &&
-      !isResponsesKnownUnavailable(connectionId);
 
-    if (useResponses) {
+    // Resolve the effective primary endpoint:
+    // - local → always 'chat' (no /v1/responses support)
+    // - explicit per-connection override (responses/chat) → use it
+    // - 'auto' → inherit the global setting (default 'responses')
+    const globalPreferred = vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .get<'responses' | 'chat'>('preferredEndpoint', 'responses');
+    const primaryEndpoint: 'responses' | 'chat' =
+      isLocal
+        ? 'chat'
+        : connectionPreferred === 'auto'
+          ? globalPreferred
+          : connectionPreferred;
+
+    if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
       try {
         const responsesClient = new ResponsesClient(
           clientBaseUrl,
@@ -390,8 +405,93 @@ export class OllamaCloudChatProvider
       }
     }
 
-    // /chat/completions path (fallback for cloud + 404, primary for
-    // local and `preferredEndpoint: 'chat'`). Unchanged.
+    // /chat/completions path — primary when global/per-connection
+    // setting is 'chat', fallback when 'responses' returned 404, or
+    // always for local Ollama.
+    if (!isLocal && primaryEndpoint === 'chat' && !isChatKnownUnavailable(connectionId)) {
+      try {
+        await this.runStream(
+          (callbacks) =>
+            client.streamChat(
+              {
+                model: model.apiModel,
+                messages: openaiMessages,
+                tools: convertToolsToOpenAI(options.tools),
+                tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                extraBody: requestConfiguration.openaiBody,
+              },
+              callbacks,
+              token,
+            ),
+          progress,
+          model,
+          requestChars,
+          () => markChatAvailable(connectionId),
+        );
+        return; // success — no fallback needed
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) {
+          markChatUnavailable(connectionId);
+          logger.info(
+            `Falling back to /v1/responses (/chat/completions returned 404) for connection "${connectionId}"`,
+          );
+          // fall through to /v1/responses below
+        } else {
+          throw error; // non-404 — surface, no fallback
+        }
+      }
+    }
+
+    // If we reach here, either:
+    //   - primary was 'responses' and 404'd → /chat/completions fallback
+    //   - primary was 'chat' and 404'd → /v1/responses fallback
+    //   - local connection → /chat/completions (the only path)
+    // For local connections, this is the only path and there is no
+    // fallback. For cloud/remote, this is the fallback from the
+    // primary endpoint's 404.
+    if (!isLocal && primaryEndpoint === 'chat' && isChatKnownUnavailable(connectionId)) {
+      // /chat/completions 404'd earlier → try /v1/responses as fallback
+      try {
+        const responsesClient = new ResponsesClient(
+          clientBaseUrl,
+          apiKey ?? '',
+          connection,
+        );
+        const { input, instructions } = convertToResponsesInput(messages);
+        const responsesTools = convertToolsToResponses(options.tools);
+        await this.runStream(
+          (callbacks) =>
+            responsesClient.streamResponses(
+              {
+                model: model.apiModel ?? model.id,
+                input,
+                ...(instructions !== undefined ? { instructions } : {}),
+                ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
+                tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                extraBody: requestConfiguration.openaiBody,
+              },
+              callbacks,
+              token,
+            ),
+          progress,
+          model,
+          requestChars,
+          () => markResponsesAvailable(connectionId),
+        );
+        return;
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 404) {
+          markResponsesUnavailable(connectionId);
+          logger.info(
+            `/v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
+          );
+        }
+        throw error;
+      }
+    }
+
+    // /chat/completions — the final fallback (from responses 404) or
+    // the only path for local Ollama.
     await this.runStream(
       (callbacks) =>
         client.streamChat(
@@ -408,7 +508,7 @@ export class OllamaCloudChatProvider
       progress,
       model,
       requestChars,
-      undefined,
+      isLocal ? undefined : () => markChatAvailable(connectionId),
     );
   }
 

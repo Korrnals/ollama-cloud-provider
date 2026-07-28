@@ -19,8 +19,9 @@ The extension is built for reliability and safety: API keys live in OS-backed se
 
 - **Native Copilot Chat integration** — Ollama Cloud models appear in the Copilot Chat model picker as first-class VS Code language models.
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
-- **Streaming responses** — token streaming with reasoning/thinking support.
-- **Tool calling** — handled natively by VS Code, with no shell execution from the extension.
+- **Streaming responses** — token streaming with reasoning/thinking support via `/v1/responses` (structured reasoning events).
+- **Tool calling** — fully supported via `/v1/responses` with top-level `function_call` / `function_call_output` input items (OpenAI Responses API spec). Handled natively by VS Code, with no shell execution from the extension.
+- **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
 - **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
 - **Retry and timeout** — exponential backoff for transient failures, three-tier streaming timeout (see ADR 0005).
 - **Streaming timeout architecture** — three timers protect against dead connections without killing legitimate long-reasoning streams: connect timeout (30s, retried), inactivity timeout (90s, reset on each chunk), max-duration safety cap (30 min, prevents forgotten-tab token leaks).
@@ -144,6 +145,7 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback. Opt-in. |
 | `ollamaCloud.visionFallback.model` | `""` | Vision-capable model id for fallback. If empty, auto-searches the primary connection's catalog for the first vision-capable model. |
 | `ollamaCloud.visionFallback.connection` | `""` | Connection id for the vision model. If empty, uses the primary connection. |
+| `ollamaCloud.preferredEndpoint` | `"responses"` | Primary API endpoint for cloud/remote connections. `"responses"` uses `/v1/responses` (structured reasoning, typed events, first-class tool calling); `"chat"` uses `/chat/completions` (classic OpenAI-compatible). The other endpoint is the automatic fallback on HTTP 404. Local Ollama always uses `/chat/completions` regardless. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this. |
 
 All settings are `scope: "application"` — workspace folders cannot override them.
 
@@ -157,8 +159,27 @@ All settings are `scope: "application"` — workspace folders cannot override th
 | `Ollama Cloud: Validate Configuration` | Validate settings (URL in whitelist, key present). |
 | `Ollama Cloud: Set Vision Fallback Model` | Pick a vision-capable model from the catalog. |
 | `Ollama Cloud: Set Vision Fallback Connection` | Pick a connection for the vision model (includes a "Clear — use primary connection" option). |
+| `Ollama Cloud: Refresh Models` | Force-sync the model catalog with the cloud endpoint, bypassing the 30s cooldown. Shows model count on completion. |
 | `Ollama Cloud: Show Registered Models` | List models registered with VS Code. |
 | `Ollama Cloud: Show Logs` | Open the extension output channel. |
+
+## Model Sync
+
+The extension automatically syncs the model catalog from the cloud endpoint:
+
+- **On startup** — the catalog refreshes immediately after activation, so new models (e.g. newly added cloud models) appear without a restart or config change.
+- **On config change** — changing `ollamaCloud.baseUrl`, `ollamaCloud.connections`, or `ollamaCloud.allowedBaseUrls` triggers a sync (with a 30s cooldown to avoid spamming).
+- **Manual refresh** — run `Ollama Cloud: Refresh Models` to force a sync at any time, bypassing the cooldown. The command shows a progress notification and displays the model count on completion.
+
+## `/v1/responses` Endpoint
+
+Since v0.6.0, cloud connections use the OpenAI `/v1/responses` API as the primary endpoint, with `/chat/completions` as a fallback. Benefits:
+
+- **Structured reasoning** — reasoning/thinking tokens are surfaced as collapsed thinking blocks in Copilot Chat (`LanguageModelThinkingPart`, VS Code 1.103+).
+- **Typed streaming events** — `response.created`, `response.reasoning_summary_text.delta`, `response.output_text.delta`, `response.completed`.
+- **First-class tool calling** — tool calls and results are top-level `function_call` / `function_call_output` input items, matching the OpenAI Responses API spec.
+
+Local Ollama connections always use `/chat/completions` (local Ollama does not implement `/v1/responses`). Cloud connections with `preferredEndpoint: 'chat'` also use `/chat/completions` directly. The capability cache memoizes 404 responses per connection, so the fallback to `/chat/completions` happens instantly after the first 404.
 
 ## Vision Fallback
 

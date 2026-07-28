@@ -14,7 +14,10 @@ import {
 } from './convert.js';
 import { convertToResponsesInput } from './convertResponses.js';
 import {
+  isChatKnownUnavailable,
   isResponsesKnownUnavailable,
+  markChatAvailable,
+  markChatUnavailable,
   markResponsesAvailable,
   markResponsesUnavailable,
 } from './capabilityCache.js';
@@ -285,21 +288,27 @@ export async function executePassThrough(
   const requestChars = countOpenAIRequestChars(openaiMessages);
 
   // ADR 0006 Phase 3 — endpoint dispatch mirrors `provider.ts`.
-  // Cloud vision connections prefer `/v1/responses` (structured
-  // reasoning, typed events); local Ollama only implements
-  // `/chat/completions`. `preferredEndpoint: 'chat'` is an explicit
-  // override. The capability cache short-circuits the `/v1/responses`
-  // attempt once a prior 404 has been memoized. No mid-stream
-  // fallback — POST is non-idempotent and a retry would bill twice
-  // (ADR 0001/0005). The vision model answers directly
-  // (pass-through), so the same dispatch applies.
+  // The user picks a primary endpoint via the global
+  // `ollamaCloud.preferredEndpoint` setting (default 'responses').
+  // Per-connection `preferredEndpoint` overrides this. The other
+  // endpoint is the automatic fallback on HTTP 404. Local Ollama
+  // always uses /chat/completions. The capability cache
+  // short-circuits the primary attempt once a prior 404 has been
+  // memoized. No mid-stream fallback — POST is non-idempotent and a
+  // retry would bill twice (ADR 0001/0005). The vision model answers
+  // directly (pass-through), so the same dispatch applies.
   const connectionId = visionConnection?.id ?? 'cloud';
   const isLocal = visionConnection?.type === 'local';
-  const preferredEndpoint = visionConnection?.preferredEndpoint ?? 'auto';
-  const useResponses =
-    !isLocal &&
-    preferredEndpoint !== 'chat' &&
-    !isResponsesKnownUnavailable(connectionId);
+  const connectionPreferred = visionConnection?.preferredEndpoint ?? 'auto';
+  const globalPreferred = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<'responses' | 'chat'>('preferredEndpoint', 'responses');
+  const primaryEndpoint: 'responses' | 'chat' =
+    isLocal
+      ? 'chat'
+      : connectionPreferred === 'auto'
+        ? globalPreferred
+        : connectionPreferred;
 
   const runResponsesStream = (): Promise<void> => {
     const responsesClient = new ResponsesClient(
@@ -381,7 +390,10 @@ export async function executePassThrough(
               `vision fallback usage tokens=${usage.totalTokens ?? 0} chars=${requestChars}`,
             );
           },
-          onDone: () => resolve(),
+          onDone: () => {
+            markChatAvailable(connectionId);
+            resolve();
+          },
           onError: (error: Error) => reject(error),
         },
         params.token,
@@ -389,7 +401,7 @@ export async function executePassThrough(
     });
   };
 
-  if (useResponses) {
+  if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
     try {
       await runResponsesStream();
       return; // success — no fallback needed
@@ -406,6 +418,43 @@ export async function executePassThrough(
     }
   }
 
+  // /chat/completions path — primary when setting is 'chat', or
+  // fallback from responses 404, or the only path for local.
+  if (!isLocal && primaryEndpoint === 'chat' && !isChatKnownUnavailable(connectionId)) {
+    try {
+      await runChatStream();
+      markChatAvailable(connectionId);
+      return;
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) {
+        markChatUnavailable(connectionId);
+        logger.info(
+          `Vision fallback: /chat/completions returned 404 for connection "${connectionId}" — falling back to /v1/responses`,
+        );
+        // fall through to /v1/responses below
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  // Symmetric fallback: chat 404'd → try responses
+  if (!isLocal && primaryEndpoint === 'chat' && isChatKnownUnavailable(connectionId)) {
+    try {
+      await runResponsesStream();
+      return;
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) {
+        markResponsesUnavailable(connectionId);
+        logger.info(
+          `Vision fallback: /v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  // Local connection — only /chat/completions, no fallback
   await runChatStream();
 }
 

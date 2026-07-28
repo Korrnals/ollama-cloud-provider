@@ -71,28 +71,48 @@ export interface StreamCallbacks {
 // ---------------------------------------------------------------------------
 
 /**
- * A single input message for `/v1/responses`. The endpoint uses a
+ * A single input item for `/v1/responses`. The endpoint uses a
  * typed `input[]` array instead of the `messages[]` array used by
- * `/chat/completions`. Each item carries `role` and a `content[]`
- * array of typed parts.
+ * `/chat/completions`. Most items are `message` items carrying `role`
+ * and a `content[]` array of typed parts. Tool calls and tool results
+ * are top-level items (`function_call` / `function_call_output`),
+ * NOT content parts inside a message — this is the key structural
+ * difference from `/chat/completions` that caused the v0.6.0 regression
+ * (the server rejects `tool_call_output` as a content type inside a
+ * message's `content[]`).
  */
-export interface ResponsesInputItem {
-  type: 'message';
-  role: 'user' | 'assistant' | 'system';
-  content: ResponsesContentPart[];
-}
+export type ResponsesInputItem =
+  | {
+      type: 'message';
+      role: 'user' | 'assistant' | 'system';
+      content: ResponsesContentPart[];
+    }
+  | {
+      type: 'function_call';
+      call_id: string;
+      name: string;
+      arguments: string;
+    }
+  | {
+      type: 'function_call_output';
+      call_id: string;
+      output: string;
+    };
 
 /**
  * Content part for a `/v1/responses` input message. `input_text` and
  * `input_image` cover user input (text + vision); `output_text` is the
- * assistant's emitted text (for conversational history); `tool_call_output`
- * carries a tool result back to the model.
+ * assistant's emitted text (for conversational history).
+ *
+ * `tool_call_output` is intentionally NOT a content part — it is a
+ * top-level input item (`function_call_output`). The v0.6.0 release
+ * incorrectly placed it inside `message.content[]`, which the server
+ * rejected with `unknown content type: tool_call_output`.
  */
 export type ResponsesContentPart =
   | { type: 'input_text'; text: string }
   | { type: 'input_image'; image_url: string }
-  | { type: 'output_text'; text: string }
-  | { type: 'tool_call_output'; call_id: string; output: string };
+  | { type: 'output_text'; text: string };
 
 /**
  * Full `/v1/responses` request body. `stream: true` is required for
