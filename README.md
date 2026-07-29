@@ -19,6 +19,7 @@ The extension is built for reliability and safety: API keys live in OS-backed se
 
 - **Native Copilot Chat integration** — Ollama Cloud models appear in the Copilot Chat model picker as first-class VS Code language models.
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
+- **Context filtering (token savings)** — optional pre-processing that drops duplicate messages, empty content parts, and redundant tool definitions, and compacts the system prompt — reducing token cost without touching semantic content. Tool-call integrity is guaranteed; vision content is never filtered. Three levels (`off` / `safe` / `aggressive`), `off` by default. See [Context filtering](#context-filtering).
 - **`/v1/responses` primary endpoint** — cloud connections use the OpenAI Responses API by default, with structured streaming and reasoning shown as a collapsed thinking block in Copilot Chat (`LanguageModelThinkingPart`, VS Code 1.103+). `/chat/completions` is the automatic fallback on HTTP 404.
 - **Proxy-aware networking** — a native HTTP client bypasses VS Code's `global.fetch()` interception, fixing connect-timeout issues under `chat.agent.sandbox.enabled: "on"`. Respects the `http.proxy` VS Code setting.
 - **Tool calling** — fully supported via `/v1/responses` with top-level `function_call` / `function_call_output` input items (OpenAI Responses API spec). Handled natively by VS Code, with no shell execution from the extension.
@@ -141,12 +142,13 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (safety cap). Never reset. No retry. |
 | `ollamaCloud.requestTimeoutMs` | `120000` | **Deprecated** — use `requestMaxDurationMs`. Alias for backward compat. |
 | `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx, connect timeout). |
-| `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. |
+| `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. Each connection can override the global `ollamaCloud.contextFilter.level` via a per-connection `contextFilter.level` (`off`/`safe`/`aggressive` override; `auto` inherits). |
 | `ollamaCloud.visionModels` | `[]` | Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection `visionModels` override this list. |
 | `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback. Opt-in. |
 | `ollamaCloud.visionFallback.model` | `""` | Vision-capable model id for fallback. If empty, auto-searches the primary connection's catalog for the first vision-capable model. |
 | `ollamaCloud.visionFallback.connection` | `""` | Connection id for the vision model. If empty, uses the primary connection. |
 | `ollamaCloud.preferredEndpoint` | `"responses"` | Primary API endpoint for cloud/remote connections. `"responses"` uses `/v1/responses` (structured reasoning, typed events, first-class tool calling); `"chat"` uses `/chat/completions` (classic OpenAI-compatible). The other endpoint is the automatic fallback on HTTP 404. Local Ollama always uses `/chat/completions` regardless. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this. |
+| `ollamaCloud.contextFilter.level` | `"off"` | Context filtering level (ADR 0007): `off` (no filtering), `safe` (structural cleanup — duplicate messages, empty parts, redundant tools, system-prompt whitespace), `aggressive` (safe + context-window truncation + similar-message merging + metadata stripping). See [Context filtering](#context-filtering). Per-connection `contextFilter.level` overrides this global (`auto` inherits). |
 
 All settings are `scope: "application"` — workspace folders cannot override them.
 
@@ -181,6 +183,69 @@ Since v0.6.0, cloud connections use the OpenAI `/v1/responses` API as the primar
 - **First-class tool calling** — tool calls and results are top-level `function_call` / `function_call_output` input items, matching the OpenAI Responses API spec.
 
 Local Ollama connections always use `/chat/completions` (local Ollama does not implement `/v1/responses`). Cloud connections with `preferredEndpoint: 'chat'` also use `/chat/completions` directly. The capability cache memoizes 404 responses per connection, so the fallback to `/chat/completions` happens instantly after the first 404.
+
+## Context filtering
+
+Long chat sessions and tool-heavy workflows re-send the same trailing context every turn, advertise duplicate tool definitions, and accumulate whitespace the model bills for but ignores. Context filtering is an optional pre-processing step that removes this structural redundancy from the payload **before** it reaches the convert step — lowering token cost while preserving the semantic content of the request and the quality of the response. It removes redundancy only (duplicates, empty parts, whitespace, ignorable metadata); it never removes meaning. Both `/v1/responses` and `/chat/completions` benefit, because the filter runs at the shared provider entry point before the endpoint-specific convert. See [ADR 0007](docs/adr/0007-context-filtering.md) for the full specification.
+
+### Levels
+
+| Level | What it does | When to use |
+|---|---|---|
+| `off` (default) | No filtering. Payload sent as-is. Zero overhead. | When you want full fidelity or low traffic. |
+| `safe` | Drops duplicate messages (same `role` + identical `content`), empty content parts, and redundant tool definitions (same `function.name`); trims text whitespace; compacts system-prompt whitespace. No message removal, no truncation. | Recommended for most users — pure cleanup, no information loss. |
+| `aggressive` | `safe` plus context-window truncation (preserves the system prompt and the last user message), merges similar adjacent messages (same `role`, Jaccard similarity ≥ 0.8), and strips non-essential metadata (`name`, empty `refusal`, unknown keys — never `role`/`content`/`tool_calls`/`tool_call_id`). | Long sessions hitting the model's context limit. |
+
+Estimated token savings (not guarantees; actual savings depend on payload redundancy): `safe` 5–15%, `aggressive` 20–40%. Each request logs its own before/after, so you can verify the saving.
+
+### Quality guarantees
+
+- **Tool-call integrity is binding.** When the filter drops or merges a message carrying a `tool_call`, it always drops the matching `tool_call_output` (and vice versa). A dropped call never leaves an orphaned result; a dropped result never leaves a call with no reply. Multi-turn tool use stays coherent at every level.
+- **Vision content is never filtered.** `input_image` parts pass through untouched at every level — silently dropping an image you attached is worse than the token cost.
+- **The system prompt and the last user message are always preserved** at `aggressive` truncation. Trimming drops from the front only, after the system prompt.
+- **No semantic content is removed** — only structural redundancy: duplicate messages, empty parts, redundant tool definitions, whitespace, and metadata fields the model ignores.
+
+### Configuration
+
+Global setting (see the [Configuration](#configuration) table):
+
+```json
+{
+  "ollamaCloud.contextFilter.level": "safe"
+}
+```
+
+Override per connection in `ollamaCloud.connections`. The value `auto` (default) inherits the global setting; `off` / `safe` / `aggressive` override it for that one connection — mirroring the `preferredEndpoint` override/inherit pattern:
+
+```json
+{
+  "ollamaCloud.contextFilter.level": "safe",
+  "ollamaCloud.connections": [
+    {
+      "id": "cloud",
+      "label": "Cloud",
+      "type": "cloud",
+      "enabled": true,
+      "baseUrl": "https://ollama.com",
+      "openaiCompatiblePath": "/v1",
+      "requiresApiKey": true,
+      "contextFilter": {
+        "level": "aggressive"
+      }
+    }
+  ]
+}
+```
+
+### Observability
+
+Each filtered request (at `safe` and `aggressive`; nothing is logged at `off`) writes one line to the extension Output channel (`Ollama Cloud: Show Logs`):
+
+```
+Context filter: level=safe before=12345chars after=10500chars saved=15% (3 messages dropped, 0 tools dropped, 0 merged, 0 truncated)
+```
+
+`before`/`after` are char-based estimates (the extension has no tokenizer dependency); `saved` is the percentage reduction. The parenthetical field order is `messages dropped, tools dropped, merged, truncated`. Additional one-line diagnostics list each class of action (`dropped N duplicate messages`, `merged N similar pairs`, `truncated N oldest messages`, `dropped N duplicate tools`, `stripped metadata from N fields`), emitted only when that count is non-zero. Orphaned tool outputs (e.g. a tool result whose matching assistant call was dropped) are folded into `messages dropped` and reported under `dropped N duplicate messages`, not as a separate line.
 
 ## Vision Fallback
 
