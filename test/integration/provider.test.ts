@@ -1,7 +1,8 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import { OllamaCloudChatProvider } from '../../src/provider.js';
-import { clearCapabilityCache } from '../../src/capabilityCache.js';
+import { clearCapabilityCache, markResponsesUnavailable } from '../../src/capabilityCache.js';
+import { logger } from '../../src/logger.js';
 
 const BASE_URL = 'https://ollama.com/v1';
 
@@ -367,12 +368,9 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     // The fallback fired: fetch was called exactly once, targeting
     // the vision model (gemma3:12b), not the primary. The user sees
     // the vision model's streamed text, not the throw.
-    console.log('DEBUG fetchCalls=', JSON.stringify(fetchCalls.map(c => ({url: c.url, bodyKeys: c.body ? Object.keys(c.body) : null}))), 'parts=', progress.parts.length);
     assert.equal(fetchCalls.length, 1, 'fallback issued a single vision call');
     const body = fetchCalls[0].body as { model: string };
     assert.equal(body.model, 'gemma3:12b', 'request targeted the vision model');
-    // DEBUG: surface the URL + body shape to diagnose zero parts.
-    console.log('DEBUG url=', fetchCalls[0].url, 'body keys=', Object.keys(body), 'parts=', progress.parts.length);
     assert.equal(progress.parts.length, 1, 'one text delta reported');
     assert.equal(
       (progress.parts[0] as vscode.LanguageModelTextPart).value,
@@ -958,6 +956,518 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
     assert.equal(
       (progress.parts[0] as vscode.LanguageModelTextPart).value,
       'vision chat answer',
+    );
+  });
+});
+
+/**
+ * Issue #40 — endpoint fallback policy. When the user EXPLICITLY chose
+ * the primary endpoint (per-connection `'responses'`/`'chat'`, OR a
+ * global `preferredEndpoint` the user actually configured rather than
+ * the default), a 404 from that endpoint does NOT silently fall back.
+ * The provider throws an actionable `LanguageModelError` with a hint.
+ * When the effective choice is `'auto'` (default or inherited from a
+ * default global), the prior fallback + log-warning behaviour holds.
+ * Local Ollama is unaffected — always `/chat/completions`, no fallback.
+ *
+ * Coverage:
+ *   (a) explicit responses + 404 → error with hint, no fallback
+ *   (b) explicit chat + 404 → error, no fallback
+ *   (c) auto + 404 → fallback + log
+ *   (d) local → unaffected (always /chat/completions)
+ */
+describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () => {
+  let originalFetch: typeof fetch;
+  let fetchCalls: Array<{ url: string; status: number }>;
+  let logged: string[];
+  let originalInfo: typeof logger.info;
+  const LOCAL_URL = 'http://localhost:11434';
+
+  beforeEach(() => {
+    // The capability cache is process-global; a prior suite's 404 may
+    // have marked the connection's endpoint unavailable. Clear it so
+    // each test's 404 decision is driven by a live round-trip, not a
+    // memoized state from another suite.
+    clearCapabilityCache();
+    fetchCalls = [];
+    logged = [];
+    originalFetch = global.fetch;
+    // Capture logger.info output so the auto-mode fallback log line
+    // can be asserted. Mirror the visionFallback.test.ts pattern.
+    originalInfo = logger.info.bind(logger);
+    logger.info = (message: string, ...details: unknown[]): void => {
+      logged.push(`${message} ${details.map((d) => JSON.stringify(d)).join(' ')}`);
+    };
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    logger.info = originalInfo;
+    // Reset config + inspection metadata so no test leaks explicitness
+    // state into the next suite (the stub's config + inspection maps
+    // are shared globals across tests).
+    setConfig({});
+    vscode.workspace
+      .getConfiguration('ollamaCloud')
+      ._setInspection('preferredEndpoint', null);
+  });
+
+  /**
+   * Fetch stub that returns 404 for `path` and a success SSE stream
+   * otherwise. Used to confirm the provider does NOT fall back to the
+   * other endpoint in explicit mode.
+   */
+  function fetch404On(path: '/responses' | '/chat/completions'): typeof fetch {
+    return (async (input: string | URL, _init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const status = url.endsWith(path) ? 404 : 200;
+      fetchCalls.push({ url, status });
+      if (status === 404) {
+        return new Response(JSON.stringify({ error: { message: 'not found' } }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+  }
+
+  it('(a) explicit responses + 404 → throws LanguageModelError with hint, no fallback', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Per-connection 'responses' is ALWAYS explicit (task spec point 1).
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'responses' },
+      ],
+    });
+    global.fetch = fetch404On('/responses');
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      (err: unknown) => {
+        // Surfaced as a LanguageModelError with NotFound code + the
+        // actionable hint message naming the endpoint, connection, and
+        // the two remediation paths.
+        assert.ok(err instanceof vscode.LanguageModelError, 'throws LanguageModelError');
+        assert.equal((err as vscode.LanguageModelError).code, 'NotFound');
+        const msg = (err as Error).message;
+        assert.match(msg, /Endpoint \/v1\/responses returned 404 for connection "cloud"/);
+        assert.match(msg, /You have explicitly chosen this endpoint/);
+        assert.match(msg, /Set "ollamaCloud.preferredEndpoint" to "auto"/);
+        assert.match(msg, /switch to "chat"/);
+        return true;
+      },
+    );
+
+    // Exactly ONE fetch — the explicit /v1/responses attempt. The
+    // provider must NOT fall back to /chat/completions.
+    assert.equal(fetchCalls.length, 1, 'no fallback fetch in explicit responses mode');
+    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+    assert.equal(fetchCalls[0].status, 404);
+    // No progress surfaced — the request failed before streaming.
+    assert.equal(progress.parts.length, 0, 'no parts reported on 404 error');
+    // The explicit-mode decision path was logged.
+    assert.ok(
+      logged.some((line) => line.includes('Endpoint selected') && line.includes('explicit=true')),
+      'logged endpoint selection with explicit=true',
+    );
+    assert.ok(
+      logged.some((line) => line.includes('Explicit /v1/responses 404')),
+      'logged explicit 404 decision (no fallback)',
+    );
+  });
+
+  it('(b) explicit chat + 404 → throws LanguageModelError with hint, no fallback', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Per-connection 'chat' is ALWAYS explicit (task spec point 1).
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+    global.fetch = fetch404On('/chat/completions');
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof vscode.LanguageModelError, 'throws LanguageModelError');
+        assert.equal((err as vscode.LanguageModelError).code, 'NotFound');
+        const msg = (err as Error).message;
+        assert.match(msg, /Endpoint \/chat\/completions returned 404 for connection "cloud"/);
+        assert.match(msg, /You have explicitly chosen this endpoint/);
+        assert.match(msg, /Set "ollamaCloud.preferredEndpoint" to "auto"/);
+        assert.match(msg, /switch to "responses"/);
+        return true;
+      },
+    );
+
+    // Exactly ONE fetch — the explicit /chat/completions attempt. No
+    // fallback to /v1/responses.
+    assert.equal(fetchCalls.length, 1, 'no fallback fetch in explicit chat mode');
+    assert.ok(fetchCalls[0].url.endsWith('/chat/completions'));
+    assert.equal(fetchCalls[0].status, 404);
+    assert.equal(progress.parts.length, 0, 'no parts reported on 404 error');
+    assert.ok(
+      logged.some((line) => line.includes('Endpoint selected') && line.includes('explicit=true')),
+      'logged endpoint selection with explicit=true',
+    );
+    assert.ok(
+      logged.some((line) => line.includes('Explicit /chat/completions 404')),
+      'logged explicit 404 decision (no fallback)',
+    );
+  });
+
+  it('(c) auto + 404 → falls back to chat and logs the auto-mode decision', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Per-connection 'auto' with NO explicitly-configured global
+    // preferredEndpoint → inherits the default → auto mode. The stub's
+    // inspect() returns undefined for keys without inspection metadata,
+    // so globalPreferredExplicit is false and isPreferredEndpointExplicit
+    // is false.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    // No _setInspection call → inspect('preferredEndpoint') returns undefined.
+
+    let callCount = 0;
+    global.fetch = (async (input: string | URL, _init?: RequestInit) => {
+      callCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      // First call — /v1/responses → 404 (auto default is 'responses').
+      // Second call — /chat/completions → success stream.
+      const status = callCount === 1 ? 404 : 200;
+      fetchCalls.push({ url, status });
+      if (status === 404) {
+        return new Response(JSON.stringify({ error: { message: 'not found' } }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"chat answer"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('hi')],
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // Two fetches: /v1/responses (404) then /chat/completions (200) —
+    // the prior fallback behaviour is preserved in auto mode.
+    assert.equal(callCount, 2, 'auto mode issued a fallback chat fetch');
+    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+    assert.equal(fetchCalls[0].status, 404);
+    assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
+    assert.equal(fetchCalls[1].status, 200);
+    // The chat text delta surfaced — fallback succeeded.
+    assert.equal(progress.parts.length, 1, 'one text delta reported');
+    assert.equal(
+      (progress.parts[0] as vscode.LanguageModelTextPart).value,
+      'chat answer',
+    );
+    // Auto mode is non-explicit.
+    assert.ok(
+      logged.some((line) => line.includes('Endpoint selected') && line.includes('explicit=false')),
+      'logged endpoint selection with explicit=false',
+    );
+    // The auto-mode fallback decision was logged (task spec point 5).
+    assert.ok(
+      logged.some((line) => line.includes('Auto-mode fallback')),
+      'logged the auto-mode fallback decision',
+    );
+  });
+
+  it('(c2) auto inherits an EXPLICITLY-configured global → treated as explicit, no fallback on 404', async () => {
+    // Task spec point 1: per-connection 'auto' inherits the global
+    // explicitness. When the user explicitly set the global
+    // preferredEndpoint (detected via inspect() globalValue), the
+    // inherited choice is explicit — 404 surfaces an error, no fallback.
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+      // The global value the user explicitly configured.
+      preferredEndpoint: 'responses',
+    });
+    vscode.workspace
+      .getConfiguration('ollamaCloud')
+      ._setInspection('preferredEndpoint', {
+        key: 'ollamaCloud.preferredEndpoint',
+        defaultValue: 'responses',
+        globalValue: 'responses',
+      });
+
+    global.fetch = fetch404On('/responses');
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof vscode.LanguageModelError, 'inherits-explicit throws LanguageModelError');
+        assert.equal((err as vscode.LanguageModelError).code, 'NotFound');
+        assert.match(
+          (err as Error).message,
+          /Endpoint \/v1\/responses returned 404 for connection "cloud"/,
+        );
+        return true;
+      },
+    );
+
+    // Exactly ONE fetch — inherited-explicit does NOT fall back.
+    assert.equal(fetchCalls.length, 1, 'no fallback when auto inherits explicit global');
+    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+  });
+
+  it('(d) local connection → always /chat/completions, no fallback, no error', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Local Ollama does not implement /v1/responses. The provider
+    // routes directly to /chat/completions regardless of the
+    // preferredEndpoint setting (task spec point 4).
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [LOCAL_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'home', type: 'local', baseUrl: LOCAL_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+
+    let callCount = 0;
+    let modelsFetched = false;
+    let chatUrl = '';
+    global.fetch = (async (input: string | URL, _init?: RequestInit) => {
+      callCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      // Catalog sync — return one local model so the catalog builds a
+      // local model entry with connectionId 'home' and id
+      // 'ollama-cloud/home/gpt-oss:120b'. The local connection uses the
+      // default openaiCompatiblePath (''), so openAiBaseUrl resolves to
+      // 'http://localhost:11434' and the catalog fetch hits
+      // http://localhost:11434/models — NOT /v1/models. Match /models
+      // (covers /v1/models too) so the OpenAI catalog path resolves the
+      // model on the first fetch and callCount stays at 2 (catalog +
+      // chat). /api/tags serves Ollama's native { models: [...] } shape
+      // (parsed by fetchModelIdsFromTagsCatalog) in case that path is
+      // exercised; the prior stub returned { data: [...] } there, which
+      // the tags parser cannot read.
+      if (url.endsWith('/models')) {
+        modelsFetched = true;
+        return new Response(
+          JSON.stringify({ data: [{ id: 'gpt-oss:120b' }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.endsWith('/api/tags')) {
+        modelsFetched = true;
+        return new Response(
+          JSON.stringify({ models: [{ model: 'gpt-oss:120b' }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      // Chat stream — the ONLY endpoint a local request may hit.
+      chatUrl = url;
+      fetchCalls.push({ url, status: 200 });
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"local answer"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    // Sync the catalog so 'ollama-cloud/home/gpt-oss:120b' resolves to
+    // the local connection. Without this, the model is unknown and the
+    // provider throws before reaching the endpoint logic.
+    await provider.syncModelCatalog(true);
+    assert.ok(modelsFetched, 'catalog synced from the local connection');
+
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('home/gpt-oss:120b'),
+      [userMsg('hi')],
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // Exactly ONE chat fetch — local never attempts /v1/responses and
+    // never falls back (it only has one path).
+    assert.equal(callCount, 2, 'catalog sync + single chat fetch');
+    assert.ok(
+      chatUrl.includes('/chat/completions'),
+      `expected /chat/completions URL, got ${chatUrl}`,
+    );
+    assert.ok(
+      !chatUrl.includes('/responses'),
+      'local must NOT attempt /v1/responses',
+    );
+    assert.equal(progress.parts.length, 1, 'one text delta reported');
+    assert.equal(
+      (progress.parts[0] as vscode.LanguageModelTextPart).value,
+      'local answer',
+    );
+    // Local is never treated as explicit (task spec point 4: unaffected).
+    assert.ok(
+      logged.some((line) => line.includes('isLocal=true')),
+      'logged local connection flag',
+    );
+  });
+
+  /**
+   * Issue #40 follow-up — cache-guard path. When the user explicitly
+   * chose `responses` AND the capability cache already memoized that
+   * endpoint as unavailable for the connection, the explicit-mode
+   * error must fire from the cache short-circuit (ZERO live fetches),
+   * not from a fresh 404 round-trip. This case isolates the guard at
+   * `src/provider.ts` (the `isResponsesKnownUnavailable` branch) from
+   * the live-404 path covered by case (a). The fetch stub returns 200
+   * on both endpoints so any live fetch would silently succeed —
+   * proving the error originates from the cache, not the network.
+   */
+  it('(e) explicit responses + cached-unavailable → throws with hint, no fetch round-trip', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'responses' },
+      ],
+    });
+    // Populate the capability cache for the cloud connection WITHOUT a
+    // live round-trip — directly mark /v1/responses unavailable. The
+    // `beforeEach` already cleared the cache, so this is the sole
+    // source of the memoized state.
+    markResponsesUnavailable('cloud');
+
+    let callCount = 0;
+    global.fetch = (async (input: string | URL, _init?: RequestInit) => {
+      callCount += 1;
+      const url = typeof input === 'string' ? input : input.toString();
+      fetchCalls.push({ url, status: 200 });
+      // Both endpoints return a success stream — if the provider
+      // reached the network at all, the request would NOT 404. Any
+      // fetch here means the cache guard was bypassed.
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof vscode.LanguageModelError, 'cache-guard throws LanguageModelError');
+        assert.equal((err as vscode.LanguageModelError).code, 'NotFound');
+        const msg = (err as Error).message;
+        assert.match(msg, /Endpoint \/v1\/responses returned 404 for connection "cloud"/);
+        assert.match(msg, /You have explicitly chosen this endpoint/);
+        return true;
+      },
+    );
+
+    // The cache short-circuited before any live fetch — ZERO
+    // round-trips. This is the defining assertion of the cache-guard
+    // path (vs. case (a), which issues exactly one live 404 fetch).
+    assert.equal(callCount, 0, 'cache-guard short-circuited with no fetch round-trip');
+    assert.equal(fetchCalls.length, 0, 'no fetch calls recorded');
+    assert.equal(progress.parts.length, 0, 'no parts reported on cache-guard error');
+    // The cache-guard decision was logged, distinct from the live-404
+    // log line asserted in case (a).
+    assert.ok(
+      logged.some((line) => line.includes('Explicit /v1/responses cached-unavailable')),
+      'logged the cache-guard decision (no live 404)',
     );
   });
 });

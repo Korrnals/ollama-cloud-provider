@@ -84,6 +84,14 @@ class SecretStorage {
 
 class WorkspaceConfiguration {
   #store = {};
+  // Inspection metadata for individual keys — set via `_setInspection`.
+  // Mirrors the real `inspect()` return shape: `{ key, defaultValue,
+  // globalValue, workspaceValue, workspaceFolderValue, ... }`. Tests
+  // use this to simulate "user explicitly configured the setting"
+  // (globalValue/workspaceValue set) vs. "only the default applies"
+  // (only defaultValue set). `inspect()` returns `undefined` for keys
+  // without metadata, matching the prior behaviour.
+  #inspection = {};
 
   get(section, defaultValue) {
     return section in this.#store ? this.#store[section] : defaultValue;
@@ -97,12 +105,24 @@ class WorkspaceConfiguration {
     this.#store[section] = value;
   }
 
-  inspect() {
-    return undefined;
+  inspect(section) {
+    return this.#inspection[section];
   }
 
   _replace(store) {
     this.#store = { ...store };
+  }
+
+  /**
+   * Test-only: set the `inspect()` metadata for a key. Pass `null` to
+   * clear. Shape mirrors `vscode.WorkspaceConfiguration.inspect`.
+   */
+  _setInspection(section, value) {
+    if (value === null || value === undefined) {
+      delete this.#inspection[section];
+    } else {
+      this.#inspection[section] = { ...value };
+    }
   }
 }
 
@@ -247,6 +267,32 @@ export const lm = {
 export const ThemeIcon = {
   File: 'file',
 };
+
+/**
+ * Minimal `vscode.LanguageModelError` stub. The real class exposes
+ * static factories (`NoPermissions`, `Blocked`, `NotFound`) that
+ * return a `LanguageModelError` with a `code` property. Tests assert
+ * on the message + code; the factories below mirror that surface.
+ */
+export class LanguageModelError extends Error {
+  constructor(message, code) {
+    super(message);
+    this.name = 'LanguageModelError';
+    this.code = code ?? 'Unknown';
+  }
+
+  static NoPermissions(message) {
+    return new LanguageModelError(message, 'NoPermissions');
+  }
+
+  static Blocked(message) {
+    return new LanguageModelError(message, 'Blocked');
+  }
+
+  static NotFound(message) {
+    return new LanguageModelError(message, 'NotFound');
+  }
+}
 
 export const ConfigurationTarget = {
   Global: 1,

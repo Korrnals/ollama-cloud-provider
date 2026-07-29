@@ -28,6 +28,7 @@ import {
   convertToolsToResponses,
 } from './convertResponses.js';
 import {
+  clearCapabilityCache,
   isChatKnownUnavailable,
   isResponsesKnownUnavailable,
   markChatAvailable,
@@ -43,6 +44,29 @@ import type { UsageInfo } from './protocolTypes.js';
 const AUTH_REQUIRED_DETAIL =
   'Run Ollama Cloud: Set API Key to configure access.';
 const PROVIDER_TOOLTIP = 'Ollama Cloud';
+
+/**
+ * Issue #40 — builds the explicit-mode 404 error thrown when the user
+ * explicitly chose `primaryEndpoint` and that endpoint returned 404.
+ * The message names the failing endpoint, the connection, and the two
+ * remediation paths (switch to `auto` for automatic fallback, or
+ * switch to the other explicit endpoint). Surfaced as a
+ * `LanguageModelError` so VS Code presents it consistently to the
+ * chat participant that invoked the model.
+ */
+function endpointExplicitUnavailableError(
+  primaryEndpoint: 'responses' | 'chat',
+  connectionId: string,
+): vscode.LanguageModelError {
+  if (primaryEndpoint === 'responses') {
+    return vscode.LanguageModelError.NotFound(
+      `Endpoint /v1/responses returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "chat".`,
+    );
+  }
+  return vscode.LanguageModelError.NotFound(
+    `Endpoint /chat/completions returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "responses".`,
+  );
+}
 
 type ModelPickerInformation = vscode.LanguageModelChatInformation & {
   isUserSelectable?: boolean;
@@ -97,6 +121,19 @@ export class OllamaCloudChatProvider
             void this.syncModelCatalog();
           }
           this.onDidChangeLanguageModelChatInformationEmitter.fire();
+        }
+        // Issue #40 — `preferredEndpoint` drives the explicit-vs-auto
+        // endpoint decision. The capability cache memoizes per-endpoint
+        // availability keyed by connection id; a stale entry from the
+        // previous setting would short-circuit the new choice (and in
+        // explicit mode now *throws* instead of silently routing). Clear
+        // the cache so the next request re-probes both endpoints live.
+        // Per-connection `preferredEndpoint` lives under
+        // `ollamaCloud.connections` and is already covered by the
+        // catalog-sync + emitter branch above; the global scalar key is
+        // the only one that needs an explicit cache clear here.
+        if (event.affectsConfiguration('ollamaCloud.preferredEndpoint')) {
+          clearCapabilityCache();
         }
       }),
       context.secrets.onDidChange((event) => {
@@ -336,6 +373,17 @@ export class OllamaCloudChatProvider
     // this: `'responses'`/`'chat'` are explicit; `'auto'` inherits the
     // global setting.
     //
+    // Issue #40 — fallback policy. When the user EXPLICITLY chose the
+    // primary endpoint (per-connection `'responses'`/`'chat'`, OR a
+    // global `preferredEndpoint` the user actually configured rather
+    // than the default), a 404 from that endpoint does NOT silently
+    // fall back. The provider throws a clear, actionable error so the
+    // user knows their explicit choice is unsupported by this
+    // connection and can switch endpoints or opt into `auto`. When the
+    // effective choice is `'auto'` (the default, or a per-connection
+    // `'auto'` inheriting a default global), the prior fallback +
+    // log-warning behaviour is preserved.
+    //
     // The OTHER endpoint is the automatic fallback on HTTP 404:
     //   primary=responses → fallback=chat (and vice versa).
     // Local Ollama always uses /chat/completions (no /v1/responses).
@@ -343,25 +391,81 @@ export class OllamaCloudChatProvider
     // The capability cache short-circuits the primary attempt once a
     // prior 404 has been memoized for the connection. No mid-stream
     // fallback — POST is non-idempotent and a retry would bill twice
-    // (ADR 0001/0005).
+    // (ADR 0001/0005). The cache is intentionally NOT bypassed for
+    // explicit mode: if an explicit endpoint is already known
+    // unavailable (memoized from a prior 404 in this session), the
+    // explicit-mode error must still fire — but it fires from the
+    // cache short-circuit path, not from a fresh 404 round-trip. See
+    // `endpointExplicitUnavailableError` below.
     const endpointConnection = connection ?? cloudConnection;
     const connectionPreferred = endpointConnection?.preferredEndpoint ?? 'auto';
     const isLocal = endpointConnection?.type === 'local';
     const connectionId = endpointConnection?.id ?? 'cloud';
 
-    // Resolve the effective primary endpoint:
-    // - local → always 'chat' (no /v1/responses support)
-    // - explicit per-connection override (responses/chat) → use it
-    // - 'auto' → inherit the global setting (default 'responses')
-    const globalPreferred = vscode.workspace
-      .getConfiguration('ollamaCloud')
-      .get<'responses' | 'chat'>('preferredEndpoint', 'responses');
+    // Resolve the effective primary endpoint AND whether the choice is
+    // explicit. Explicit = per-connection `'responses'`/`'chat'` (always
+    // an override) OR a global `preferredEndpoint` the user actually
+    // configured (detected via `inspect()` — `globalValue`/`workspaceValue`
+    // set, vs. only `defaultValue`). `'auto'` per-connection inherits
+    // the global explicitness.
+    const globalConfig = vscode.workspace.getConfiguration('ollamaCloud');
+    const globalInspection = globalConfig.inspect<'responses' | 'chat' | 'auto'>('preferredEndpoint');
+    const globalPreferredExplicit =
+      globalInspection?.globalValue !== undefined ||
+      globalInspection?.workspaceValue !== undefined ||
+      globalInspection?.workspaceFolderValue !== undefined;
+    const globalPreferred = globalConfig.get<'responses' | 'chat'>(
+      'preferredEndpoint',
+      'responses',
+    );
+    const isPreferredEndpointExplicit =
+      !isLocal &&
+      (connectionPreferred === 'responses' ||
+        connectionPreferred === 'chat' ||
+        (connectionPreferred === 'auto' && globalPreferredExplicit));
+
     const primaryEndpoint: 'responses' | 'chat' =
       isLocal
         ? 'chat'
         : connectionPreferred === 'auto'
           ? globalPreferred
           : connectionPreferred;
+
+    logger.info(
+      `Endpoint selected: primary=${primaryEndpoint}, explicit=${isPreferredEndpointExplicit}, connection="${connectionId}", isLocal=${isLocal}`,
+    );
+
+    // Issue #40 — capability-cache short-circuit guard for explicit
+    // mode. When the user explicitly chose `primaryEndpoint` AND the
+    // capability cache already memoized that endpoint as unavailable
+    // (a prior 404 in this session), the explicit-mode contract
+    // requires the actionable error — NOT a silent detour to the other
+    // endpoint. Without this guard, the cache would skip the primary
+    // `if` block and execution would fall through to the other
+    // endpoint, silently routing around the user's explicit choice.
+    // The cache itself is NOT bypassed (per task spec point 6); the
+    // guard reads it and translates "known unavailable + explicit"
+    // into the same error a live 404 would produce.
+    if (
+      isPreferredEndpointExplicit &&
+      primaryEndpoint === 'responses' &&
+      isResponsesKnownUnavailable(connectionId)
+    ) {
+      logger.info(
+        `Explicit /v1/responses cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+      );
+      throw endpointExplicitUnavailableError('responses', connectionId);
+    }
+    if (
+      isPreferredEndpointExplicit &&
+      primaryEndpoint === 'chat' &&
+      isChatKnownUnavailable(connectionId)
+    ) {
+      logger.info(
+        `Explicit /chat/completions cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+      );
+      throw endpointExplicitUnavailableError('chat', connectionId);
+    }
 
     if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
       try {
@@ -395,8 +499,17 @@ export class OllamaCloudChatProvider
       } catch (error) {
         if (error instanceof HttpError && error.status === 404) {
           markResponsesUnavailable(connectionId);
+          // Issue #40 — explicit choice: do NOT silently fall back.
+          // Surface an actionable error so the user knows their
+          // explicit endpoint is unsupported by this connection.
+          if (isPreferredEndpointExplicit) {
+            logger.info(
+              `Explicit /v1/responses 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+            );
+            throw endpointExplicitUnavailableError('responses', connectionId);
+          }
           logger.info(
-            `Falling back to /chat/completions (/v1/responses returned 404) for connection "${connectionId}"`,
+            `Auto-mode fallback: /v1/responses returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
           );
           // fall through to /chat/completions below
         } else {
@@ -432,8 +545,15 @@ export class OllamaCloudChatProvider
       } catch (error) {
         if (error instanceof HttpError && error.status === 404) {
           markChatUnavailable(connectionId);
+          // Issue #40 — explicit choice: do NOT silently fall back.
+          if (isPreferredEndpointExplicit) {
+            logger.info(
+              `Explicit /chat/completions 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+            );
+            throw endpointExplicitUnavailableError('chat', connectionId);
+          }
           logger.info(
-            `Falling back to /v1/responses (/chat/completions returned 404) for connection "${connectionId}"`,
+            `Auto-mode fallback: /chat/completions returned 404 for connection "${connectionId}" — retrying on /v1/responses`,
           );
           // fall through to /v1/responses below
         } else {
