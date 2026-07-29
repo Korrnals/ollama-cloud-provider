@@ -36,6 +36,13 @@ export type ConnectionType = 'cloud' | 'local' | 'remote' | 'custom';
 export type PreferredEndpoint = 'responses' | 'chat' | 'auto';
 
 /**
+ * ADR 0007 — per-connection context-filter override.
+ * - `'off'` / `'safe'` / `'aggressive'` override the global level.
+ * - `'auto'` (default) inherits the global `ollamaCloud.contextFilter.level`.
+ */
+export type ConnectionContextFilterLevel = 'off' | 'safe' | 'aggressive' | 'auto';
+
+/**
  * A normalized, validated connection configuration.
  *
  * `allowedBaseUrls` is the per-connection whitelist. It is ALWAYS
@@ -82,6 +89,14 @@ export interface ConnectionConfig {
    * no silent fallback).
    */
   readonly preferredEndpoint: PreferredEndpoint;
+  /**
+   * ADR 0007 — per-connection context-filter override. `'auto'`
+   * (default) inherits the global `ollamaCloud.contextFilter.level`;
+   * `'off'` / `'safe'` / `'aggressive'` override it for this
+   * connection. Mirrors the `preferredEndpoint` override/inherit
+   * pattern from ADR 0006.
+   */
+  readonly contextFilter: ConnectionContextFilterLevel;
 }
 
 /**
@@ -258,6 +273,9 @@ function synthesizeCloudConnection(
     // Cloud connection defaults to 'auto' — try /v1/responses first,
     // fall back to /chat/completions on 404 (ADR 0006).
     preferredEndpoint: 'auto',
+    // ADR 0007 — cloud connection defaults to 'auto' so the global
+    // `ollamaCloud.contextFilter.level` setting is the single switch.
+    contextFilter: 'auto',
   };
 }
 
@@ -348,6 +366,7 @@ function normalizeConnection(
     visionModels,
     requiresApiKey,
     preferredEndpoint: normalizePreferredEndpoint(record.preferredEndpoint, type),
+    contextFilter: normalizeContextFilterLevel(record.contextFilter),
   };
 }
 
@@ -467,6 +486,26 @@ function normalizePreferredEndpoint(
     return value;
   }
   return type === 'local' ? 'chat' : 'auto';
+}
+
+/**
+ * ADR 0007 — normalizes the per-connection `contextFilter` value.
+ * Accepts `'off'` / `'safe'` / `'aggressive'` / `'auto'`; any other
+ * value (including `undefined`) falls back to `'auto'` (inherit the
+ * global `ollamaCloud.contextFilter.level`).
+ */
+function normalizeContextFilterLevel(
+  value: unknown,
+): ConnectionContextFilterLevel {
+  if (
+    value === 'off' ||
+    value === 'safe' ||
+    value === 'aggressive' ||
+    value === 'auto'
+  ) {
+    return value;
+  }
+  return 'auto';
 }
 
 function normalizePath(value: string): string {

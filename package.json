@@ -204,6 +204,29 @@
               "requiresApiKey": {
                 "type": "boolean",
                 "description": "Whether an API key is required for this connection. Defaults to true for cloud/remote/custom, false for local."
+              },
+              "contextFilter": {
+                "type": "object",
+                "properties": {
+                  "level": {
+                    "type": "string",
+                    "enum": [
+                      "off",
+                      "safe",
+                      "aggressive",
+                      "auto"
+                    ],
+                    "enumDescriptions": [
+                      "Disable context filtering for this connection (overrides the global setting).",
+                      "Structural cleanup only — drop duplicate messages, empty content parts, redundant tool definitions; compact system-prompt whitespace.",
+                      "safe + context-window truncation, similar-message merging, and metadata stripping.",
+                      "Inherit the global `ollamaCloud.contextFilter.level` setting (default)."
+                    ],
+                    "default": "auto",
+                    "description": "Per-connection context-filter override. `auto` (default) inherits the global `ollamaCloud.contextFilter.level`; `off`/`safe`/`aggressive` override it for this connection. See ADR 0007."
+                  }
+                },
+                "description": "ADR 0007 — per-connection context-filter override."
               }
             },
             "required": [
@@ -254,6 +277,22 @@
           ],
           "default": "responses",
           "description": "Primary API endpoint for cloud and remote connections. The other endpoint is used as automatic fallback on HTTP 404. Local Ollama connections always use /chat/completions regardless of this setting. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this global setting.",
+          "scope": "application"
+        },
+        "ollamaCloud.contextFilter.level": {
+          "type": "string",
+          "enum": [
+            "off",
+            "safe",
+            "aggressive"
+          ],
+          "enumDescriptions": [
+            "No filtering. Payload sent as-is (default).",
+            "Structural cleanup only — drop duplicate messages, empty content parts, and redundant tool definitions; compact system-prompt whitespace. No message removal, no truncation.",
+            "safe + context-window truncation, similar-message merging, and metadata stripping. Can drop context the user wanted — see the per-request log line."
+          ],
+          "default": "off",
+          "description": "Context filtering level (ADR 0007). `off` (default) sends the payload as-is. `safe` removes duplicate messages, empty content parts, and redundant tool definitions, and compacts system-prompt whitespace. `aggressive` adds context-window truncation, similar-message merging, and metadata stripping. Per-connection `contextFilter.level` in `ollamaCloud.connections` overrides this global setting (`off`/`safe`/`aggressive` override; `auto` inherits).",
           "scope": "application"
         }
       }

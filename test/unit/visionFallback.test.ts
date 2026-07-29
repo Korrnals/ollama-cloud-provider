@@ -72,6 +72,7 @@ function makeConnection(
     visionModels: [],
     requiresApiKey: type !== 'local',
     preferredEndpoint: 'auto',
+    contextFilter: 'auto',
   };
 }
 

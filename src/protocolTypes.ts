@@ -36,6 +36,12 @@ export interface OpenAICompatibleMessage {
   tool_call_id?: string;
   tool_calls?: OpenAICompatibleToolCall[];
   reasoning_content?: string;
+  // ADR 0007 — recognised but non-essential metadata. `name` is the
+  // optional sender label; `refusal` is the assistant refusal text.
+  // Both survive `safe`; `aggressive` strips `name` always and
+  // `refusal` only when empty.
+  name?: string;
+  refusal?: string;
 }
 
 export interface UsageInfo {

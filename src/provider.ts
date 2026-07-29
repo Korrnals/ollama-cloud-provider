@@ -26,6 +26,8 @@ import { ResponsesClient } from './responsesClient.js';
 import {
   convertToResponsesInput,
   convertToolsToResponses,
+  convertOpenAIMessagesToResponsesInput,
+  convertOpenAIToolsToResponses,
 } from './convertResponses.js';
 import {
   clearCapabilityCache,
@@ -40,7 +42,8 @@ import { HttpError } from './retry.js';
 import { loadConnections, openAiBaseUrl } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
-import type { UsageInfo } from './protocolTypes.js';
+import type { OpenAICompatibleTool, UsageInfo } from './protocolTypes.js';
+import { filterContext, type ContextFilterLevel } from './contextFilter.js';
 
 const AUTH_REQUIRED_DETAIL =
   'Run Ollama Cloud: Set API Key to configure access.';
@@ -99,6 +102,37 @@ function endpointExplicitUnavailableError(
   return vscode.LanguageModelError.NotFound(
     `Endpoint /chat/completions returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "responses".`,
   );
+}
+
+/**
+ * ADR 0007 — resolves the `/v1/responses` `tools[]` array from the
+ * filter state. When the context filter ran (`filterReport !==
+ * undefined`, i.e. `safe`/`aggressive`), the filter produced a
+ * filtered `OpenAICompatibleTool[]` (`filteredTools`) — convert it
+ * directly to the `/v1/responses` tool schema via
+ * `convertOpenAIToolsToResponses` (no VS Code ↔ OpenAI round-trip,
+ * symmetric with `convertOpenAIMessagesToResponsesInput` for
+ * messages). When the filter did NOT run (`off` fast path,
+ * `filterReport === undefined`), convert the ORIGINAL VS Code
+ * `options.tools` via `convertToolsToResponses` — the 375-test
+ * regression path is untouched.
+ *
+ * `filteredTools` is the post-filter OpenAI-format tool list (the
+ * filter dedupes by `function.name` and may drop entries). At `off`,
+ * `filteredTools` holds the unfiltered `convertToolsToOpenAI` output —
+ * but we still take the `options.tools` branch because the
+ * `filterReport === undefined` signal means "use the original
+ * conversion path", keeping the off-path byte-identical to pre-#39.
+ */
+function resolveResponsesTools(
+  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
+  filteredTools: readonly OpenAICompatibleTool[] | undefined,
+  originalTools: readonly vscode.LanguageModelChatTool[] | undefined,
+): ReturnType<typeof convertOpenAIToolsToResponses> {
+  if (filterReport !== undefined) {
+    return convertOpenAIToolsToResponses(filteredTools);
+  }
+  return convertToolsToResponses(originalTools);
 }
 
 type ModelPickerInformation = vscode.LanguageModelChatInformation & {
@@ -428,28 +462,18 @@ export class OllamaCloudChatProvider
       modelOptions,
     );
     const openaiMessages = convertMessagesToOpenAI(messages);
-    const requestChars = countOpenAIRequestChars(openaiMessages);
 
-    // Issue #41 — Strand 3.1: convert-path redundancy audit. Verdict
-    // (verified 2026-07-29): NO redundancy in either converter.
-    //   - `convertMessagesToOpenAI`: system prompt lives in exactly
-    //     one `role:system` message; tool definitions go only in the
-    //     top-level `tools` array (via `convertToolsToOpenAI`), never
-    //     inlined into a message; instructions are not a `/chat/
-    //     completions` concept so there is no `instructions`+message
-    //     duplication vector.
-    //   - `convertToResponsesInput`: the FIRST system message is
-    //     hoisted to top-level `instructions`; subsequent system
-    //     messages are dropped (logged). Tool definitions go only in
-    //     the top-level `tools` array (via `convertToolsToResponses`).
-    // No content is sent twice. This log line makes future drift
-    // visible — if a refactor accidentally double-sends the system
-    // prompt or inlines tool definitions, the `requestChars` here will
-    // diverge from the expected baseline and the audit line will
-    // surface it. `logger.debug` is not in the interface, so `info`.
-    logger.info(
-      `convert audit: no redundancy, requestChars=${requestChars}, messages=${openaiMessages.length}`,
-    );
+    // ADR 0006 — endpoint selection deferred to the block below (it
+    // needs `endpointConnection` + `globalConfig`). ADR 0007 context
+    // filter is resolved in that same block so it can reuse
+    // `endpointConnection` + `globalConfig` without recomputing them.
+    // `requestChars` is computed AFTER the filter runs so it reflects
+    // the FILTERED payload (used for the convert audit line + the
+    // token estimator).
+    let filteredMessages = openaiMessages;
+    let filteredTools = convertToolsToOpenAI(options.tools);
+    let filterReport: ReturnType<typeof filterContext>['report'] | undefined;
+    let requestChars = 0;
 
     // ADR 0006 — endpoint selection. The user picks a primary endpoint
     // via `ollamaCloud.preferredEndpoint` (global setting, default
@@ -515,6 +539,105 @@ export class OllamaCloudChatProvider
           ? globalPreferred
           : connectionPreferred;
 
+    // ADR 0007 — resolve the effective context-filter level and run
+    // the filter (only at `safe`/`aggressive` — `off` is a fast path
+    // that skips `filterContext` entirely, preserving zero overhead
+    // when the filter is disabled). Per-connection `contextFilter.level`
+    // overrides the global; `'auto'`/`undefined` inherit the global
+    // (mirrors `preferredEndpoint`). The filter is pure + endpoint-
+    // agnostic: it runs once on the OpenAI-format `openaiMessages` and
+    // the filtered output feeds BOTH endpoints — `/chat/completions`
+    // via `filteredMessages` directly, `/v1/responses` via
+    // `convertOpenAIMessagesToResponsesInput` (shapes the filtered
+    // OpenAI messages into `/v1/responses` input without a VS Code ↔
+    // OpenAI round-trip). `requestChars` is computed AFTER the filter
+    // so it reflects the filtered payload (drives the convert audit
+    // line + the token estimator).
+    const connectionContextFilter = endpointConnection?.contextFilter ?? 'auto';
+    const globalContextFilter = globalConfig.get<'off' | 'safe' | 'aggressive'>(
+      'contextFilter.level',
+      'off',
+    );
+    const effectiveFilterLevel: ContextFilterLevel =
+      connectionContextFilter === 'auto'
+        ? globalContextFilter
+        : connectionContextFilter;
+    if (effectiveFilterLevel !== 'off') {
+      const filterResult = filterContext({
+        messages: openaiMessages,
+        tools: filteredTools,
+        level: effectiveFilterLevel,
+        maxInputTokens: model.maxInputTokens,
+      });
+      filteredMessages = filterResult.messages;
+      filteredTools = filterResult.tools;
+      filterReport = filterResult.report;
+    }
+    requestChars = countOpenAIRequestChars(filteredMessages);
+
+    // Issue #41 — Strand 3.1: convert-path redundancy audit. Verdict
+    // (verified 2026-07-29): NO redundancy in either converter.
+    //   - `convertMessagesToOpenAI`: system prompt lives in exactly
+    //     one `role:system` message; tool definitions go only in the
+    //     top-level `tools` array (via `convertToolsToOpenAI`), never
+    //     inlined into a message; instructions are not a `/chat/
+    //     completions` concept so there is no `instructions`+message
+    //     duplication vector.
+    //   - `convertToResponsesInput`: the FIRST system message is
+    //     hoisted to top-level `instructions`; subsequent system
+    //     messages are dropped (logged). Tool definitions go only in
+    //     the top-level `tools` array (via `convertToolsToResponses`).
+    // No content is sent twice. This log line makes future drift
+    // visible — if a refactor accidentally double-sends the system
+    // prompt or inlines tool definitions, the `requestChars` here will
+    // diverge from the expected baseline and the audit line will
+    // surface it. `logger.debug` is not in the interface, so `info`.
+    logger.info(
+      `convert audit: no redundancy, requestChars=${requestChars}, messages=${filteredMessages.length}`,
+    );
+
+    // ADR 0007 — context-filter log line. Emitted at `safe` /
+    // `aggressive` only (NOT `off` — no logging at `off` per ADR).
+    // The log carries char counts + drop counts ONLY — no message
+    // content (sensitive-data policy: the filter log is a telemetry
+    // line, not a content dump). Per-class diagnostics follow only
+    // when the count for that class is non-zero (no "dropped 0"
+    // noise), mirroring the Issue #41 convert-path diagnostic style.
+    if (filterReport !== undefined) {
+      const before = filterReport.beforeChars;
+      const after = filterReport.afterChars;
+      const saved =
+        before === 0 ? 0 : Math.round(((before - after) / before) * 100);
+      logger.info(
+        `Context filter: level=${filterReport.level} before=${before}chars after=${after}chars saved=${saved}% (${filterReport.droppedMessages} messages dropped, ${filterReport.droppedTools} tools dropped, ${filterReport.mergedMessages} merged, ${filterReport.truncatedMessages} truncated)`,
+      );
+      if (filterReport.droppedMessages > 0) {
+        logger.info(
+          `Context filter: dropped ${filterReport.droppedMessages} duplicate messages`,
+        );
+      }
+      if (filterReport.mergedMessages > 0) {
+        logger.info(
+          `Context filter: merged ${filterReport.mergedMessages} similar pairs`,
+        );
+      }
+      if (filterReport.truncatedMessages > 0) {
+        logger.info(
+          `Context filter: truncated ${filterReport.truncatedMessages} oldest messages`,
+        );
+      }
+      if (filterReport.droppedTools > 0) {
+        logger.info(
+          `Context filter: dropped ${filterReport.droppedTools} duplicate tools`,
+        );
+      }
+      if (filterReport.strippedMetadataFields > 0) {
+        logger.info(
+          `Context filter: stripped metadata from ${filterReport.strippedMetadataFields} fields`,
+        );
+      }
+    }
+
     logger.info(
       `Endpoint selected: primary=${primaryEndpoint}, explicit=${isPreferredEndpointExplicit}, connection="${connectionId}", isLocal=${isLocal}, apiModel="${model.apiModel ?? model.id}", requestChars=${requestChars}`,
     );
@@ -558,8 +681,20 @@ export class OllamaCloudChatProvider
           apiKey ?? '',
           connection,
         );
-        const { input, instructions } = convertToResponsesInput(messages);
-        const responsesTools = convertToolsToResponses(options.tools);
+        // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
+        // When the filter ran (`filterReport !== undefined`), shape
+        // the filtered `OpenAICompatibleMessage[]` directly into
+        // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
+        // (no VS Code ↔ OpenAI round-trip — keeps the filter
+        // endpoint-agnostic and avoids lossy re-conversion). When the
+        // filter did NOT run (`off` fast path), use the original
+        // `convertToResponsesInput` on the VS Code `messages` (the
+        // 375-test regression path is untouched).
+        const { input, instructions } =
+          filterReport !== undefined
+            ? convertOpenAIMessagesToResponsesInput(filteredMessages)
+            : convertToResponsesInput(messages);
+        const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
         await this.runStream(
           (callbacks) =>
             responsesClient.streamResponses(
@@ -612,8 +747,13 @@ export class OllamaCloudChatProvider
             client.streamChat(
               {
                 model: model.apiModel,
-                messages: openaiMessages,
-                tools: convertToolsToOpenAI(options.tools),
+                // ADR 0007 — `/chat/completions` consumes the
+                // FILTERED payload (`filteredMessages` +
+                // `filteredTools`). At `off` these are the unfiltered
+                // originals, so the 375-test regression path is
+                // untouched.
+                messages: filteredMessages,
+                tools: filteredTools,
                 tool_choice: resolveToolChoice(options.toolMode, options.tools),
                 extraBody: requestConfiguration.openaiBody,
               },
@@ -661,8 +801,13 @@ export class OllamaCloudChatProvider
           apiKey ?? '',
           connection,
         );
-        const { input, instructions } = convertToResponsesInput(messages);
-        const responsesTools = convertToolsToResponses(options.tools);
+        // ADR 0007 — same filtered-payload routing as the primary
+        // /v1/responses path above.
+        const { input, instructions } =
+          filterReport !== undefined
+            ? convertOpenAIMessagesToResponsesInput(filteredMessages)
+            : convertToResponsesInput(messages);
+        const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
         await this.runStream(
           (callbacks) =>
             responsesClient.streamResponses(
@@ -701,8 +846,11 @@ export class OllamaCloudChatProvider
         client.streamChat(
           {
             model: model.apiModel,
-            messages: openaiMessages,
-            tools: convertToolsToOpenAI(options.tools),
+            // ADR 0007 — `/chat/completions` consumes the FILTERED
+            // payload (`filteredMessages` + `filteredTools`). At `off`
+            // these are the unfiltered originals.
+            messages: filteredMessages,
+            tools: filteredTools,
             tool_choice: resolveToolChoice(options.toolMode, options.tools),
             extraBody: requestConfiguration.openaiBody,
           },

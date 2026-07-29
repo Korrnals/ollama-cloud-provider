@@ -11,6 +11,7 @@
 // cache + `preferredEndpoint`); this module only shapes the request.
 import * as vscode from 'vscode';
 import type {
+  OpenAICompatibleTool,
   ResponsesContentPart,
   ResponsesInputItem,
   ResponsesTool,
@@ -195,9 +196,222 @@ export function convertToolsToResponses(
   }));
 }
 
+/**
+ * ADR 0007 — context-filter-aware tool conversion for `/v1/responses`.
+ *
+ * Mirrors `convertToolsToResponses` but reads the OpenAI-compatible
+ * tool shape (`OpenAICompatibleTool`, the `/chat/completions` form
+ * with `function.{name,description,parameters}` nesting) instead of
+ * VS Code's `LanguageModelChatTool[]`. Used when the context filter
+ * ran at `safe`/`aggressive` and produced a filtered
+ * `OpenAICompatibleTool[]` (e.g. with duplicate `function.name`
+ * entries removed). Keeps the `/v1/responses` path on the FILTERED
+ * payload without a VS Code ↔ OpenAI round-trip, symmetric with
+ * `convertOpenAIMessagesToResponsesInput` for messages.
+ *
+ * Returns `undefined` when the tool list is empty so the request body
+ * omits the `tools` field entirely (same contract as
+ * `convertToolsToResponses`).
+ */
+export function convertOpenAIToolsToResponses(
+  tools: readonly OpenAICompatibleTool[] | undefined,
+): ResponsesTool[] | undefined {
+  if (!tools || tools.length === 0) {
+    return undefined;
+  }
+
+  return tools.map((tool) => ({
+    type: 'function',
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters ?? {},
+  }));
+}
+
 // Re-exported so callers can import the vision gate helper from this
 // module alongside the converters.
 export { hasImageParts };
+
+// ---------------------------------------------------------------------------
+// ADR 0007 — context-filter-aware `/v1/responses` conversion.
+//
+// `convertToResponsesInput` (above) consumes VS Code
+// `LanguageModelChatRequestMessage[]` directly — the original source of
+// the request. When the context filter (ADR 0007) runs at `safe` or
+// `aggressive`, the filter operates on `OpenAICompatibleMessage[]`
+// (the `/chat/completions` shape) and produces a filtered array. The
+// `/v1/responses` path needs the FILTERED payload too, but converting
+// the filtered OpenAI messages back to VS Code messages (then back to
+// `/v1/responses`) would be a lossy round-trip. Instead, this helper
+// shapes the filtered `OpenAICompatibleMessage[]` directly into the
+// `/v1/responses` `input[]` + `instructions` form — the same shape
+// `convertToResponsesInput` produces, but reading OpenAI-format
+// messages instead of VS Code messages.
+//
+// The mapping mirrors `convertToResponsesInput`:
+//   - First `role:system` message → top-level `instructions`.
+//   - Subsequent `role:system` messages → dropped (logged, same as
+//     `convertToResponsesInput`).
+//   - User/assistant messages with text → `{ type:'message', role,
+//     content[] }` with `input_text` (user) or `output_text`
+//     (assistant) parts.
+//   - `image_url` parts (vision) → `input_image` parts carrying the
+//     data URL. Vision content is never filtered (ADR § Non-goals), so
+//     it passes through this helper unchanged.
+//   - Assistant `tool_calls` → top-level `function_call` items.
+//   - `role:tool` messages (tool results) → top-level
+//     `function_call_output` items.
+//
+// Pure + stateless — same contract as `convertToResponsesInput`.
+// ---------------------------------------------------------------------------
+
+import type {
+  OpenAICompatibleMessage,
+  OpenAIContentPart,
+} from './protocolTypes.js';
+
+/**
+ * Converts filtered `OpenAICompatibleMessage[]` (the output of
+ * `filterContext`) into the `/v1/responses` `input[]` + `instructions`
+ * shape. Used by the provider when the context filter ran at
+ * `safe`/`aggressive` AND the selected endpoint is `/v1/responses` —
+ * so the filtered payload reaches both endpoints without a VS Code ↔
+ * OpenAI round-trip. See ADR 0007 § Provider integration point.
+ */
+export function convertOpenAIMessagesToResponsesInput(
+  messages: readonly OpenAICompatibleMessage[],
+): ResponsesConversionResult {
+  const input: ResponsesInputItem[] = [];
+  let instructions: string | undefined;
+
+  for (const message of messages) {
+    const role = message.role;
+
+    if (role === 'system') {
+      if (instructions === undefined) {
+        instructions = openAIContentToText(message.content);
+      } else {
+        // Same diagnostic as `convertToResponsesInput`: a second
+        // `role:system` message is dropped because `/v1/responses`
+        // hoists only the first system message to `instructions`.
+        logger.info(
+          'convertResponses: dropped extra system message after context filter (kept first as instructions)',
+        );
+      }
+      continue;
+    }
+
+    // Tool results (`role:tool`) → top-level `function_call_output`
+    // items only (no message item — `/v1/responses` has no `tool`
+    // message role). Skip the message-item emission below for tool.
+    if (role === 'tool') {
+      const output = openAIContentToText(message.content);
+      if (message.tool_call_id !== undefined) {
+        input.push({
+          type: 'function_call_output',
+          call_id: message.tool_call_id,
+          output,
+        });
+      }
+      continue;
+    }
+
+    const contentParts = openAIContentToResponsesParts(message.content, role);
+
+    // Emit the message item only when it has content. Empty assistant
+    // messages with no tool calls are dropped, mirroring
+    // `convertToResponsesInput`. `role` is now narrowed to
+    // `user` | `assistant` (system handled above, tool handled above).
+    if (contentParts.length > 0) {
+      input.push({ type: 'message', role, content: contentParts });
+    } else if (role === 'assistant' && (message.tool_calls === undefined || message.tool_calls.length === 0)) {
+      logger.info(
+        'convertResponses: dropped empty assistant message after context filter',
+      );
+    }
+
+    // Assistant tool calls → top-level `function_call` items.
+    if (message.tool_calls !== undefined) {
+      for (const call of message.tool_calls) {
+        input.push({
+          type: 'function_call',
+          call_id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments,
+        });
+      }
+    }
+  }
+
+  return instructions !== undefined ? { input, instructions } : { input };
+}
+
+/**
+ * Extracts the concatenated text from an `OpenAIChatContent` value
+ * (string → itself; part array → concatenated `text` parts; null → "").
+ * Used for the hoisted `instructions` and for `function_call_output`
+ * `output` fields.
+ */
+function openAIContentToText(
+  content: OpenAICompatibleMessage['content'],
+): string {
+  if (content === null || content === undefined) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  let text = '';
+  for (const part of content) {
+    if (part.type === 'text') {
+      text += part.text;
+    }
+  }
+  return text;
+}
+
+/**
+ * Converts an `OpenAIChatContent` value into the `/v1/responses`
+ * `content[]` part array. `text` parts → `input_text` (user) or
+ * `output_text` (assistant); `image_url` parts → `input_image` with
+ * the same data URL. Vision content passes through unchanged.
+ */
+function openAIContentToResponsesParts(
+  content: OpenAICompatibleMessage['content'],
+  role: 'system' | 'user' | 'assistant' | 'tool',
+): ResponsesContentPart[] {
+  const parts: ResponsesContentPart[] = [];
+  if (content === null || content === undefined) {
+    return parts;
+  }
+  if (typeof content === 'string') {
+    if (content.length > 0) {
+      parts.push(
+        role === 'assistant'
+          ? { type: 'output_text', text: content }
+          : { type: 'input_text', text: content },
+      );
+    }
+    return parts;
+  }
+  for (const part of content as OpenAIContentPart[]) {
+    if (part.type === 'text') {
+      if (part.text.length > 0) {
+        parts.push(
+          role === 'assistant'
+            ? { type: 'output_text', text: part.text }
+            : { type: 'input_text', text: part.text },
+        );
+      }
+    } else if (part.type === 'image_url') {
+      parts.push({
+        type: 'input_image',
+        image_url: part.image_url.url,
+      });
+    }
+  }
+  return parts;
+}
 
 function extractMessageText(
   message: vscode.LanguageModelChatRequestMessage,

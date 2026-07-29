@@ -458,6 +458,7 @@ describe('connections.modelIdPrefix / connectionOriginLabel — model picker', (
       visionModels: [],
       requiresApiKey: true,
       preferredEndpoint: 'auto',
+      contextFilter: 'auto',
     };
   }
 
@@ -524,6 +525,7 @@ describe('connections.openAiBaseUrl — baseUrl + openaiCompatiblePath', () => {
       visionModels: [],
       requiresApiKey: true,
       preferredEndpoint: 'auto',
+      contextFilter: 'auto',
     };
   }
 
