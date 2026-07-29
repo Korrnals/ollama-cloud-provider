@@ -1596,6 +1596,162 @@ describe('OllamaCloudChatProvider — stream lifecycle logs (Issue #41)', () => 
       logged.some((line) => line.includes('Stream error:') && line.includes('class=')),
       'logged Stream error with the error class',
     );
+    // Issue #41 review fix (Finding 4): the `status=` field is the
+    // differentiating signal for `HttpError` (vs `ConnectTimeoutError`
+    // / `AbortError`, which have no `status=`). Lock the branch by
+    // asserting the configured status (500 from the stub above) is
+    // present on the Stream error line.
+    assert.ok(
+      logged.some(
+        (line) => line.includes('Stream error:') && line.includes('status=500'),
+      ),
+      'logged Stream error with status= for the HttpError case',
+    );
+  });
+
+  // Issue #41 review fix (Finding 2): a thinking-only stream (no
+  // `output_text` deltas, only reasoning deltas) must log a non-zero
+  // `chunks=` count on the Stream done line. Before the fix,
+  // `chunkCount` incremented only in `onText`, so a thinking-only
+  // stream logged `chunks=0` — which a reader misreads as "stream
+  // empty". Uses the /v1/responses path (the only path that emits
+  // `onThinking`).
+  it('logs a non-zero chunks= count for a thinking-only stream (Finding 2)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      // Cloud + auto resolves to /v1/responses — the only path that
+      // emits `onThinking` (reasoning_summary_text.delta events).
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+
+    const sseEvent = (type: string, json: string): Uint8Array =>
+      encode(`event: ${type}\ndata: ${json}\n\n`);
+    // Thinking-only stream: two reasoning deltas, NO output_text delta.
+    const chunks = [
+      sseEvent('response.created', '{"response":{"id":"r1","status":"in_progress"}}'),
+      sseEvent(
+        'response.reasoning_summary_text.delta',
+        '{"delta":"thinking step 1","item_id":"rs1"}',
+      ),
+      sseEvent(
+        'response.reasoning_summary_text.delta',
+        '{"delta":" step 2","item_id":"rs1"}',
+      ),
+      sseEvent(
+        'response.completed',
+        '{"response":{"id":"r1","status":"completed","usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}}',
+      ),
+    ];
+    global.fetch = (async () =>
+      mockResponse(streamFromChunks(chunks))) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('think silently')],
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The Stream done line must carry chunks=N where N > 0. Two
+    // reasoning deltas fired `onThinking`, so chunkCount === 2.
+    const doneLine = logged.find((line) => line.includes('Stream done:'));
+    assert.ok(doneLine, 'logged a Stream done line');
+    const match = doneLine!.match(/chunks=(\d+)/);
+    assert.ok(match, `Stream done line carries a chunks= count: ${doneLine}`);
+    const chunkCount = Number(match![1]);
+    assert.ok(
+      chunkCount > 0,
+      `thinking-only stream logged chunks=${chunkCount} (must be > 0, not 0)`,
+    );
+    assert.equal(
+      chunkCount,
+      2,
+      `two reasoning deltas incremented chunkCount to 2, got ${chunkCount}`,
+    );
+  });
+
+  // Issue #41 review fix (Finding 3): the usage audit must reflect the
+  // estimator's state AT REQUEST TIME, not the post-update EMA. Before
+  // the fix, `updateTokenEstimate` ran before `formatUsageLog`, so the
+  // first request's audit used the already-shifted EMA (self-
+  // referential bias dampening the early-session delta). After the fix,
+  // the first request's audit uses the initial `charsPerToken` (4).
+  it('uses the pre-update charsPerToken in the usage audit for the first request (Finding 3)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      // /chat/completions path — usage rides on the final chunk via
+      // stream_options.include_usage.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+
+    // A request whose observed ratio (requestChars/inputTokens) is far
+    // from the initial charsPerToken (4). 1000 chars / 50 input tokens
+    // = 8 chars/token — a big shift. With the pre-update value (4),
+    // estimatedTokens = ceil(1000/4) = 250, which is >>50, so the
+    // >20% delta fires. With the post-update EMA (0.7*4 + 0.3*8 = 5.2),
+    // estimatedTokens = ceil(1000/5.2) = 192, still >50 but the point
+    // is the audit reflects the REQUEST-TIME estimator, not the
+    // shifted one. We assert `estimatedTokens=250` (the pre-update
+    // value) specifically.
+    const longMessage = 'x'.repeat(1000);
+    const chunks = [
+      encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n'),
+      encode(
+        'data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":2,"total_tokens":52}}\n',
+      ),
+      encode('data: [DONE]\n'),
+    ];
+    global.fetch = (async () =>
+      mockResponse(streamFromChunks(chunks))) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg(longMessage)],
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The usage audit line must use the PRE-update charsPerToken (4):
+    // estimatedTokens = ceil(1000/4) = 250. If the bug were present,
+    // it would use the post-update EMA (5.2) → estimatedTokens=192.
+    const usageLine = logged.find((line) => line.includes('estimatedTokens='));
+    assert.ok(usageLine, 'logged a usage audit line with estimatedTokens');
+    assert.ok(
+      usageLine!.includes('estimatedTokens=250'),
+      `first-request audit used the pre-update charsPerToken (4 → estimatedTokens=250), got: ${usageLine}`,
+    );
   });
 });
 

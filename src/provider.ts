@@ -346,19 +346,15 @@ export class OllamaCloudChatProvider
   ): Promise<vscode.LanguageModelChatInformation[]> {
     const hasApiKey = await this.authManager.hasApiKey();
     // Issue #41 — Strand 2: pass the model's connection so the tooltip
-    // can show the effective endpoint. Resolved once per call; a
-    // missing connection (cloud model not yet in `connections`) falls
-    // back to the synthesized cloud connection, which is what
-    // `provideLanguageModelChatResponse` also uses.
+    // can show the effective endpoint. Resolved once per call. (Review
+    // fix Finding 5: the previous `?? (cloud ? find cloud : undefined)`
+    // fallback was fully redundant — the `find` already locates `cloud`
+    // when `model.connectionId === 'cloud'`.)
     const connections = loadConnections();
     return this.modelCatalog
       .list()
       .map((model) => {
-        const connection =
-          connections.find((c) => c.id === model.connectionId) ??
-          (model.connectionId === 'cloud'
-            ? connections.find((c) => c.id === 'cloud')
-            : undefined);
+        const connection = connections.find((c) => c.id === model.connectionId);
         return toChatInformation(model, hasApiKey, connection);
       });
   }
@@ -587,14 +583,11 @@ export class OllamaCloudChatProvider
     //     hoisted to top-level `instructions`; subsequent system
     //     messages are dropped (logged). Tool definitions go only in
     //     the top-level `tools` array (via `convertToolsToResponses`).
-    // No content is sent twice. This log line makes future drift
-    // visible — if a refactor accidentally double-sends the system
-    // prompt or inlines tool definitions, the `requestChars` here will
-    // diverge from the expected baseline and the audit line will
-    // surface it. `logger.debug` is not in the interface, so `info`.
-    logger.info(
-      `convert audit: no redundancy, requestChars=${requestChars}, messages=${filteredMessages.length}`,
-    );
+    // No content is sent twice. The audit verdict is recorded in this
+    // comment (review fix Finding 6: the per-request `convert audit:`
+    // log line was removed — the verdict is static and `requestChars`
+    // is already carried by the `Endpoint selected` line below, so the
+    // per-request line was pure noise on the output channel).
 
     // ADR 0007 — context-filter log line. Emitted at `safe` /
     // `aggressive` only (NOT `off` — no logging at `off` per ADR).
@@ -940,6 +933,10 @@ export class OllamaCloudChatProvider
               `Stream start (thinking): model="${modelLabel}" ttft=${firstChunkAt - startedAt}ms`,
             );
           }
+          // Issue #41 review fix (Finding 2): increment `chunkCount`
+          // here too, so a thinking-only stream does not log
+          // `chunks=0` (which misreads as "stream empty").
+          chunkCount += 1;
           const thinkingPart = createThinkingPart(text);
           if (thinkingPart) {
             progress.report(thinkingPart);
@@ -956,6 +953,10 @@ export class OllamaCloudChatProvider
               `Stream start (tool_call): model="${modelLabel}" ttft=${firstChunkAt - startedAt}ms`,
             );
           }
+          // Issue #41 review fix (Finding 2): increment `chunkCount`
+          // here too, so a tool-call-only stream does not log
+          // `chunks=0` (which misreads as "stream empty").
+          chunkCount += 1;
           progress.report(
             new vscode.LanguageModelToolCallPart(
               toolCall.id,
@@ -965,13 +966,22 @@ export class OllamaCloudChatProvider
           );
         },
         onUsage: (usage: UsageInfo) => {
+          // Issue #41 review fix (Finding 3): capture `charsPerToken`
+          // BEFORE updating the EMA. The audit compares "what we sent"
+          // against "what the server counted" using the estimator's
+          // state AT REQUEST TIME. Updating first then logging the
+          // already-shifted EMA is self-referential bias that dampens
+          // the delta for the first few requests of a session.
+          const preUpdateCharsPerToken = this.charsPerToken;
           this.updateTokenEstimate(requestChars, usage);
           // Issue #41 — Strand 3.2: log estimated tokens alongside
           // server-reported usage so the audit can compare "what we
           // sent" vs "what the server counted". Log the delta when it
           // exceeds 20% — that is the signal of redundant content or
           // a conversion bug.
-          logger.info(formatUsageLog(model.id, usage, requestChars, this.charsPerToken));
+          logger.info(
+            formatUsageLog(model.id, usage, requestChars, preUpdateCharsPerToken),
+          );
         },
         onDone: () => {
           // Issue #41 — Strand 1: log stream done with total duration
