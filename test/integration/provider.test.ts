@@ -1471,3 +1471,376 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
     );
   });
 });
+
+/**
+ * Issue #41 — Strand 1 (stream lifecycle logging) + Strand 2 (endpoint
+ * indicator tooltip). Two suites:
+ *   1. Stream lifecycle: `Stream start` / `Stream done` fire on a
+ *      successful stream; `Stream error` fires on a failed stream with
+ *      `class=...`. Reuses the logger-capture pattern from the Issue
+ *      #40 suite above.
+ *   2. Tooltip: `provideLanguageModelChatInformation` appends an
+ *      `Endpoint:` line for (a) cloud auto, (b) cloud explicit
+ *      `responses`, (c) local.
+ */
+describe('OllamaCloudChatProvider — stream lifecycle logs (Issue #41)', () => {
+  let originalFetch: typeof fetch;
+  let logged: string[];
+  let originalInfo: typeof logger.info;
+  let originalError: typeof logger.error;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    logged = [];
+    originalFetch = global.fetch;
+    originalInfo = logger.info.bind(logger);
+    originalError = logger.error.bind(logger);
+    logger.info = (message: string, ...details: unknown[]): void => {
+      logged.push(`${message} ${details.map((d) => JSON.stringify(d)).join(' ')}`);
+    };
+    logger.error = (message: string, ...details: unknown[]): void => {
+      logged.push(`${message} ${details.map((d) => JSON.stringify(d)).join(' ')}`);
+    };
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    logger.info = originalInfo;
+    logger.error = originalError;
+    setConfig({});
+  });
+
+  it('logs Stream start and Stream done on a successful stream', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+
+    const chunks = [
+      encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n'),
+      encode('data: [DONE]\n'),
+    ];
+    global.fetch = (async () =>
+      mockResponse(streamFromChunks(chunks))) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('hi')],
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // Stream start fires once on the first chunk (ttft logged).
+    assert.ok(
+      logged.some((line) => line.includes('Stream start:') && line.includes('ttft=')),
+      'logged Stream start with ttft on first chunk',
+    );
+    // Stream done fires once with duration + chunk count.
+    assert.ok(
+      logged.some((line) => line.includes('Stream done:') && line.includes('duration=') && line.includes('chunks=')),
+      'logged Stream done with duration and chunk count',
+    );
+  });
+
+  it('logs Stream error with class= on a failed stream', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+
+    // fetch resolves with a 500 — the streaming client raises an
+    // HttpError, which runStream logs as `Stream error: ... class=HttpError`.
+    global.fetch = (async () =>
+      new Response(JSON.stringify({ error: { message: 'boom' } }), {
+        status: 500,
+        headers: { 'content-type': 'application/json' },
+      })) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+    );
+
+    // Stream error fires with the error class. HttpError is the
+    // expected class for a non-2xx response.
+    assert.ok(
+      logged.some((line) => line.includes('Stream error:') && line.includes('class=')),
+      'logged Stream error with the error class',
+    );
+  });
+});
+
+/**
+ * Issue #41 — Strand 2: the model picker tooltip surfaces the
+ * effective endpoint (`Endpoint: ...`) so the user can see at a glance
+ * whether a model resolves to `/v1/responses`, `/chat/completions`,
+ * or the local Ollama path. Asserted for the three cases that matter:
+ *   (a) cloud auto (default `preferredEndpoint`) — resolves to /v1/responses
+ *   (b) cloud explicit `responses`
+ *   (c) local connection — always /chat/completions (local)
+ */
+describe('OllamaCloudChatProvider — endpoint indicator tooltip (Issue #41)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    setConfig({});
+  });
+
+  /**
+   * Drives `provideLanguageModelChatInformation` and returns the
+   * tooltip of the first info item whose id matches `apiModel`.
+   */
+  async function tooltipFor(
+    ctx: vscode.ExtensionContext,
+    apiModel: string,
+  ): Promise<string> {
+    const provider = new OllamaCloudChatProvider(ctx);
+    const infos = await provider.provideLanguageModelChatInformation(
+      {} as vscode.PrepareLanguageModelChatModelOptions,
+      new vscode.CancellationTokenSource().token,
+    );
+    const match = infos.find((i) => i.id === `ollama-cloud/${apiModel}`);
+    assert.ok(match, `info for ${apiModel} present`);
+    return match.tooltip ?? '';
+  }
+
+  it('(a) cloud auto — tooltip includes Endpoint: auto (resolves to /v1/responses)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      apiKey: '',
+      // Default global preferredEndpoint is 'responses'; connection is 'auto'.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+
+    const tooltip = await tooltipFor(ctx, 'gpt-oss:120b');
+    // auto resolves against the global default ('responses') and the
+    // label surfaces both the auto choice and what it resolves to.
+    assert.match(tooltip, /Endpoint: auto \(resolves to \/v1\/responses\)/);
+  });
+
+  it('(b) cloud explicit responses — tooltip includes Endpoint: /v1/responses', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'responses' },
+      ],
+    });
+
+    const tooltip = await tooltipFor(ctx, 'gpt-oss:120b');
+    assert.match(tooltip, /Endpoint: \/v1\/responses/);
+  });
+
+  it('(c) local connection — tooltip includes Endpoint: /chat/completions (local)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    const LOCAL_URL = 'http://localhost:11434';
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL, LOCAL_URL],
+      apiKey: '',
+      connections: [
+        {
+          id: 'home',
+          type: 'local',
+          baseUrl: LOCAL_URL,
+          preferredEndpoint: 'auto',
+        },
+      ],
+    });
+
+    // Catalog fetch stub — the local connection's OpenAI catalog path
+    // hits `<baseUrl>/models`. Return one model so the catalog builds
+    // an entry with connectionId 'home'.
+    global.fetch = (async (input: string | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/models')) {
+        return new Response(
+          JSON.stringify({ data: [{ id: 'llama3.2:latest' }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url.endsWith('/api/tags')) {
+        return new Response(
+          JSON.stringify({ models: [{ model: 'llama3.2:latest' }] }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return mockResponse(streamFromChunks([]));
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    await provider.syncModelCatalog(true);
+
+    const infos = await provider.provideLanguageModelChatInformation(
+      {} as vscode.PrepareLanguageModelChatModelOptions,
+      new vscode.CancellationTokenSource().token,
+    );
+    const localInfo = infos.find((i) => i.id.includes('home'));
+    assert.ok(localInfo, 'local connection model present in info list');
+    assert.match(
+      localInfo!.tooltip ?? '',
+      /Endpoint: \/chat\/completions \(local\)/,
+    );
+  });
+
+  /**
+   * Issue #41 — must-fix regression (Code Reviewer finding #1).
+   *
+   * When the user changes the global `ollamaCloud.preferredEndpoint`
+   * setting (and nothing else — no `baseUrl`, `connections`, `apiKey`
+   * change), the `onDidChangeConfiguration` handler must fire the
+   * information emitter so VS Code re-queries the tooltip. Without the
+   * fix the `preferredEndpoint` branch clears the cache and logs the
+   * new endpoint but never calls `.fire()`, so the
+   * `Endpoint: auto (resolves to ...)` tooltip line stays stale until
+   * some unrelated event (catalog sync, apiKey change) fires the
+   * emitter later.
+   *
+   * The vscode stub's `workspace.onDidChangeConfiguration` returns a
+   * no-op and does NOT deliver events to registered listeners, so the
+   * test captures the handler the provider registers by monkey-patching
+   * `vscode.workspace.onDidChangeConfiguration` for the duration of
+   * the test, then invokes it with a synthetic event whose
+   * `affectsConfiguration` only returns true for
+   * `ollamaCloud.preferredEndpoint`. The provider's own
+   * `onDidChangeLanguageModelChatInformation` event is subscribed
+   * before the synthetic change; the assertion is that the emitter
+   * fired exactly once as a result of the `preferredEndpoint` change.
+   */
+  it('(d) global preferredEndpoint change fires the information emitter (must-fix #1)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      apiKey: '',
+      // Cloud connection is 'auto' → inherits the global setting, so
+      // the tooltip's `resolves to ...` line tracks the global value.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+
+    // Capture the `onDidChangeConfiguration` listener the provider
+    // registers in its constructor. The stub returns a no-op, so we
+    // intercept the registration to grab the handler. The vscode
+    // types mark `workspace` properties as read-only, so cast through
+    // `unknown` to a mutable shape for the test-only monkey-patch.
+    let configListener:
+      | ((e: { affectsConfiguration(section: string): boolean }) => void)
+      | undefined;
+    const originalOnDidChange = vscode.workspace.onDidChangeConfiguration;
+    const writableWorkspace = vscode.workspace as unknown as {
+      onDidChangeConfiguration: typeof vscode.workspace.onDidChangeConfiguration;
+    };
+    writableWorkspace.onDidChangeConfiguration = ((
+      listener: (e: { affectsConfiguration(section: string): boolean }) => void,
+    ) => {
+      configListener = listener;
+      return { dispose: () => undefined };
+    }) as typeof vscode.workspace.onDidChangeConfiguration;
+
+    let fired = 0;
+    const provider = new OllamaCloudChatProvider(ctx);
+    const sub = provider.onDidChangeLanguageModelChatInformation(() => {
+      fired += 1;
+    });
+
+    // Restore the stub's no-op `onDidChangeConfiguration` so the
+    // monkey-patch does not leak past this test.
+    writableWorkspace.onDidChangeConfiguration = originalOnDidChange;
+
+    try {
+      assert.ok(configListener, 'provider registered a config-change listener');
+
+      // Sanity baseline: the tooltip reflects the default global
+      // `preferredEndpoint: 'responses'`. `tooltipFor` awaits the
+      // info query, which also drains the constructor's
+      // `queueMicrotask(() => emitter.fire())` (line ~193) so the
+      // baseline fire is observed and discarded before the regression
+      // measurement begins.
+      const before = await tooltipFor(ctx, 'gpt-oss:120b');
+      assert.match(
+        before,
+        /Endpoint: auto \(resolves to \/v1\/responses\)/,
+        'tooltip reflects the default global preferredEndpoint before the change',
+      );
+      // Discard the constructor's microtask fire so `fired` measures
+      // only the config-change fire under test.
+      fired = 0;
+
+      // Simulate the user changing ONLY the global preferredEndpoint
+      // setting. The synthetic event's `affectsConfiguration` returns
+      // true for `ollamaCloud.preferredEndpoint` and false for every
+      // other key — this is the exact case the must-fix targets (no
+      // baseUrl/connections/apiKey change to drive the other branch's
+      // `.fire()`).
+      setConfig({
+        baseUrl: BASE_URL,
+        allowedBaseUrls: [BASE_URL],
+        apiKey: '',
+        preferredEndpoint: 'chat',
+        connections: [
+          { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+        ],
+      });
+      configListener!({
+        affectsConfiguration: (section: string) =>
+          section === 'ollamaCloud.preferredEndpoint',
+      });
+
+      // The must-fix assertion: the `preferredEndpoint` branch fired
+      // the information emitter. Before the fix this was 0 — the bug.
+      assert.equal(fired, 1, 'preferredEndpoint change fired the information emitter');
+
+      // And the tooltip now reflects the new resolution.
+      const after = await tooltipFor(ctx, 'gpt-oss:120b');
+      assert.match(
+        after,
+        /Endpoint: auto \(resolves to \/chat\/completions\)/,
+        'tooltip reflects the new global preferredEndpoint after the change',
+      );
+    } finally {
+      sub.dispose();
+    }
+  });
+});

@@ -398,6 +398,17 @@ function buildResponse(
   const statusText = res.statusMessage ?? '';
   const headers = buildHeaders(res.headers);
 
+  // Issue #41 — Strand 1: log the response status + path (NOT the
+  // full URL, NOT query, NOT headers — secrets/per-PII). One line
+  // per request, on the response side, paired with the request log
+  // in `httpRequest`. `buildResponse` is the single choke point all
+  // three transport paths (direct / HTTP proxy / TLS-CONNECT tunnel)
+  // funnel through, so this fires exactly once per request regardless
+  // of which path served it.
+  logger.info(
+    `httpClient: response status=${status} path=${parsedTarget.pathname}`,
+  );
+
   // Convert the Node Readable to a Web ReadableStream lazily. Each
   // `data` chunk becomes one Web-stream chunk; `end` closes the
   // stream; `error` errors it. The streaming clients read via

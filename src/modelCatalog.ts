@@ -475,6 +475,13 @@ export class ModelCatalog {
     const changed = !sameModelIds(this.models, nextModels);
     this.models = nextModels;
 
+    // Issue #41 — Strand 1: single-connection refresh result so the
+    // audit can see how many models the cloud connection contributed.
+    // Pairs with the per-connection log in `refreshForConnections`.
+    logger.info(
+      `modelCatalog: refreshed cloud connection discovered=${ids.length} models`,
+    );
+
     return { changed, count: nextModels.length };
   }
 
@@ -510,6 +517,13 @@ export class ModelCatalog {
             nextModels.push(model);
           }
         }
+        // Issue #41 — Strand 1: per-connection sync result so the
+        // audit can see which connections contributed how many models
+        // (and which contributed zero). One line per connection per
+        // refresh — not per model.
+        logger.info(
+          `modelCatalog: refreshed connection='${connection.id}' discovered=${ids.length} models`,
+        );
       } catch (error) {
         // Per-connection failures are logged + skipped — one bad
         // connection must not break discovery for the others. The

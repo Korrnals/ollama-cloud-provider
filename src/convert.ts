@@ -5,6 +5,7 @@ import type {
   OpenAICompatibleToolCall,
   OpenAIContentPart,
 } from './protocolTypes.js';
+import { logger } from './logger.js';
 // ADR 0006 — shared primitives now live in `convertPrimitives.ts` so
 // both the `/chat/completions` converter and the `/v1/responses`
 // converter use the same security-sensitive helpers (image detection,
@@ -79,6 +80,16 @@ export function convertMessagesToOpenAI(
           content: text || '',
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         });
+      } else {
+        // Issue #41 — Strand 3.1 audit / Strand 1 diagnostic: an
+        // assistant message with no text AND no tool calls is silently
+        // dropped. That is the correct behaviour (empty assistant
+        // turns would break the OpenAI `messages[]` shape), but it is
+        // also a signal worth surfacing — a chat client that emits
+        // empty assistant turns may be losing reasoning content.
+        logger.info(
+          `convert: dropped empty assistant message (role=assistant, parts=${message.content.length})`,
+        );
       }
     } else if (imageParts.length > 0) {
       // User message with images: content becomes an array of text +
@@ -92,6 +103,16 @@ export function convertMessagesToOpenAI(
       result.push({ role, content: parts });
     } else if (text) {
       result.push({ role, content: text });
+    } else {
+      // Issue #41 — Strand 3.1 audit / Strand 1 diagnostic: a user
+      // or system message with no text and no images is dropped.
+      // Correct behaviour (OpenAI rejects empty `content`), but a
+      // signal worth surfacing — a chat client emitting empty user
+      // turns is likely a bug. Tool messages are exempt: they are
+      // emitted above from `toolResults` regardless of `text`.
+      logger.info(
+        `convert: dropped empty ${role} message (parts=${message.content.length})`,
+      );
     }
 
     for (const toolResult of toolResults) {

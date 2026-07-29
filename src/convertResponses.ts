@@ -22,6 +22,7 @@ import {
   serializeToolResultContent,
   mapRole,
 } from './convertPrimitives.js';
+import { logger } from './logger.js';
 
 /**
  * Result of converting VS Code messages to a `/v1/responses` request
@@ -71,6 +72,17 @@ export function convertToResponsesInput(
     if (role === 'system') {
       if (instructions === undefined) {
         instructions = extractMessageText(message);
+      } else {
+        // Issue #41 — Strand 3.1 audit / Strand 1 diagnostic: a
+        // SECOND `role:system` message is dropped because OpenAI's
+        // `/v1/responses` endpoint hoists only the first system message
+        // to top-level `instructions`. Subsequent system messages are
+        // NOT silently folded into `instructions` — they are discarded.
+        // Surfacing this so a chat client that emits multiple system
+        // turns is visible in the audit (their content is lost).
+        logger.info(
+          `convertResponses: dropped extra system message (parts=${message.content.length}, kept first as instructions)`,
+        );
       }
       continue;
     }
@@ -123,6 +135,14 @@ export function convertToResponsesInput(
     // mirroring `convertMessagesToOpenAI`.
     if (contentParts.length > 0) {
       input.push({ type: 'message', role, content: contentParts });
+    } else if (role === 'assistant' && toolCalls.length === 0) {
+      // Issue #41 — Strand 3.1 audit / Strand 1 diagnostic: empty
+      // assistant turn with no text AND no tool calls is dropped.
+      // Same signal as `convert.ts` — surface it so silent content
+      // loss is visible.
+      logger.info(
+        `convertResponses: dropped empty assistant message (role=assistant, parts=${message.content.length})`,
+      );
     }
 
     // Emit `function_call` items for assistant tool calls. These

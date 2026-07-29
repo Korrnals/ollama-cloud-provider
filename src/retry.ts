@@ -226,8 +226,16 @@ export async function withRetry<T>(
       const attemptNumber = attempt + 1;
       const errorMessage =
         error instanceof Error ? error.message : String(error);
+      // Issue #41 — Strand 1: structured retry log with the error
+      // class so the audit can correlate stream errors (logged in
+      // `provider.ts runStream` as `class=...`) with the retry that
+      // followed them. `HttpError` adds the status; other retriable
+      // errors (ConnectTimeoutError, AbortError) add only the class.
+      const errorClass = error instanceof Error ? error.constructor.name : 'unknown';
+      const statusSuffix =
+        error instanceof HttpError ? ` status=${error.status}` : '';
       logger.warn(
-        `Retrying after ${delay}ms (attempt ${attemptNumber}/${maxRetries}): ${errorMessage}`,
+        `Retrying after ${delay}ms (attempt ${attemptNumber}/${maxRetries}) class=${errorClass}${statusSuffix}: ${errorMessage}`,
       );
 
       await sleep(delay);

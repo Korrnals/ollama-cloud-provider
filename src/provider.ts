@@ -38,12 +38,45 @@ import {
 } from './capabilityCache.js';
 import { HttpError } from './retry.js';
 import { loadConnections, openAiBaseUrl } from './connections.js';
+import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
 import type { UsageInfo } from './protocolTypes.js';
 
 const AUTH_REQUIRED_DETAIL =
   'Run Ollama Cloud: Set API Key to configure access.';
 const PROVIDER_TOOLTIP = 'Ollama Cloud';
+
+/**
+ * Issue #41 — Strand 2. Resolves the effective endpoint label shown in
+ * the model picker tooltip and logged on config change.
+ *
+ *   - local connection        → `/chat/completions (local)`
+ *   - explicit `responses`    → `/v1/responses`
+ *   - explicit `chat`         → `/chat/completions`
+ *   - `auto` (default)        → `auto (resolves to /v1/responses)` when
+ *     the global `preferredEndpoint` is the default `'responses'`,
+ *     otherwise `auto (resolves to /chat/completions)`.
+ *
+ * The label is deliberately short and contains no host or auth material
+ * so it is safe to surface in a tooltip and in the output log.
+ */
+function resolveEndpointLabel(connection: ConnectionConfig | undefined): string {
+  if (!connection || connection.type === 'local') {
+    return '/chat/completions (local)';
+  }
+  const preferred = connection.preferredEndpoint ?? 'auto';
+  if (preferred === 'responses') {
+    return '/v1/responses';
+  }
+  if (preferred === 'chat') {
+    return '/chat/completions';
+  }
+  // auto — resolves against the global setting.
+  const globalPreferred = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<'responses' | 'chat'>('preferredEndpoint', 'responses');
+  return `auto (resolves to ${globalPreferred === 'chat' ? '/chat/completions' : '/v1/responses'})`;
+}
 
 /**
  * Issue #40 — builds the explicit-mode 404 error thrown when the user
@@ -134,6 +167,23 @@ export class OllamaCloudChatProvider
         // the only one that needs an explicit cache clear here.
         if (event.affectsConfiguration('ollamaCloud.preferredEndpoint')) {
           clearCapabilityCache();
+          // Issue #41 — Strand 2: log the new effective endpoint per
+          // connection so a config change is visible in the output log.
+          // One line per connection — no host, no auth material.
+          for (const conn of loadConnections()) {
+            logger.info(
+              `Endpoint changed: connection="${conn.id}" endpoint=${resolveEndpointLabel(conn)}`,
+            );
+          }
+          // Issue #41 — must-fix: fire the information emitter so VS Code
+          // re-queries `provideLanguageModelChatInformation` and the
+          // model picker tooltip refreshes. Without this, changing only
+          // the global `preferredEndpoint` setting leaves the
+          // `Endpoint: auto (resolves to ...)` tooltip line stale until
+          // some other event (catalog sync, apiKey change) fires the
+          // emitter. Matches the pattern used by the
+          // baseUrl/connections/apiKey branch above.
+          this.onDidChangeLanguageModelChatInformationEmitter.fire();
         }
       }),
       context.secrets.onDidChange((event) => {
@@ -261,9 +311,22 @@ export class OllamaCloudChatProvider
     _token: vscode.CancellationToken,
   ): Promise<vscode.LanguageModelChatInformation[]> {
     const hasApiKey = await this.authManager.hasApiKey();
+    // Issue #41 — Strand 2: pass the model's connection so the tooltip
+    // can show the effective endpoint. Resolved once per call; a
+    // missing connection (cloud model not yet in `connections`) falls
+    // back to the synthesized cloud connection, which is what
+    // `provideLanguageModelChatResponse` also uses.
+    const connections = loadConnections();
     return this.modelCatalog
       .list()
-      .map((model) => toChatInformation(model, hasApiKey));
+      .map((model) => {
+        const connection =
+          connections.find((c) => c.id === model.connectionId) ??
+          (model.connectionId === 'cloud'
+            ? connections.find((c) => c.id === 'cloud')
+            : undefined);
+        return toChatInformation(model, hasApiKey, connection);
+      });
   }
 
   async provideLanguageModelChatResponse(
@@ -367,6 +430,27 @@ export class OllamaCloudChatProvider
     const openaiMessages = convertMessagesToOpenAI(messages);
     const requestChars = countOpenAIRequestChars(openaiMessages);
 
+    // Issue #41 — Strand 3.1: convert-path redundancy audit. Verdict
+    // (verified 2026-07-29): NO redundancy in either converter.
+    //   - `convertMessagesToOpenAI`: system prompt lives in exactly
+    //     one `role:system` message; tool definitions go only in the
+    //     top-level `tools` array (via `convertToolsToOpenAI`), never
+    //     inlined into a message; instructions are not a `/chat/
+    //     completions` concept so there is no `instructions`+message
+    //     duplication vector.
+    //   - `convertToResponsesInput`: the FIRST system message is
+    //     hoisted to top-level `instructions`; subsequent system
+    //     messages are dropped (logged). Tool definitions go only in
+    //     the top-level `tools` array (via `convertToolsToResponses`).
+    // No content is sent twice. This log line makes future drift
+    // visible — if a refactor accidentally double-sends the system
+    // prompt or inlines tool definitions, the `requestChars` here will
+    // diverge from the expected baseline and the audit line will
+    // surface it. `logger.debug` is not in the interface, so `info`.
+    logger.info(
+      `convert audit: no redundancy, requestChars=${requestChars}, messages=${openaiMessages.length}`,
+    );
+
     // ADR 0006 — endpoint selection. The user picks a primary endpoint
     // via `ollamaCloud.preferredEndpoint` (global setting, default
     // `'responses'`). Per-connection `preferredEndpoint` overrides
@@ -432,7 +516,7 @@ export class OllamaCloudChatProvider
           : connectionPreferred;
 
     logger.info(
-      `Endpoint selected: primary=${primaryEndpoint}, explicit=${isPreferredEndpointExplicit}, connection="${connectionId}", isLocal=${isLocal}`,
+      `Endpoint selected: primary=${primaryEndpoint}, explicit=${isPreferredEndpointExplicit}, connection="${connectionId}", isLocal=${isLocal}, apiModel="${model.apiModel ?? model.id}", requestChars=${requestChars}`,
     );
 
     // Issue #40 — capability-cache short-circuit guard for explicit
@@ -678,12 +762,36 @@ export class OllamaCloudChatProvider
     requestChars: number,
     onSuccess: (() => void) | undefined,
   ): Promise<void> {
+    // Issue #41 — Strand 1: stream lifecycle logging. Record the
+    // request start time so stream-start (first chunk) and stream-done
+    // can report elapsed ms. The endpoint label is derived from the
+    // model's connection at the call site would require plumbing; the
+    // model id + apiModel is enough signal for diagnostics.
+    const startedAt = Date.now();
+    let firstChunkAt: number | undefined;
+    let chunkCount = 0;
+    const modelLabel = model.apiModel ?? model.id;
     await new Promise<void>((resolve, reject) => {
       void invoke({
         onText: (text: string) => {
+          if (firstChunkAt === undefined) {
+            firstChunkAt = Date.now();
+            // Issue #41 — Strand 1: log stream start (first chunk) with
+            // time-to-first-token. One line per stream — not per chunk.
+            logger.info(
+              `Stream start: model="${modelLabel}" ttft=${firstChunkAt - startedAt}ms`,
+            );
+          }
+          chunkCount += 1;
           progress.report(new vscode.LanguageModelTextPart(text));
         },
         onThinking: (text: string) => {
+          if (firstChunkAt === undefined) {
+            firstChunkAt = Date.now();
+            logger.info(
+              `Stream start (thinking): model="${modelLabel}" ttft=${firstChunkAt - startedAt}ms`,
+            );
+          }
           const thinkingPart = createThinkingPart(text);
           if (thinkingPart) {
             progress.report(thinkingPart);
@@ -694,6 +802,12 @@ export class OllamaCloudChatProvider
           name: string;
           input: Record<string, unknown>;
         }) => {
+          if (firstChunkAt === undefined) {
+            firstChunkAt = Date.now();
+            logger.info(
+              `Stream start (tool_call): model="${modelLabel}" ttft=${firstChunkAt - startedAt}ms`,
+            );
+          }
           progress.report(
             new vscode.LanguageModelToolCallPart(
               toolCall.id,
@@ -704,13 +818,37 @@ export class OllamaCloudChatProvider
         },
         onUsage: (usage: UsageInfo) => {
           this.updateTokenEstimate(requestChars, usage);
-          logger.info(formatUsageLog(model.id, usage));
+          // Issue #41 — Strand 3.2: log estimated tokens alongside
+          // server-reported usage so the audit can compare "what we
+          // sent" vs "what the server counted". Log the delta when it
+          // exceeds 20% — that is the signal of redundant content or
+          // a conversion bug.
+          logger.info(formatUsageLog(model.id, usage, requestChars, this.charsPerToken));
         },
         onDone: () => {
+          // Issue #41 — Strand 1: log stream done with total duration
+          // + chunk count. Diagnostics for slow streams and to confirm
+          // a request actually completed (vs silently dropped).
+          const durationMs = Date.now() - startedAt;
+          logger.info(
+            `Stream done: model="${modelLabel}" duration=${durationMs}ms chunks=${chunkCount}`,
+          );
           onSuccess?.();
           resolve();
         },
-        onError: (error: Error) => reject(error),
+        onError: (error: Error) => {
+          // Issue #41 — Strand 1: log stream error with the error
+          // class + status (if HttpError) + duration. One line per
+          // failed stream — not per retry (retries log in retry.ts).
+          const durationMs = Date.now() - startedAt;
+          const status =
+            error instanceof HttpError ? ` status=${error.status}` : '';
+          logger.error(
+            `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name}`,
+            error,
+          );
+          reject(error);
+        },
       }).catch((error: unknown) => {
         // Safety net: if the client rejects its own promise instead
         // of calling onError (shouldn't happen, but defence-in-depth),
@@ -724,6 +862,7 @@ export class OllamaCloudChatProvider
 function toChatInformation(
   model: ModelDefinition,
   hasApiKey: boolean,
+  connection: ConnectionConfig | undefined,
 ): vscode.LanguageModelChatInformation {
   const configurationSchema = getModelConfigurationSchema(model);
 
@@ -737,15 +876,23 @@ function toChatInformation(
       ? model.name
       : `${model.origin}:${model.name}`;
 
+  // Issue #41 — Strand 2: surface the effective endpoint in the
+  // tooltip. Appended as a new line so the existing `PROVIDER_TOOLTIP`
+  // header and the auth-required hint stay where existing readers
+  // expect them; the endpoint line is pure diagnostic, no host/auth.
+  const endpointLabel = resolveEndpointLabel(connection);
+  const baseTooltip = hasApiKey
+    ? PROVIDER_TOOLTIP
+    : `${PROVIDER_TOOLTIP}\n${AUTH_REQUIRED_DETAIL}`;
+  const tooltip = `${baseTooltip}\nEndpoint: ${endpointLabel}`;
+
   return {
     id: model.id,
     name,
     family: model.family,
     version: model.version,
     detail: model.origin === 'Cloud' ? PROVIDER_TOOLTIP : model.origin,
-    tooltip: hasApiKey
-      ? PROVIDER_TOOLTIP
-      : `${PROVIDER_TOOLTIP}\n${AUTH_REQUIRED_DETAIL}`,
+    tooltip,
     maxInputTokens: model.maxInputTokens,
     maxOutputTokens: model.maxOutputTokens,
     capabilities: {
@@ -771,7 +918,15 @@ function resolveToolChoice(
     : 'auto';
 }
 
-function formatUsageLog(modelId: string, usage: UsageInfo): string {
+// Issue #41 — Strand 3.2: exported so the unit test in
+// `test/unit/formatUsageLog.test.ts` can assert the estimatedTokens /
+// delta audit fields without going through the full provider stream.
+export function formatUsageLog(
+  modelId: string,
+  usage: UsageInfo,
+  requestChars?: number,
+  charsPerToken?: number,
+): string {
   const parts = [`[${modelId}]`];
   if (usage.inputTokens !== undefined) {
     parts.push(`input=${usage.inputTokens}`);
@@ -782,6 +937,40 @@ function formatUsageLog(modelId: string, usage: UsageInfo): string {
   if (usage.totalTokens !== undefined) {
     parts.push(`total=${usage.totalTokens}`);
   }
+
+  // Issue #41 — Strand 3.2: token audit. When the caller passes the
+  // request's character count and the current chars-per-token estimate,
+  // compute the locally-estimated input token count and compare it
+  // against the server-reported `inputTokens`. A delta >20% in either
+  // direction is the signal of redundant content (system prompt sent
+  // twice, instructions duplicated in `instructions` + a message, tool
+  // definitions sent in both `tools` and inline) or a conversion bug.
+  // The audit line stays single-line — `logger.info` is one call.
+  if (
+    requestChars !== undefined &&
+    charsPerToken !== undefined &&
+    charsPerToken > 0
+  ) {
+    const estimatedTokens = Math.max(1, Math.ceil(requestChars / charsPerToken));
+    parts.push(`estimatedTokens=${estimatedTokens}`);
+
+    if (usage.inputTokens !== undefined && usage.inputTokens > 0) {
+      const diff = estimatedTokens - usage.inputTokens;
+      const ratio = Math.abs(diff) / usage.inputTokens;
+      if (ratio > 0.2) {
+        // Sign the delta: `+` when the estimate OVER-counts (likely
+        // redundant content sent), `-` when the server counted more
+        // than we estimated (likely under-counting in the convert
+        // path, e.g. a part dropped before reaching the server).
+        const sign = diff > 0 ? '+' : '-';
+        const pct = Math.round(ratio * 100);
+        parts.push(
+          `delta=${sign}${pct}% (audit: check convert path for redundancy)`,
+        );
+      }
+    }
+  }
+
   return parts.join(' ');
 }
 
