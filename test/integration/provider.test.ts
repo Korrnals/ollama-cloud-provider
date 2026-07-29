@@ -2000,3 +2000,269 @@ describe('OllamaCloudChatProvider — endpoint indicator tooltip (Issue #41)', (
     }
   });
 });
+
+/**
+ * Issue #39 review fix (Finding 1) — provider integration coverage for
+ * the context filter (ADR 0007). The 50 unit tests cover `filterContext`
+ * in isolation; these tests exercise the provider's level resolution +
+ * log emission + endpoint routing of the FILTERED payload. Stubs mirror
+ * the existing provider tests: `globalConfig` via `setConfig`,
+ * `global.fetch`, and the cloud connection's `contextFilter` override.
+ *
+ * Cases:
+ *   (a) `off` fast-path — no `Context filter:` log line, request still
+ *       goes through with the unfiltered messages.
+ *   (b) per-connection override — connection `safe` + global `off` →
+ *       filter runs + log line emitted.
+ *   (c) aggressive truncation — system prompt + last user message are
+ *       preserved through the provider into the request body.
+ *   (d) merge refuses tool-bearing messages — a duplicate tool-call pair
+ *       survives `safe` (integrity preserved through the provider).
+ */
+describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Finding 1)', () => {
+  let originalFetch: typeof fetch;
+  let logged: string[];
+  let originalInfo: typeof logger.info;
+  let fetchBodies: Array<{ url: string; body: unknown }>;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    logged = [];
+    fetchBodies = [];
+    originalFetch = global.fetch;
+    originalInfo = logger.info.bind(logger);
+    logger.info = (message: string, ...details: unknown[]): void => {
+      logged.push(`${message} ${details.map((d) => JSON.stringify(d)).join(' ')}`);
+    };
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    logger.info = originalInfo;
+    setConfig({});
+  });
+
+  /**
+   * Drives a chat turn and returns the captured request bodies + the
+   * emitted log lines. The cloud connection is used with `preferredEndpoint:
+   * 'chat'` so the `/chat/completions` path consumes `filteredMessages`
+   * directly (the easiest endpoint to inspect the filtered payload on).
+   */
+  async function runTurn(
+    ctx: vscode.ExtensionContext,
+    messages: vscode.LanguageModelChatRequestMessage[],
+    connectionContextFilter: 'auto' | 'off' | 'safe' | 'aggressive',
+    globalContextFilterLevel: 'off' | 'safe' | 'aggressive',
+  ): Promise<void> {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      contextFilter: { level: globalContextFilterLevel },
+      connections: [
+        {
+          id: 'cloud',
+          type: 'cloud',
+          baseUrl: BASE_URL,
+          preferredEndpoint: 'chat',
+          contextFilter: connectionContextFilter,
+        },
+      ],
+    });
+
+    const chunks = [
+      encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
+      encode('data: [DONE]\n'),
+    ];
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchBodies.push({ url, body });
+      return mockResponse(streamFromChunks(chunks));
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      messages,
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+  }
+
+  it('(a) off fast-path emits no Context filter log line and sends unfiltered messages', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    await runTurn(
+      ctx,
+      [userMsg('hello world')],
+      'auto', // connection inherits global
+      'off',
+    );
+
+    // No filter log line — the `off` fast path skips `filterContext`
+    // entirely (zero overhead), so the provider never emits the
+    // `Context filter:` summary line.
+    assert.ok(
+      !logged.some((line) => line.includes('Context filter:')),
+      'off fast-path must NOT emit a Context filter log line',
+    );
+    // Exactly one chat fetch — the request still went through.
+    assert.equal(fetchBodies.length, 1, 'one /chat/completions request');
+    // The unfiltered message survives verbatim in the request body.
+    const body = fetchBodies[0].body as { messages: Array<{ content: string }> };
+    assert.equal(body.messages.length, 1, 'unfiltered: one message');
+    assert.equal(body.messages[0].content, 'hello world');
+  });
+
+  it('(b) per-connection safe override runs the filter even when global is off', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Two near-duplicate user turns — `safe` drops the second as a
+    // duplicate of the first. The global level is `off`, but the
+    // connection override `safe` takes precedence.
+    await runTurn(
+      ctx,
+      [userMsg('tell me a joke'), userMsg('tell me a joke')],
+      'safe',
+      'off',
+    );
+
+    // The filter ran — a `Context filter:` summary line was emitted.
+    assert.ok(
+      logged.some((line) => line.includes('Context filter:') && line.includes('level=safe')),
+      'per-connection safe override emitted a Context filter log line',
+    );
+    // The duplicate was dropped — the request body carries ONE message
+    // (the `safe` level drops the second identical user turn).
+    const body = fetchBodies[0].body as { messages: Array<{ content: string }> };
+    assert.equal(
+      body.messages.length,
+      1,
+      `safe override dropped the duplicate, expected 1 message, got ${body.messages.length}`,
+    );
+    assert.equal(body.messages[0].content, 'tell me a joke');
+  });
+
+  it('(c) aggressive truncation preserves the system prompt and last user message', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Build a conversation that exceeds the truncation budget for
+    // gpt-oss:120b (maxInputTokens=131072 → budget =
+    // floor(131072 * 0.9 * 4) = 471859 chars). A huge middle assistant
+    // message pushes the total over budget; the truncation loop drops
+    // it, preserving the system prompt + the last user message.
+    // `systemMsg` uses role=1 (the stub's System member).
+    const hugeAssistant = 'a'.repeat(500000);
+    const messages: vscode.LanguageModelChatRequestMessage[] = [
+      {
+        role: 1 as unknown as vscode.LanguageModelChatMessageRole,
+        content: [new vscode.LanguageModelTextPart('you are helpful')] as vscode.LanguageModelChatRequestMessage['content'],
+        name: undefined,
+      },
+      {
+        role: vscode.LanguageModelChatMessageRole.Assistant,
+        content: [new vscode.LanguageModelTextPart(hugeAssistant)] as vscode.LanguageModelChatRequestMessage['content'],
+        name: undefined,
+      },
+      userMsg('final question'),
+    ];
+    await runTurn(ctx, messages, 'aggressive', 'off');
+
+    // The filter ran at aggressive and truncated at least one message.
+    assert.ok(
+      logged.some(
+        (line) => line.includes('Context filter:') && line.includes('level=aggressive'),
+      ),
+      'aggressive level emitted a Context filter log line',
+    );
+    assert.ok(
+      logged.some((line) => line.includes('truncated') && line.includes('1')),
+      'truncation diagnostic reported the dropped message',
+    );
+    // The request body preserves the system prompt + the last user
+    // message — the huge middle assistant was dropped.
+    const body = fetchBodies[0].body as { messages: Array<{ role: string; content: string }> };
+    const roles = body.messages.map((m) => m.role);
+    assert.ok(
+      roles.includes('system'),
+      'system prompt preserved through aggressive truncation',
+    );
+    assert.ok(
+      body.messages.some(
+        (m) => m.role === 'user' && m.content === 'final question',
+      ),
+      'last user message preserved through aggressive truncation',
+    );
+    // The huge middle message is gone.
+    assert.ok(
+      !body.messages.some((m) => m.content === hugeAssistant),
+      'huge middle assistant message was truncated',
+    );
+  });
+
+  it('(d) safe refuses to drop or merge tool-bearing messages (integrity preserved)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // A tool-call + tool-result pair. `safe` must preserve the pair
+    // (tool-call integrity is a binding rule: a `tool_call` always
+    // keeps its matching `tool_call_output` and vice versa). The pair
+    // is constructed as an assistant turn carrying a tool call followed
+    // by a tool-result turn — the provider converts these and the
+    // filter must not orphan either side.
+    const toolCallPart = new vscode.LanguageModelToolCallPart(
+      'call-1',
+      'get_weather',
+      { city: 'Tokyo' },
+    );
+    const toolResultPart = new vscode.LanguageModelToolResultPart(
+      'call-1',
+      [new vscode.LanguageModelTextPart('sunny, 24C')],
+    );
+    const messages: vscode.LanguageModelChatRequestMessage[] = [
+      userMsg('weather in Tokyo?'),
+      {
+        role: vscode.LanguageModelChatMessageRole.Assistant,
+        content: [toolCallPart] as vscode.LanguageModelChatRequestMessage['content'],
+        name: undefined,
+      },
+      {
+        role: vscode.LanguageModelChatMessageRole.User,
+        content: [toolResultPart] as vscode.LanguageModelChatRequestMessage['content'],
+        name: undefined,
+      },
+      userMsg('thanks'),
+    ];
+    await runTurn(ctx, messages, 'safe', 'off');
+
+    // The filter ran at safe.
+    assert.ok(
+      logged.some((line) => line.includes('Context filter:') && line.includes('level=safe')),
+      'safe level emitted a Context filter log line',
+    );
+    // The request body preserves BOTH halves of the tool pair: the
+    // assistant tool_call AND the matching tool result (role:'tool').
+    const body = fetchBodies[0].body as {
+      messages: Array<{ role: string; tool_calls?: unknown[]; tool_call_id?: string }>;
+    };
+    const hasToolCall = body.messages.some(
+      (m) => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls!.length > 0,
+    );
+    const hasToolResult = body.messages.some(
+      (m) => m.role === 'tool' && m.tool_call_id === 'call-1',
+    );
+    assert.ok(hasToolCall, 'safe preserved the assistant tool_call half of the pair');
+    assert.ok(
+      hasToolResult,
+      'safe preserved the matching tool result (tool_call_id=call-1) — integrity held',
+    );
+  });
+});

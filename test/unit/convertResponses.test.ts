@@ -2,9 +2,15 @@ import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import {
   convertToResponsesInput,
+  convertOpenAIMessagesToResponsesInput,
   convertToolsToResponses,
 } from '../../src/convertResponses.js';
-import type { ResponsesInputItem } from '../../src/protocolTypes.js';
+import type {
+  OpenAIChatContent,
+  OpenAICompatibleMessage,
+  OpenAICompatibleToolCall,
+  ResponsesInputItem,
+} from '../../src/protocolTypes.js';
 
 const { LanguageModelChatMessageRole, LanguageModelTextPart, LanguageModelToolResultPart, LanguageModelToolCallPart } =
   vscode;
@@ -52,6 +58,36 @@ function asMessage(item: ResponsesInputItem): {
     type: 'message';
     role: 'user' | 'assistant' | 'system';
     content: Array<{ type: string; [key: string]: unknown }>;
+  };
+}
+
+// Type-narrowing helpers for the top-level tool items
+// (`function_call` / `function_call_output`), symmetric to `asMessage`.
+function asFunctionCall(item: ResponsesInputItem): {
+  type: 'function_call';
+  call_id: string;
+  name: string;
+  arguments: string;
+} {
+  assert.equal(item.type, 'function_call', `expected function_call, got ${item.type}`);
+  return item as {
+    type: 'function_call';
+    call_id: string;
+    name: string;
+    arguments: string;
+  };
+}
+
+function asFunctionCallOutput(item: ResponsesInputItem): {
+  type: 'function_call_output';
+  call_id: string;
+  output: string;
+} {
+  assert.equal(item.type, 'function_call_output', `expected function_call_output, got ${item.type}`);
+  return item as {
+    type: 'function_call_output';
+    call_id: string;
+    output: string;
   };
 }
 
@@ -211,6 +247,176 @@ describe('convertResponses.convertToResponsesInput', () => {
       (result.input[1] as { output: string }).output,
       '42',
     );
+  });
+});
+
+// --- OpenAI-format message fixtures for the filtered /v1/responses path ---
+// These build `OpenAICompatibleMessage` (the /chat/completions shape the
+// context filter produces) instead of VS Code messages, exercising
+// `convertOpenAIMessagesToResponsesInput` directly without a round-trip.
+function oaiSystem(content: string): OpenAICompatibleMessage {
+  return { role: 'system', content };
+}
+
+function oaiUser(content: OpenAIChatContent): OpenAICompatibleMessage {
+  return { role: 'user', content };
+}
+
+function oaiAssistant(opts: {
+  content?: OpenAIChatContent;
+  tool_calls?: OpenAICompatibleToolCall[];
+}): OpenAICompatibleMessage {
+  return {
+    role: 'assistant',
+    content: opts.content ?? null,
+    tool_calls: opts.tool_calls,
+  };
+}
+
+function oaiTool(toolCallId: string, content: string): OpenAICompatibleMessage {
+  return { role: 'tool', content, tool_call_id: toolCallId };
+}
+
+describe('convertResponses.convertOpenAIMessagesToResponsesInput', () => {
+  it('hoists the first filtered system message to instructions', () => {
+    // A single `role:system` message becomes the top-level
+    // `instructions`; it must NOT also appear in `input[]`.
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiSystem('you are a helpful assistant'),
+      oaiUser('hi'),
+    ]);
+    assert.equal(result.instructions, 'you are a helpful assistant');
+    assert.equal(result.input.length, 1);
+    assert.equal(asMessage(result.input[0]).role, 'user');
+  });
+
+  it('drops subsequent system messages and keeps the first as instructions', () => {
+    // `/v1/responses` hoists only the first system message to
+    // `instructions`. A second system message is dropped (logged),
+    // and the FIRST one wins — not the last.
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiSystem('first-wins'),
+      oaiSystem('second-dropped'),
+      oaiUser('hi'),
+    ]);
+    assert.equal(result.instructions, 'first-wins');
+    // Both system messages are absent from `input[]`.
+    assert.equal(result.input.length, 1);
+    assert.equal(asMessage(result.input[0]).role, 'user');
+  });
+
+  it('preserves tool-call integrity: function_call + matching function_call_output', () => {
+    // An assistant `tool_calls` entry plus a matching `role:tool`
+    // result must produce a top-level `function_call` item AND a
+    // top-level `function_call_output` item. Every `call_id` on a
+    // `function_call` must have a matching `function_call_output` and
+    // vice versa — tool-call integrity survives the conversion.
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiAssistant({
+        tool_calls: [
+          {
+            id: 'call-1',
+            type: 'function',
+            function: { name: 'search', arguments: '{"q":"x"}' },
+          },
+        ],
+      }),
+      oaiTool('call-1', 'result text'),
+    ]);
+    assert.equal(result.input.length, 2);
+
+    const call = asFunctionCall(result.input[0]);
+    assert.equal(call.call_id, 'call-1');
+    assert.equal(call.name, 'search');
+    assert.equal(call.arguments, '{"q":"x"}');
+
+    const output = asFunctionCallOutput(result.input[1]);
+    assert.equal(output.call_id, 'call-1');
+    assert.equal(output.output, 'result text');
+
+    // Integrity check: call_ids match 1:1 across both item kinds.
+    const callIds = result.input
+      .filter((i) => i.type === 'function_call')
+      .map((i) => (i as { call_id: string }).call_id);
+    const outputIds = result.input
+      .filter((i) => i.type === 'function_call_output')
+      .map((i) => (i as { call_id: string }).call_id);
+    assert.deepEqual(callIds, outputIds);
+  });
+
+  it('preserves a filtered vision image_url as an input_image part', () => {
+    // Vision content is never filtered (ADR 0007 § Non-goals), so an
+    // `image_url` content part must pass through as an `input_image`
+    // part carrying the same data URL.
+    const dataUrl = 'data:image/png;base64,iVBORw0KGgo=';
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiUser([
+        { type: 'text', text: 'describe this' },
+        { type: 'image_url', image_url: { url: dataUrl } },
+      ]),
+    ]);
+    assert.equal(result.instructions, undefined);
+    assert.equal(result.input.length, 1);
+    const content = asMessage(result.input[0]).content;
+    assert.equal(content.length, 2);
+    assert.equal(content[0].type, 'input_text');
+    assert.equal(content[1].type, 'input_image');
+    assert.equal(
+      (content[1] as unknown as { image_url: string }).image_url,
+      dataUrl,
+    );
+  });
+
+  it('drops an empty assistant message with no content and no tool calls', () => {
+    // An assistant turn with neither text/image content nor tool calls
+    // is dropped (not emitted as an empty item), mirroring
+    // `convertToResponsesInput` and `convertMessagesToOpenAI`.
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiUser('question'),
+      oaiAssistant({}),
+      oaiUser('follow-up'),
+    ]);
+    assert.equal(result.input.length, 2);
+    assert.equal(asMessage(result.input[0]).role, 'user');
+    assert.equal(asMessage(result.input[1]).role, 'user');
+  });
+
+  it('converts a mixed conversation into instructions + ordered input items', () => {
+    // A realistic filtered sequence (system + user + assistant-with-call
+    // + tool + user) must produce `instructions` plus the right ordered
+    // sequence of items: message(user) → message(assistant) →
+    // function_call → function_call_output → message(user).
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiSystem('system prompt'),
+      oaiUser('what is the weather'),
+      oaiAssistant({
+        content: 'let me check',
+        tool_calls: [
+          {
+            id: 'c1',
+            type: 'function',
+            function: { name: 'weather', arguments: '{"city":"NYC"}' },
+          },
+        ],
+      }),
+      oaiTool('c1', '72F sunny'),
+      oaiUser('thanks'),
+    ]);
+    assert.equal(result.instructions, 'system prompt');
+    assert.equal(result.input.length, 5);
+
+    assert.equal(asMessage(result.input[0]).role, 'user');
+    assert.equal(asMessage(result.input[1]).role, 'assistant');
+    // Assistant text uses output_text.
+    assert.equal(asMessage(result.input[1]).content[0].type, 'output_text');
+
+    assert.equal(result.input[2].type, 'function_call');
+    assert.equal(asFunctionCall(result.input[2]).call_id, 'c1');
+    assert.equal(result.input[3].type, 'function_call_output');
+    assert.equal(asFunctionCallOutput(result.input[3]).call_id, 'c1');
+
+    assert.equal(asMessage(result.input[4]).role, 'user');
+    assert.equal(asMessage(result.input[4]).content[0].type, 'input_text');
   });
 });
 
