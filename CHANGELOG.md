@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-29
+
+### Added
+- **Context filtering (ADR 0007, #39)** — new `src/contextFilter.ts` pure-function module with three user-selected levels: `off` (default, no filtering, zero overhead), `safe` (drop duplicate messages, remove empty content parts, trim whitespace, dedup tools, compact system-prompt whitespace), `aggressive` (safe + context-window truncation preserving system prompt + last user message, merge similar adjacent messages via Jaccard ≥ 0.8, strip non-essential metadata). Global setting `ollamaCloud.contextFilter.level` + per-connection override (`auto` inherits global). Binding tool-call-integrity rule: a dropped `tool_call` always drops its matching `tool_call_output` and vice versa. Vision content (`input_image`) never filtered. Endpoint-agnostic — runs before convert, both `/v1/responses` and `/chat/completions` benefit. Zero runtime dependencies preserved. 57 new tests.
+- **ADR 0007** — Context Filtering (Pre-Model Payload Processing). Nygard format, documents the three-level scheme, non-goals (no automatic mode, no semantic compaction, no tokenizer), and six rejected alternatives.
+
+### Fixed
+- **Endpoint fallback policy (#40)** — when `preferredEndpoint` is explicitly set (per-connection `responses`/`chat` OR a global setting the user actually configured), a 404 from that endpoint NO LONGER silently falls back. The provider throws `LanguageModelError.NotFound` with an actionable hint (switch to `auto` for fallback, or switch to the other endpoint). When `preferredEndpoint` is `auto` (default), the prior fallback + log-warning behaviour is preserved. Capability-cache short-circuit guard for explicit mode. `clearCapabilityCache()` on `preferredEndpoint` config change. Local Ollama unaffected (always `/chat/completions`).
+
+### Changed
+- **Comprehensive refactoring (#41)** — logging expanded from 63 to 79 `logger.*` calls across `src/`. Stream lifecycle logs (time-to-first-token, duration, chunk count, error class + status). Endpoint indicator in model picker tooltip (`Endpoint: /v1/responses` / `auto (resolves to ...)` / `/chat/completions (local)`), refreshed on config change. Token-usage audit: `formatUsageLog` now reports estimated tokens (char-based proxy) alongside server-reported usage, with a `delta=` line when the gap exceeds 20%. Convert-path drop/coerce diagnostics. Per-connection catalog sync logging. Retry decision logging with attempt + delay + error class. No status bar item (log + tooltip only, per owner decision). No behaviour change beyond richer logs and a longer tooltip.
+
 ## [0.6.1] - 2026-07-28
 
 ### Fixed
