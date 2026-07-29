@@ -5,6 +5,16 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-29
+
+### Added
+- **README documentation for context filtering** — new `## Context filtering` section (three levels, quality guarantees, configuration, observability), bullet in Key features, row in Configuration table. Consistent with ADR 0007.
+- **Provider integration tests for context filtering (#39 review)** — 4 cases: off fast-path (no filter log, unfiltered payload), per-connection safe override (runs the filter when global is off), aggressive truncation (preserves system + last user), tool-call integrity (safe refuses to drop/merge tool-bearing messages).
+- **Unit tests for `convertOpenAIMessagesToResponsesInput` (#39 review)** — 6 cases: filtered system hoisted to instructions, subsequent system messages dropped (first becomes instructions), tool-call integrity (1:1 `function_call` + matching `function_call_output` by `call_id`), vision `image_url` preserved as `input_image`, empty assistant message dropped, mixed conversation ordering.
+
+### Changed
+- Closed all deferred code-review findings from v0.7.0 (no finding left for follow-up): `chunkCount` increments in all three stream callbacks (#41 F2 — thinking-only and tool-call-only streams no longer log `chunks=0`); token-usage audit uses the pre-update `charsPerToken` (#41 F3 — request-time estimator, not the already-shifted EMA); `Stream error` test asserts `status=` for `HttpError` (#41 F4); redundant connection-lookup ternary collapsed in the endpoint tooltip resolver (#41 F5); per-request `convert audit` log line removed (#41 F6 — verdict is static, `requestChars` already rides on the `Endpoint selected` line).
+
 ## [0.7.0] - 2026-07-29
 
 ### Added
