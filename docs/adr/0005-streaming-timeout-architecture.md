@@ -58,7 +58,19 @@ Replace the single end-to-end 120 s timeout with three timers, each with a disti
 
 ### No mid-stream retry
 
-All three specialists agreed unanimously: do NOT retry mid-stream. POST `/chat/completions` is not idempotent — a retry bills the user twice and shows a duplicate prefix already displayed. This is consistent with ADR 0001 (provider-not-agent — the provider surfaces errors, it does not autonomously retry agent-style) and with `retry.ts:11-17`.
+**Revision 2026-08-03 (Architectural Committee):** the original rule is refined along a boundary the 2026-07-27 committee did not draw — the zero-chunk edge case.
+
+- **`chunksReceived > 0` — terminal, no retry (unchanged).** POST `/chat/completions` is not idempotent — a retry bills the user twice and shows a duplicate prefix already displayed. Consistent with ADR 0001 (provider-not-agent) and `retry.ts:11-17`. Original unanimous rejection (2026-07-27) holds for this case.
+- **`chunksReceived === 0` — retryable, narrow conditions (new).** When the request fails with ALL of:
+  1. `chunksReceived === 0`, AND
+  2. `data: [DONE]` was NOT received, AND
+  3. the error is a network-level socket close (not `InactivityTimeoutError`, not `MaxDurationError`, not `cancel`), AND
+  4. the stream reached the response body phase (HTTP 200 + headers received)
+
+  the request is retryable. Rationale: Ollama Cloud bills via the `usage` field emitted inside SSE/ndjson chunks — zero chunks received means zero billed tokens, so the non-idempotency argument that blocks `chunksReceived > 0` retry does not apply. A socket close at this point is semantically a connect-phase failure: the server accepted the request, opened the stream, but produced no output before dropping. `withRetry` may re-attempt, subject to the existing backoff policy.
+- **Edge case the refinement closes.** Today `ollamaClient.ts` ends the read loop with `if (!done) { flushToolCalls; onDone() }` — when the stream returns HTTP 200 + headers + no body (server opens connection, sends nothing, closes), `done` stays `false`, `chunksReceived` stays `0`, no error throws, `callbacks.onDone()` fires. The caller sees "successful" completion with no content. This is worse than double-billing: it silently masks a provider outage as a successful empty response. The revised rule routes this case to a retryable error instead of `onDone`, surfacing the failure.
+
+Full deliberation in committee contract: `~/.gcw/architectural-committee/2026-08-03-ollama-cloud-provider-stream-error-handling-contract.md`.
 
 ### Security invariants (must hold on implementation — verify before merge)
 
@@ -99,7 +111,7 @@ All three specialists agreed unanimously: do NOT retry mid-stream. POST `/chat/c
 | (D) Adaptive timeout | rejected | Not formalizable — any concrete implementation reduces to inactivity (B) plus a heuristic, which is strictly worse than a fixed threshold with a tunable clamp |
 | (E) Current + raise to 600 s | rejected | End-to-end timer does not reset on chunk arrival — still kills long reasoning. «Бездумное поднятие» — owner rejected |
 | (F) No timeout | rejected | Owner: «тупо убрать — антипаттерн». No budget protection, no dead-connection detection |
-| Mid-stream retry | rejected | POST `/chat/completions` is not idempotent — retry = double billing + duplicate prefix already shown to user. Unanimous rejection by all three specialists. Violates ADR 0001 (provider-not-agent) and `retry.ts:11-17` |
+| Mid-stream retry (chunks > 0) | rejected | POST `/chat/completions` is not idempotent — retry = double billing + duplicate prefix. Unanimous rejection (2026-07-27). Refined 2026-08-03: zero-chunk connect-phase socket-close is retryable (0 chunks = 0 billed tokens); see §"No mid-stream retry". Violates ADR 0001 and `retry.ts:11-17` for `chunks > 0` only |
 
 ## Spike results
 
