@@ -607,7 +607,7 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
       // Cloud defaults to /v1/responses (auto) so the reasoning
       // events flow through the responses client.
       connections: [
-        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'responses' },
       ],
     });
     originalFetch = global.fetch;
@@ -700,6 +700,23 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
 
   it('falls back to /chat/completions when /v1/responses returns 404 (no reasoning)', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Override to 'auto' for this test — it exercises fallback behaviour,
+    // not the explicit 'responses' the describe-block beforeEach sets.
+    // Phase 2: auto → native (/api/chat) first, 404 → fallback to /chat/completions.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
 
     let callCount = 0;
     global.fetch = (async (input: string | URL, init?: RequestInit) => {
@@ -707,7 +724,7 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
       const url = typeof input === 'string' ? input : input.toString();
       const body = init?.body ? JSON.parse(String(init.body)) : null;
       fetchCalls.push({ url, body });
-      // First call — /v1/responses → 404. Second call —
+      // First call — /api/chat (native) → 404 (Phase 2: auto resolves to native). Second call —
       // /chat/completions → success stream.
       if (callCount === 1) {
         return new Response(JSON.stringify({ error: { message: 'not found' } }), {
@@ -740,7 +757,7 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
 
     // Two fetches: /v1/responses (404) then /chat/completions.
     assert.equal(callCount, 2, 'fallback issued a second chat fetch');
-    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+    assert.ok(fetchCalls[0].url.endsWith('/api/chat'));
     assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
 
     // Only the chat text delta surfaces — no thinking parts on the
@@ -1177,7 +1194,7 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
     global.fetch = (async (input: string | URL, _init?: RequestInit) => {
       callCount += 1;
       const url = typeof input === 'string' ? input : input.toString();
-      // First call — /v1/responses → 404 (auto default is 'responses').
+      // First call — /v1/responses → 404 (auto default is 'native' (Phase 2 — endpoint routing)).
       // Second call — /chat/completions → success stream.
       const status = callCount === 1 ? 404 : 200;
       fetchCalls.push({ url, status });
@@ -1207,10 +1224,10 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
       token,
     );
 
-    // Two fetches: /v1/responses (404) then /chat/completions (200) —
+    // Two fetches: /api/chat (native, 404) then /chat/completions (200) —
     // the prior fallback behaviour is preserved in auto mode.
     assert.equal(callCount, 2, 'auto mode issued a fallback chat fetch');
-    assert.ok(fetchCalls[0].url.endsWith('/responses'));
+    assert.ok(fetchCalls[0].url.endsWith('/api/chat'));
     assert.equal(fetchCalls[0].status, 404);
     assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
     assert.equal(fetchCalls[1].status, 200);
@@ -1631,7 +1648,7 @@ describe('OllamaCloudChatProvider — stream lifecycle logs (Issue #41)', () => 
       // Cloud + auto resolves to /v1/responses — the only path that
       // emits `onThinking` (reasoning_summary_text.delta events).
       connections: [
-        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'responses' },
       ],
     });
 

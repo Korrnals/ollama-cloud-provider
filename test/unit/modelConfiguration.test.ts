@@ -105,6 +105,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions({ thinkingMode: 'enabled' }),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: true });
     });
@@ -114,6 +115,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions({ thinkingMode: 'disabled' }),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: false });
     });
@@ -123,6 +125,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions(),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: true });
     });
@@ -231,6 +234,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions({ thinkingMode: 'enabled' }),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: true });
     });
@@ -240,6 +244,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions({ thinkingMode: 'disabled' }),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: false });
     });
@@ -249,6 +254,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions(),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: true });
     });
@@ -258,6 +264,7 @@ describe('modelConfiguration.resolveModelRequestConfiguration', () => {
       const result = resolveModelRequestConfiguration(
         model,
         makeOptions({ thinkingMode: 'disabled' }),
+        'native',
       );
       assert.deepEqual(result.openaiBody, { think: false });
     });

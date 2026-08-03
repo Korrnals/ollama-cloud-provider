@@ -180,8 +180,8 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
     assert.equal(recorder.errors.length, 1, 'onError must fire on buffer overrun');
     assert.match(
       recorder.errors[0]!.message,
-      /SSE buffer exceeded/,
-      'error must mention the SSE buffer cap',
+      /stream buffer exceeded/,
+      'error must mention the stream buffer cap',
     );
 
     
