@@ -3,6 +3,13 @@
 **Date:** 2026-07-27
 **Status:** Accepted
 
+**Revision 2026-08-03 (Architectural Committee — endpoint routing):**
+The primary endpoint for cloud connections is now `native /api/chat` (the
+documented canonical endpoint per docs.ollama.com/cloud). `/v1/responses`
+and `/v1/chat/completions` remain as explicit opt-in via `preferredEndpoint`.
+`auto` for cloud resolves to `native`; `auto` for local stays `chat` (compat).
+See ADR 0009 for the full endpoint routing decision.
+
 ## Deciders
 
 - `@GCW: Tech Lead` (chair, engineering owner)
