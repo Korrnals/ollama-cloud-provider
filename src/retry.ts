@@ -82,6 +82,21 @@ export class MidStreamError extends Error {
 }
 
 /**
+ * Zero-byte socket close — the stream returned HTTP 200 + headers but
+ * the socket closed before any SSE/ndjson chunk arrived. Retriable by
+ * `withRetry`: zero chunks means zero billed tokens (Ollama Cloud bills
+ * via the `usage` field emitted inside chunks), so the non-idempotency
+ * argument that blocks mid-stream retry does not apply. See ADR 0005
+ * § "No mid-stream retry" (Revision 2026-08-03).
+ */
+export class ZeroByteSocketCloseError extends Error {
+  constructor() {
+    super('Ollama Cloud: stream closed before any chunk arrived');
+    this.name = 'ZeroByteSocketCloseError';
+  }
+}
+
+/**
  * Mid-stream silence — no chunk AND no `: keep-alive` SSE comment for
  * `requestInactivityTimeoutMs` after the first byte arrived. Terminal,
  * NOT retriable: POST `/chat/completions` is not idempotent, retrying
@@ -172,6 +187,7 @@ export function isRetriableHttpStatus(status: number): boolean {
  *
  * Retries on:
  * - {@link ConnectTimeoutError} — connect-phase timeout, retryable
+ * - {@link ZeroByteSocketCloseError} — 0-byte socket close, retryable
  * - {@link HttpError} with status 429 or >= 500
  * - `TypeError` (fetch failed — network error, DNS, connection refused)
  * - `AbortError` (timeout) — note: only meaningful when the abort signal
@@ -186,6 +202,9 @@ export function isRetriableHttpStatus(status: number): boolean {
  */
 export function defaultRetryOn(error: unknown): boolean {
   if (error instanceof ConnectTimeoutError) {
+    return true;
+  }
+  if (error instanceof ZeroByteSocketCloseError) {
     return true;
   }
   if (error instanceof InactivityTimeoutError) {

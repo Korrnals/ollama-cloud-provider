@@ -2,6 +2,7 @@ import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import {
   HttpError,
+  ZeroByteSocketCloseError,
   defaultRetryOn,
   httpErrorFromResponse,
   isRetriableHttpStatus,
@@ -124,6 +125,10 @@ describe('retry.withRetry — backoff', () => {
     const err = new Error('aborted');
     err.name = 'AbortError';
     assert.equal(defaultRetryOn(err), true);
+  });
+
+  it('returns true for ZeroByteSocketCloseError (0-byte socket close is retryable)', () => {
+    assert.strictEqual(defaultRetryOn(new ZeroByteSocketCloseError()), true);
   });
 
   it('does NOT retry when caller retryOn returns false (caller-cancel)', async () => {

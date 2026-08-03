@@ -39,6 +39,7 @@ import {
   InactivityTimeoutError,
   MaxDurationError,
   MidStreamError,
+  ZeroByteSocketCloseError,
   defaultRetryOn,
   httpErrorFromResponse,
   withRetry,
@@ -350,6 +351,14 @@ export class ResponsesClient {
       }
 
       if (!done) {
+        if (chunksReceived === 0) {
+          // ADR 0005 § No mid-stream retry (Revision 2026-08-03):
+          // 200 + headers + no body = server closed before any chunk.
+          // 0 chunks = 0 billed tokens. Surface as error, NOT silent
+          // onDone — silent empty success masks provider outage.
+          callbacks.onError(new ZeroByteSocketCloseError());
+          return;
+        }
         // Stream ended without `response.completed`. Treat as done —
         // the server closed the connection cleanly. (Distinct from
         // `/chat/completions`, where `[DONE]` is mandatory; the
@@ -375,6 +384,26 @@ export class ResponsesClient {
         }
         if (abortReason === 'connect') {
           callbacks.onError(new ConnectTimeoutError(connectTimeoutMs));
+          return;
+        }
+        // ADR 0005 § No mid-stream retry (Revision 2026-08-03) —
+        // bare socket close: AbortError with no abortReason tag AND
+        // zero chunks received means the connection dropped between
+        // the 200 + headers and the first body byte. This is the
+        // 0-byte socket close edge case. Surface as a typed error
+        // rather than the ambiguous silent `onDone`.
+        //
+        // LIMITATION: this catch is OUTSIDE the `withRetry` wrapper
+        // (which wraps only the initial `fetch` + status check). The
+        // reader loop runs after `withRetry` returned, so throwing
+        // `ZeroByteSocketCloseError` here does NOT trigger retry — it
+        // routes to `callbacks.onError`. Full retry would require
+        // restructuring `withRetry` to wrap `fetch + read-first-chunk`
+        // (move the reader loop's first iteration inside the wrapper).
+        // Deferred to a follow-up — surfacing as error already closes
+        // the «worse than double-billing» hole (silent empty success).
+        if (abortReason === null && chunksReceived === 0) {
+          callbacks.onError(new ZeroByteSocketCloseError());
           return;
         }
         callbacks.onDone();
