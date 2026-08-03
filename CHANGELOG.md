@@ -5,6 +5,21 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-03
+
+### Added
+- **Native `/api/chat` endpoint for cloud connections** — the extension now uses Ollama's native API (`/api/chat`) as the default for cloud connections, per [docs.ollama.com/cloud](https://docs.ollama.com/cloud). The native endpoint offers first-class `think` field (not vendor-extension), `tool_calls` with object arguments (not string fragments), full-event streaming (no partial accumulation), and Ollama-specific metrics (`total_duration`, `prompt_eval_count`, `eval_count`). See ADR 0009.
+- **4-way `preferredEndpoint` override** — the setting now accepts `auto`/`native`/`chat`/`responses`. `auto` resolves to `native` for cloud, `chat` for local. Users can explicitly choose any of the four. Per-connection `preferredEndpoint` overrides the global.
+
+### Changed
+- **Cloud default endpoint: `responses` → `native`** — `auto` for cloud connections now resolves to `/api/chat` (native) instead of `/v1/responses`. This is the documented canonical endpoint for Ollama Cloud. Existing users who relied on `/v1/responses` can set `preferredEndpoint: 'responses'` to restore the previous behaviour. See ADR 0006 revision + ADR 0009.
+- **`ollamaClient.ts` is now endpoint-format-aware** — accepts `endpointFormat: 'compat' | 'native'` parameter. Native path uses ndjson parser (`processNdjsonLine`), native request schema (`think` top-level, object tool args, `options` field), and `nativeBaseUrl` (`/api` not `/v1`).
+
+### Notes
+- Local Ollama connections are unaffected — `auto` for local stays `chat` (compat).
+- `visionFallback.ts` still uses `responses` (not migrated to native — separate slice).
+- Phase 1 (opt-in native) + Phase 2 (cloud default → native) + Phase 3 (ADR 0006 revision + ADR 0009) = complete endpoint routing feature.
+
 ## [0.7.3] - 2026-08-03
 
 ### Fixed
