@@ -287,6 +287,15 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
     toolCalling: true,
   },
   {
+    apiModel: 'kimi-k3',
+    family: 'kimi',
+    maxInputTokens: 262144,
+    maxOutputTokens: 262144,
+    imageInput: true,
+    toolCalling: true,
+    reasoning: true,
+  },
+  {
     apiModel: 'minimax-m2',
     family: 'minimax',
     maxInputTokens: 204800,
@@ -1172,8 +1181,9 @@ export function inferReasoning(id: string): boolean {
     return true;
   }
 
-  // Kimi: k2.5, k2.6, and k2-thinking support thinking
+  // Kimi: k2.5, k2.6, k2.7, k2-thinking, k3 support thinking
   if (
+    id.startsWith('kimi-k3') ||
     id.startsWith('kimi-k2.5') ||
     id.startsWith('kimi-k2.6') ||
     id.startsWith('kimi-k2.7') ||
