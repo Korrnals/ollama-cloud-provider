@@ -44,6 +44,64 @@ export interface OpenAICompatibleMessage {
   refusal?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 (2026-08-03 endpoint routing) — native `/api/chat` types.
+//
+// Native Ollama `/api/chat` uses a DIFFERENT message shape than the
+// OpenAI-compat `/chat/completions`:
+//   - `tool_calls[].function.arguments` is an OBJECT (not a string).
+//   - Vision images are a top-level `images: ["base64..."]` array on the
+//     user message (NOT `image_url` content parts).
+//   - `tools[].function.parameters` is the same shape as compat.
+//
+// The native message type is intentionally SEPARATE from
+// `OpenAICompatibleMessage` so the two wire formats never cross wires.
+// `convertMessagesToNative` produces `NativeChatMessage[]`; the
+// `OllamaClient` native path serialises them verbatim.
+// ---------------------------------------------------------------------------
+
+/**
+ * Native `/api/chat` tool call. `arguments` is an OBJECT (parsed), not
+ * a JSON string — the native endpoint accepts and returns object
+ * arguments directly (spike mnemos `1c8b86f3`).
+ */
+export interface NativeChatToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: Record<string, unknown>;
+  };
+}
+
+/**
+ * Native `/api/chat` tool definition. Same shape as
+ * `OpenAICompatibleTool` (kept as a distinct type so the two wire
+ * formats stay separable).
+ */
+export interface NativeChatTool {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+  };
+}
+
+/**
+ * Native `/api/chat` message. `content` is a string (native does not
+ * use content-part arrays — images go in `images`). `tool_calls` carry
+ * object arguments. `images` is a base64 (data-URL-stripped) array on
+ * user messages only.
+ */
+export interface NativeChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool';
+  content: string;
+  tool_call_id?: string;
+  tool_calls?: NativeChatToolCall[];
+  images?: string[];
+}
+
 export interface UsageInfo {
   inputTokens?: number;
   outputTokens?: number;

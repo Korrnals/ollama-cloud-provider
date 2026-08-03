@@ -32,8 +32,13 @@ export type ConnectionType = 'cloud' | 'local' | 'remote' | 'custom';
 
 /**
  * ADR 0006 — preferred endpoint selection. See `ConnectionConfig.preferredEndpoint`.
+ *
+ * Phase 1 (2026-08-03 endpoint routing) — added `'native'` for the
+ * Ollama native `/api/chat` endpoint (ndjson wire format, object tool
+ * arguments, `images[]` for vision). Opt-in only; `'auto'` still
+ * resolves to `'responses'` (default) or `'chat'`.
  */
-export type PreferredEndpoint = 'responses' | 'chat' | 'auto';
+export type PreferredEndpoint = 'responses' | 'chat' | 'native' | 'auto';
 
 /**
  * ADR 0007 — per-connection context-filter override.
@@ -523,6 +528,45 @@ function normalizePath(value: string): string {
  */
 export function openAiBaseUrl(connection: ConnectionConfig): string {
   return `${connection.baseUrl}${connection.openaiCompatiblePath}`;
+}
+
+/**
+ * Phase 1 of the 2026-08-03 endpoint-routing committee decision —
+ * returns the native Ollama base URL for a connection. The native
+ * `/api/chat` endpoint lives under `/api` (NOT `/v1`); the cloud
+ * default is `https://ollama.com/api`.
+ *
+ * Resolution:
+ *   - When `openaiCompatiblePath` is empty (cloud default), the
+ *     `baseUrl` already carries `/v1` — strip it and append `/api`.
+ *   - When `openaiCompatiblePath` is `/v1` (local Ollama pointed at
+ *     the root), drop the path and append `/api`.
+ *   - Otherwise fall back to `rootUrlForConnection` + `/api`.
+ *
+ * The returned URL does NOT end with a trailing slash. The caller
+ * (`OllamaClient` native mode) appends `/chat` to build the full
+ * request URL `${nativeBaseUrl}/chat`.
+ *
+ * SECURITY NOTE: the native base URL differs from the OpenAI-compat
+ * base URL whitelisted via `allowedBaseUrls` (e.g. `https://ollama.com/api`
+ * vs `https://ollama.com/v1`). `assertBaseUrlAllowedForConnection`
+ * accepts the native base URL when it shares the same origin as a
+ * whitelisted OpenAI base — see `configValidator.ts`.
+ */
+export function nativeBaseUrl(connection: ConnectionConfig): string {
+  const full = openAiBaseUrl(connection);
+  try {
+    const url = new URL(full);
+    // Strip `/v1` from the pathname (whether it came from baseUrl or
+    // openaiCompatiblePath), then append `/api`. Keeps the origin
+    // (host + port) intact so the security check can match it against
+    // the whitelisted OpenAI base.
+    url.pathname = (url.pathname.replace(/\/v1\/?$/, '') || '') + '/api';
+    return url.toString().replace(/\/+$/, '');
+  } catch {
+    // Non-URL baseUrl — best-effort strip + append.
+    return full.replace(/\/v1\/?$/, '').replace(/\/+$/, '') + '/api';
+  }
 }
 
 /**

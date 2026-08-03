@@ -312,11 +312,86 @@ export function assertBaseUrlAllowedForConnection(
   const normalized = normalizeBaseUrl(baseUrl);
   const allowed = connection.allowedBaseUrls.map(normalizeBaseUrl);
 
-  if (!allowed.includes(normalized)) {
-    throw new Error(
-      `Ollama Cloud: baseUrl '${normalized}' is not in the allowedBaseUrls whitelist for connection '${connection.id}'. Add it to the connection's allowedBaseUrls or use the connection's default baseUrl.`,
-    );
+  if (allowed.includes(normalized)) {
+    return;
   }
+
+  // Phase 1 of the 2026-08-03 endpoint-routing committee — the native
+  // `/api/chat` endpoint lives under a DIFFERENT path (`/api`) than the
+  // OpenAI-compat base (`/v1`) that the user whitelisted. The two share
+  // the same origin (host + port). Accept the native base URL when it
+  // shares the origin of any whitelisted OpenAI base AND its pathname
+  // is exactly `/api` — defence-in-depth: same origin, explicit native
+  // suffix, no wildcard. This does NOT broaden the whitelist to any
+  // path on the host; it grants exactly the native `/api` namespace
+  // the committee decision requires.
+  if (isNativeApiBaseAllowedForConnection(normalized, allowed)) {
+    return;
+  }
+
+  throw new Error(
+    `Ollama Cloud: baseUrl '${normalized}' is not in the allowedBaseUrls whitelist for connection '${connection.id}'. Add it to the connection's allowedBaseUrls or use the connection's default baseUrl.`,
+  );
+}
+
+/**
+ * Phase 1 (2026-08-03 endpoint routing) — returns true when `normalized`
+ * is a native `/api` base URL that shares the origin of a whitelisted
+ * OpenAI-compat base. The native `/api/chat` endpoint is the canonical
+ * cloud endpoint per the committee decision; the user whitelists the
+ * OpenAI-compat `/v1` base, so the native path must be admitted by
+ * origin-matching rather than by exact string match.
+ *
+ * Defence-in-depth constraints:
+ *   - `normalized` must end with `/api` (exact suffix — no `/api/foo`).
+ *   - The whitelisted entry must share the SAME origin (protocol +
+ *     host + port) as `normalized`.
+ *   - The whitelisted entry's pathname, after stripping `/v1`, must be
+ *     empty (root) — i.e. the whitelisted base was `<origin>/v1`. This
+ *     prevents a whitelist of `https://example.com/some/v1` from
+ *     granting `https://example.com/api`.
+ */
+function isNativeApiBaseAllowedForConnection(
+  normalized: string,
+  allowed: readonly string[],
+): boolean {
+  // The native base must end with `/api` and be longer than `/api`
+  // (i.e. it must have an origin in front of it).
+  if (!normalized.endsWith('/api') || normalized.length <= '/api'.length) {
+    return false;
+  }
+  let candidateOrigin: string;
+  let candidatePath: string;
+  try {
+    const candidate = new URL(normalized);
+    candidateOrigin = `${candidate.protocol}//${candidate.host}`;
+    candidatePath = candidate.pathname.replace(/\/+$/, '');
+  } catch {
+    return false;
+  }
+  if (candidatePath !== '/api') {
+    return false;
+  }
+  for (const entry of allowed) {
+    try {
+      const whitelisted = new URL(entry);
+      const whitelistedOrigin = `${whitelisted.protocol}//${whitelisted.host}`;
+      if (whitelistedOrigin !== candidateOrigin) {
+        continue;
+      }
+      const whitelistedPath = whitelisted.pathname.replace(/\/+$/, '');
+      // The whitelisted OpenAI base must be `<origin>/v1` — strip `/v1`
+      // and require the remainder to be empty (root). This prevents
+      // a sub-path whitelist from granting the root `/api`.
+      const remainder = whitelistedPath.replace(/\/v1\/?$/, '');
+      if (remainder === '') {
+        return true;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return false;
 }
 
 function normalizeBaseUrl(value: string): string {

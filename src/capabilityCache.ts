@@ -14,6 +14,14 @@ import { logger } from './logger.js';
 interface CapabilityEntry {
   responsesAvailable: boolean;
   chatAvailable: boolean;
+  /**
+   * Phase 1 (2026-08-03 endpoint routing) — native `/api/chat`
+   * capability. Tracked separately from the OpenAI-compat
+   * `/chat/completions` `chatAvailable` field because the two are
+   * distinct endpoints on the server (different path, different
+   * wire format); a 404 on one does not imply a 404 on the other.
+   */
+  nativeChatAvailable: boolean;
   checkedAt: number;
 }
 
@@ -64,6 +72,7 @@ export function markResponsesUnavailable(connectionId: string): void {
   cache.set(connectionId, {
     responsesAvailable: false,
     chatAvailable: existing?.chatAvailable ?? true,
+    nativeChatAvailable: existing?.nativeChatAvailable ?? true,
     checkedAt: Date.now(),
   });
   logger.info(
@@ -81,8 +90,56 @@ export function markResponsesAvailable(connectionId: string): void {
   cache.set(connectionId, {
     responsesAvailable: true,
     chatAvailable: existing?.chatAvailable ?? true,
+    nativeChatAvailable: existing?.nativeChatAvailable ?? true,
     checkedAt: Date.now(),
   });
+}
+
+/**
+ * Phase 1 (2026-08-03 endpoint routing) — Returns true when the
+ * connection is KNOWN to NOT support the native `/api/chat` endpoint
+ * (a prior 404 was memoized). Used by `provider.ts` to short-circuit
+ * the native path and to fire the explicit-mode error when the
+ * user chose `preferredEndpoint: 'native'` explicitly.
+ */
+export function isNativeChatKnownUnavailable(connectionId: string): boolean {
+  const entry = cache.get(connectionId);
+  return entry?.nativeChatAvailable === false;
+}
+
+/**
+ * Phase 1 — Memoize that the connection DOES support the native
+ * `/api/chat` endpoint (a request succeeded). Subsequent
+ * `isNativeChatKnownUnavailable` checks for this connection return
+ * false for the rest of the session.
+ */
+export function markNativeChatAvailable(connectionId: string): void {
+  const existing = cache.get(connectionId);
+  cache.set(connectionId, {
+    responsesAvailable: existing?.responsesAvailable ?? true,
+    chatAvailable: existing?.chatAvailable ?? true,
+    nativeChatAvailable: true,
+    checkedAt: Date.now(),
+  });
+}
+
+/**
+ * Phase 1 — Memoize that the connection does NOT support the native
+ * `/api/chat` endpoint (a 404 was observed). Subsequent
+ * `isNativeChatKnownUnavailable` checks for this connection return
+ * true for the rest of the session.
+ */
+export function markNativeChatUnavailable(connectionId: string): void {
+  const existing = cache.get(connectionId);
+  cache.set(connectionId, {
+    responsesAvailable: existing?.responsesAvailable ?? true,
+    chatAvailable: existing?.chatAvailable ?? true,
+    nativeChatAvailable: false,
+    checkedAt: Date.now(),
+  });
+  logger.info(
+    `Capability cache: /api/chat (native) marked unavailable for connection "${connectionId}"`,
+  );
 }
 
 /**
@@ -95,6 +152,7 @@ export function markChatUnavailable(connectionId: string): void {
   cache.set(connectionId, {
     responsesAvailable: existing?.responsesAvailable ?? true,
     chatAvailable: false,
+    nativeChatAvailable: existing?.nativeChatAvailable ?? true,
     checkedAt: Date.now(),
   });
   logger.info(
@@ -111,6 +169,7 @@ export function markChatAvailable(connectionId: string): void {
   cache.set(connectionId, {
     responsesAvailable: existing?.responsesAvailable ?? true,
     chatAvailable: true,
+    nativeChatAvailable: existing?.nativeChatAvailable ?? true,
     checkedAt: Date.now(),
   });
 }

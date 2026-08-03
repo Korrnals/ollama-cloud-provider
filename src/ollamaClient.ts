@@ -5,12 +5,15 @@ import {
   assertBaseUrlAllowedForConnection,
 } from './configValidator.js';
 import type { ConnectionConfig } from './connections.js';
+import { nativeBaseUrl } from './connections.js';
 import { httpRequest, type HttpResponseLike } from './httpClient.js';
 import { logger, redactSensitive } from './logger.js';
 import type {
   OpenAICompatibleMessage,
   OpenAICompatibleTool,
   OpenAICompatibleToolCall,
+  NativeChatMessage,
+  NativeChatTool,
   StreamCallbacks,
   UsageInfo,
 } from './protocolTypes.js';
@@ -76,6 +79,56 @@ interface OpenAIStreamChunk {
   error?: string;
 }
 
+/**
+ * Phase 1 (2026-08-03 endpoint routing) — selects the wire format
+ * `OllamaClient` uses for `/chat` requests.
+ *
+ *   - `'compat'` (default, backward-compatible) — OpenAI-compatible
+ *     `/chat/completions` SSE stream. Existing callers keep working.
+ *   - `'native'` — Ollama native `/api/chat` ndjson stream. Top-level
+ *     `think`, object-argument `tool_calls`, full-event streaming.
+ *
+ * See the architectural contract
+ * `2026-08-03-ollama-cloud-provider-endpoint-routing-contract.md` §5.1.
+ */
+export type EndpointFormat = 'compat' | 'native';
+
+/**
+ * Phase 1 — native `/api/chat` ndjson chunk. One JSON object per line.
+ * The terminal chunk carries `done: true`. Tool calls arrive as a
+ * single full-event with `function.arguments` as an OBJECT (not a
+ * string), so NO pendingToolCalls accumulation is needed.
+ *
+ * See spike mnemos `1c8b86f3` for the confirmed shape.
+ */
+interface NativeChatChunk {
+  model?: string;
+  created_at?: string;
+  message?: {
+    role?: string;
+    content?: string;
+    thinking?: string;
+    tool_calls?: Array<{
+      id?: string;
+      type?: string;
+      function?: {
+        name?: string;
+        arguments?: Record<string, unknown>;
+      };
+    }>;
+  };
+  done?: boolean;
+  done_reason?: string;
+  error?: string;
+  // Native usage uses prompt_eval_count / eval_count (Ollama schema).
+  prompt_eval_count?: number;
+  eval_count?: number;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_duration?: number;
+  eval_duration?: number;
+}
+
 export class OllamaClient {
   /**
    * Optional connection the client is bound to. When set, every fetch
@@ -87,12 +140,22 @@ export class OllamaClient {
    */
   private readonly connection: ConnectionConfig | undefined;
 
+  /**
+   * Phase 1 (2026-08-03 endpoint routing) — wire format used by
+   * `streamChat`. `'compat'` (default) preserves the OpenAI-compat
+   * `/chat/completions` SSE behaviour; `'native'` switches to the
+   * Ollama native `/api/chat` ndjson behaviour.
+   */
+  private readonly endpointFormat: EndpointFormat;
+
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
     connection?: ConnectionConfig,
+    endpointFormat: EndpointFormat = 'compat',
   ) {
     this.connection = connection;
+    this.endpointFormat = endpointFormat;
   }
 
   /**
@@ -109,6 +172,29 @@ export class OllamaClient {
   }
 
   /**
+   * Phase 1 — returns the native `/api/chat` URL. When bound to a
+   * connection, derives the native base from the connection's
+   * OpenAI-compat base via `nativeBaseUrl(connection)`; otherwise
+   * strips `/v1` from the legacy `baseUrl` and appends `/api`.
+   */
+  private nativeChatUrl(): string {
+    if (this.connection) {
+      return `${nativeBaseUrl(this.connection)}/chat`;
+    }
+    return `${this.baseUrl.replace(/\/v1\/?$/, '').replace(/\/+$/, '')}/api/chat`;
+  }
+
+  /**
+   * Returns the effective fetch URL for `streamChat` based on
+   * `endpointFormat`. Used by the connect-phase fetch wrapper.
+   */
+  private chatUrl(): string {
+    return this.endpointFormat === 'native'
+      ? this.nativeChatUrl()
+      : this.chatCompletionsUrl();
+  }
+
+  /**
    * Per-connection whitelist gate. Throws synchronously when the
    * resolved baseUrl is not in the connection's whitelist (or the
    * global whitelist when no connection is bound). The catch block
@@ -116,10 +202,15 @@ export class OllamaClient {
    */
   private assertBaseUrlAllowedOrThrow(): void {
     if (this.connection) {
-      assertBaseUrlAllowedForConnection(
-        this.connection.baseUrl + this.connection.openaiCompatiblePath,
-        this.connection,
-      );
+      // Phase 1 — check the EFFECTIVE base (compat OpenAI base or native
+      // `/api` base). `assertBaseUrlAllowedForConnection` admits the
+      // native `/api` base when it shares the origin of a whitelisted
+      // `/v1` base (same-origin, defence-in-depth — see configValidator).
+      const effectiveBase =
+        this.endpointFormat === 'native'
+          ? nativeBaseUrl(this.connection)
+          : this.connection.baseUrl + this.connection.openaiCompatiblePath;
+      assertBaseUrlAllowedForConnection(effectiveBase, this.connection);
     } else {
       assertBaseUrlAllowed(this.baseUrl);
     }
@@ -128,8 +219,21 @@ export class OllamaClient {
   async streamChat(
     request: {
       model: string;
-      messages: OpenAICompatibleMessage[];
-      tools?: OpenAICompatibleTool[];
+      /**
+       * Messages in the wire format matching `endpointFormat`. For
+       * `'compat'` (default): `OpenAICompatibleMessage[]`. For
+       * `'native'`: `NativeChatMessage[]` (object tool-call arguments,
+       * `images[]` for vision). The caller (provider) is responsible
+       * for converting via `convertMessagesToOpenAI` /
+       * `convertMessagesToNative` before calling.
+       */
+      messages: OpenAICompatibleMessage[] | NativeChatMessage[];
+      /**
+       * Tools in the wire format matching `endpointFormat`. For
+       * `'compat'`: `OpenAICompatibleTool[]`. For `'native'`:
+       * `NativeChatTool[]`.
+       */
+      tools?: OpenAICompatibleTool[] | NativeChatTool[];
       tool_choice?: 'auto' | 'required' | 'none';
       extraBody?: Record<string, unknown>;
     },
@@ -217,12 +321,14 @@ export class OllamaClient {
       this.assertBaseUrlAllowedOrThrow();
 
       const { extraBody, ...baseRequest } = request;
-      const body = JSON.stringify({
-        ...baseRequest,
-        ...extraBody,
-        stream: true,
-        stream_options: { include_usage: true },
-      });
+      const body = this.endpointFormat === 'native'
+        ? JSON.stringify(buildNativeRequestBody(baseRequest, extraBody))
+        : JSON.stringify({
+          ...baseRequest,
+          ...extraBody,
+          stream: true,
+          stream_options: { include_usage: true },
+        });
 
       // Issue 13 / ADR 0005 — retry the INITIAL CONNECTION only.
       // `withRetry` wraps just the `fetch` + status check; the body
@@ -317,7 +423,7 @@ export class OllamaClient {
             if (this.apiKey) {
               headers.Authorization = `Bearer ${this.apiKey}`;
             }
-            const res = await httpRequest(this.chatCompletionsUrl(), {
+            const res = await httpRequest(this.chatUrl(), {
               method: 'POST',
               headers,
               body,
@@ -385,6 +491,16 @@ export class OllamaClient {
       const decoder = new TextDecoder();
       let buffer = '';
 
+      // Phase 1 — native mode uses ndjson parsing (no pendingToolCalls
+      // accumulation: tool_calls arrive as one full-event with object
+      // arguments). Compat mode keeps the SSE + pendingToolCalls path.
+      const processLineForFormat = (line: string): boolean => {
+        if (this.endpointFormat === 'native') {
+          return processNdjsonLine(line, callbacks);
+        }
+        return processLine(line, pendingToolCalls, callbacks, resetInactivity);
+      };
+
       while (true) {
         if (cancellationToken?.isCancellationRequested) {
           controller.abort();
@@ -404,25 +520,21 @@ export class OllamaClient {
         resetInactivity();
 
         buffer += decoder.decode(chunk.value, { stream: true });
-        // MEDIUM-2 — unbounded SSE buffer is a DoS vector. A malformed
+        // MEDIUM-2 — unbounded stream buffer is a DoS vector. A malformed
         // or hostile stream that never emits a newline would grow
         // `buffer` without limit. Cap at 1 MiB; if exceeded, abort with
         // an error rather than continuing to accumulate memory.
+        // (Phase 1: applies to BOTH SSE and ndjson — format-agnostic.)
         if (buffer.length > MAX_SSE_BUFFER_BYTES) {
           throw new Error(
-            `Ollama Cloud: SSE buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a newline; aborting to prevent unbounded memory growth.`,
+            `Ollama Cloud: stream buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a newline; aborting to prevent unbounded memory growth.`,
           );
         }
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          const stop = processLine(
-            line,
-            pendingToolCalls,
-            callbacks,
-            resetInactivity,
-          );
+          const stop = processLineForFormat(line);
           if (stop) {
             done = true;
             break;
@@ -438,12 +550,7 @@ export class OllamaClient {
         buffer += decoder.decode();
         if (buffer) {
           for (const line of buffer.split(/\r?\n/)) {
-            const stop = processLine(
-              line,
-              pendingToolCalls,
-              callbacks,
-              resetInactivity,
-            );
+            const stop = processLineForFormat(line);
             if (stop) {
               done = true;
               break;
@@ -458,10 +565,16 @@ export class OllamaClient {
           // 200 + headers + no body = server closed before any chunk.
           // 0 chunks = 0 billed tokens. Surface as retryable error, NOT
           // silent onDone — silent empty success masks provider outage.
+          // (Phase 1: format-agnostic — applies to SSE AND ndjson.)
           callbacks.onError(new ZeroByteSocketCloseError());
           return;
         }
-        flushToolCalls(pendingToolCalls, callbacks);
+        // Phase 1 — native mode emits tool_calls as a full-event (no
+        // accumulation), so there is nothing to flush. Compat mode
+        // flushes accumulated pending tool calls before onDone.
+        if (this.endpointFormat !== 'native') {
+          flushToolCalls(pendingToolCalls, callbacks);
+        }
         callbacks.onDone();
       }
     } catch (error) {
@@ -653,6 +766,149 @@ function flushToolCalls(
     });
   }
   pendingToolCalls.clear();
+}
+
+/**
+ * Phase 1 (2026-08-03 endpoint routing) — builds the native `/api/chat`
+ * request body. Differs from the OpenAI-compat body:
+ *
+ *   - `stream: true` (no `stream_options` — native has no per-chunk
+ *     usage; usage arrives on the terminal `done: true` chunk).
+ *   - `messages` and `tools` are shaped by `convertMessagesToNative` /
+ *     `convertToolsToNative` BEFORE reaching the client (the provider
+ *     passes the already-converted objects in `request.messages` /
+ *     `request.tools`). The client only adds `stream` here.
+ *   - `extraBody` (e.g. `think`, `options`) merges top-level — the
+ *     `modelConfiguration` native path emits `think` /
+ *     `options` directly in `extraBody.openaiBody`.
+ *
+ * `tool_choice` passes through unchanged (native accepts the same
+ * `'auto' | 'required' | 'none'` values).
+ */
+function buildNativeRequestBody(
+  baseRequest: {
+    model: string;
+    messages: OpenAICompatibleMessage[] | NativeChatMessage[];
+    tools?: OpenAICompatibleTool[] | NativeChatTool[];
+    tool_choice?: 'auto' | 'required' | 'none';
+  },
+  extraBody: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    ...baseRequest,
+    stream: true,
+  };
+  if (extraBody) {
+    for (const [key, value] of Object.entries(extraBody)) {
+      body[key] = value;
+    }
+  }
+  return body;
+}
+
+/**
+ * Phase 1 — parses one ndjson line of a native `/api/chat` stream.
+ *
+ * Native ndjson: one JSON object per line, NO `data:` prefix, NO
+ * `[DONE]` marker. The terminal chunk carries `done: true`. Tool calls
+ * arrive as a SINGLE full-event with `function.arguments` as an OBJECT
+ * (not a string) — so NO `pendingToolCalls` accumulation is needed
+ * (spike mnemos `1c8b86f3`).
+ *
+ * Returns `true` when the stream is terminal (the caller stops reading
+ * after a terminal line); `false` to continue.
+ *
+ * Error handling mirrors `processLine`:
+ *   - `{"error":"..."}` → throw `MidStreamError` (surfaces via the
+ *     outer catch → `classifyStreamError` in the provider).
+ *   - JSON parse failure on a non-empty line → log + skip (defence
+ *     against a partial final line; same posture as the SSE path).
+ *   - Empty line → skip (ndjson separators are bare `\n`).
+ */
+function processNdjsonLine(
+  line: string,
+  callbacks: StreamCallbacks,
+): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  let chunk: NativeChatChunk;
+  try {
+    chunk = JSON.parse(trimmed) as NativeChatChunk;
+  } catch (error) {
+    // A partial or non-JSON ndjson line is unexpected for native
+    // (ndjson is one full JSON object per line), but a trailing partial
+    // line on a dropped connection is possible. Log redacted and skip
+    // — do NOT abort the stream. Mirrors the SSE path's posture.
+    logger.warn(
+      'Failed to parse Ollama native /api/chat ndjson line (skipping).',
+      trimmed.slice(0, 200),
+      error,
+    );
+    return false;
+  }
+
+  if (typeof chunk.error === 'string' && chunk.error) {
+    throw new MidStreamError(chunk.error);
+  }
+
+  // Native usage arrives on the terminal chunk (prompt_eval_count /
+  // eval_count). Emit when present.
+  const usage = mapNativeUsage(chunk);
+  if (usage) {
+    callbacks.onUsage?.(usage);
+  }
+
+  const message = chunk.message;
+  if (message) {
+    if (message.thinking) {
+      callbacks.onThinking?.(message.thinking);
+    }
+    if (message.content) {
+      callbacks.onText(message.content);
+    }
+    // Native tool_calls: FULL-EVENT, object arguments. Emit each call
+    // immediately — NO pendingToolCalls accumulation.
+    if (message.tool_calls) {
+      for (const toolCall of message.tool_calls) {
+        const id = toolCall.id ?? '';
+        const name = toolCall.function?.name ?? '';
+        const input =
+          (toolCall.function?.arguments as Record<string, unknown> | undefined) ??
+          {};
+        callbacks.onToolCall({ id, name, input });
+      }
+    }
+  }
+
+  // Terminal chunk: `done: true`. No `[DONE]` marker in native ndjson.
+  if (chunk.done === true) {
+    callbacks.onDone();
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Phase 1 — maps native `/api/chat` usage fields to `UsageInfo`. Native
+ * Ollama uses `prompt_eval_count` / `eval_count` (NOT `prompt_tokens` /
+ * `completion_tokens`). Returns `undefined` when no counts are present
+ * (e.g. intermediate chunks before the terminal `done: true` chunk).
+ */
+function mapNativeUsage(chunk: NativeChatChunk): UsageInfo | undefined {
+  const inputTokens = chunk.prompt_eval_count;
+  const outputTokens = chunk.eval_count;
+  if (inputTokens === undefined && outputTokens === undefined) {
+    return undefined;
+  }
+  const totalTokens =
+    inputTokens !== undefined && outputTokens !== undefined
+      ? inputTokens + outputTokens
+      : undefined;
+  return { inputTokens, outputTokens, totalTokens };
 }
 
 /**
