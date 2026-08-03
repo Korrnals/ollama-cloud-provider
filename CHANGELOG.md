@@ -5,6 +5,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-08-03
+
+### Fixed
+- **Zero-byte socket close** — new `ZeroByteSocketCloseError` class in `src/retry.ts` (retryable: 0 chunks = 0 billed tokens, per Ollama Cloud's chunk-based billing). `ollamaClient.ts` and `responsesClient.ts` now surface this error instead of silently calling `onDone` when the server returns HTTP 200 + headers + no body. Closes the "worse than double-billing" hole where a provider outage was masked as a successful empty response. ADR 0005 § "No mid-stream retry" revised (2026-08-03 Architectural Committee): the rule now distinguishes `chunksReceived > 0` (terminal, no retry) from `chunksReceived === 0` (retryable, narrow conditions).
+- **HTTP 402/403/429/5xx now surface the server's actual error message** — `classifyStreamError` in `src/provider.ts` prepends the server's `error.message` (extracted from the `{"error":"..."}` body) instead of overwriting with a generic Russian fallback. Users now see the real reason (e.g. "this model uses extra usage only, add extra usage or turn on auto-reload") with a link to ollama.com/settings, not a generic "уменьшите контекст" suggestion.
+
+### Changed
+- **Release script (`scripts/local-ci/run-release-local.sh`)** — Step 2 no longer wipes all VSIX in `releases/`; it removes only the current-version VSIX (defence-in-depth against stale same-version repackaging). Rollback VSIX for other versions are preserved. Step 4 (cosign L2 signing) degrades gracefully on any cosign failure (warn + continue) instead of aborting the release; switched from deprecated `--output-signature` to `--bundle` format.
+
+### Notes
+- Completes the stream-error-handling hotfix cycle (Phase 3 of the 2026-08-03 Architectural Committee decision; Phases 1, 2, 4 shipped in v0.7.2).
+- Endpoint routing (native `/api/chat` for cloud) is the next slice — separate feature, not a hotfix.
+
 ## [0.7.2] - 2026-08-03
 
 ### Fixed
