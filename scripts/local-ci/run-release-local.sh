@@ -402,10 +402,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: git tag -a '$VERSION' -m 'Release $VERSION_NUM'"
 else
   if git rev-parse "$VERSION" >/dev/null 2>&1; then
-    fail 7 "tag $VERSION already exists — refusing to overwrite. Bump package.json version or pick a different tag."
+    warn "tag $VERSION already exists — skipping tag creation (release will use existing tag)"
+  else
+    git tag -a "$VERSION" -m "Release $VERSION_NUM" \
+      || fail 7 "git tag creation failed"
+    ok "Annotated git tag $VERSION created"
   fi
-  git tag -a "$VERSION" -m "Release $VERSION_NUM" \
-    || fail 7 "git tag creation failed"
 fi
 ok "Tag $VERSION ready (local only; pushed in step 9)"
 echo
@@ -491,7 +493,7 @@ echo
 step 10 "Create GitHub Release and upload artifacts"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: gh release create '$VERSION' --title '$VERSION' --notes-file '$NOTES_FILE'"
-  echo "  would upload: $VSIX_FILE, $SHA256_FILE, ${SHA256_FILE}.sig (if exists), ${SHA256_FILE}.asc, ${VSIX_FILE}.sig (if exists), $SBOM_FILE"
+    echo "  would upload: $VSIX_FILE, $SHA256_FILE, ${SHA256_FILE}.asc, ${VSIX_FILE}.sigstore.bundle, ${SHA256_FILE}.sigstore.bundle, $SBOM_FILE"
 else
   if ! command -v gh >/dev/null 2>&1; then
     fail 10 "gh CLI not installed — cannot create GitHub Release. Install: https://cli.github.com/"
@@ -503,7 +505,7 @@ else
 
   # Upload from releases/ — all artefacts are already staged there.
   UPLOAD_ARGS=()
-  for f in "$VSIX_FILE" "$SHA256_FILE" "${SHA256_FILE}.sig" "${SHA256_FILE}.asc" "${VSIX_FILE}.sig" "$SBOM_FILE"; do
+  for f in "$VSIX_FILE" "$SHA256_FILE" "${SHA256_FILE}.asc" "${VSIX_FILE}.sigstore.bundle" "${SHA256_FILE}.sigstore.bundle" "$SBOM_FILE"; do
     [ -f "$f" ] && UPLOAD_ARGS+=("$f")
   done
   if [ "${#UPLOAD_ARGS[@]}" -gt 0 ]; then
