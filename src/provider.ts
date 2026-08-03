@@ -3,7 +3,9 @@ import { AuthManager } from './auth.js';
 import {
   countOpenAIRequestChars,
   convertMessagesToOpenAI,
+  convertMessagesToNative,
   convertToolsToOpenAI,
+  convertToolsToNative,
   getMessageText,
   hasImageParts,
 } from './convert.js';
@@ -32,14 +34,21 @@ import {
 import {
   clearCapabilityCache,
   isChatKnownUnavailable,
+  isNativeChatKnownUnavailable,
   isResponsesKnownUnavailable,
   markChatAvailable,
   markChatUnavailable,
+  markNativeChatAvailable,
+  markNativeChatUnavailable,
   markResponsesAvailable,
   markResponsesUnavailable,
 } from './capabilityCache.js';
 import { HttpError, MidStreamError } from './retry.js';
-import { loadConnections, openAiBaseUrl } from './connections.js';
+import {
+  loadConnections,
+  nativeBaseUrl,
+  openAiBaseUrl,
+} from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
 import type { OpenAICompatibleTool, UsageInfo } from './protocolTypes.js';
@@ -56,9 +65,14 @@ const PROVIDER_TOOLTIP = 'Ollama Cloud';
  *   - local connection        → `/chat/completions (local)`
  *   - explicit `responses`    → `/v1/responses`
  *   - explicit `chat`         → `/chat/completions`
+ *   - explicit `native`       → `/api/chat (native)`
  *   - `auto` (default)        → `auto (resolves to /v1/responses)` when
  *     the global `preferredEndpoint` is the default `'responses'`,
  *     otherwise `auto (resolves to /chat/completions)`.
+ *
+ * Phase 1 (2026-08-03 endpoint routing) — `'native'` is a third
+ * explicit option. `'auto'` still resolves to `'responses'` or
+ * `'chat'` (NOT `'native'`), so the default behaviour is unchanged.
  *
  * The label is deliberately short and contains no host or auth material
  * so it is safe to surface in a tooltip and in the output log.
@@ -74,11 +88,14 @@ function resolveEndpointLabel(connection: ConnectionConfig | undefined): string 
   if (preferred === 'chat') {
     return '/chat/completions';
   }
+  if (preferred === 'native') {
+    return '/api/chat (native)';
+  }
   // auto — resolves against the global setting.
   const globalPreferred = vscode.workspace
     .getConfiguration('ollamaCloud')
-    .get<'responses' | 'chat'>('preferredEndpoint', 'responses');
-  return `auto (resolves to ${globalPreferred === 'chat' ? '/chat/completions' : '/v1/responses'})`;
+    .get<'responses' | 'chat' | 'native'>('preferredEndpoint', 'responses');
+  return `auto (resolves to ${globalPreferred === 'chat' ? '/chat/completions' : globalPreferred === 'native' ? '/api/chat (native)' : '/v1/responses'})`;
 }
 
 /**
@@ -91,12 +108,17 @@ function resolveEndpointLabel(connection: ConnectionConfig | undefined): string 
  * chat participant that invoked the model.
  */
 function endpointExplicitUnavailableError(
-  primaryEndpoint: 'responses' | 'chat',
+  primaryEndpoint: 'responses' | 'chat' | 'native',
   connectionId: string,
 ): vscode.LanguageModelError {
   if (primaryEndpoint === 'responses') {
     return vscode.LanguageModelError.NotFound(
       `Endpoint /v1/responses returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "chat".`,
+    );
+  }
+  if (primaryEndpoint === 'native') {
+    return vscode.LanguageModelError.NotFound(
+      `Endpoint /api/chat (native) returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "chat" or "responses".`,
     );
   }
   return vscode.LanguageModelError.NotFound(
@@ -572,22 +594,29 @@ export class OllamaCloudChatProvider
       // set, vs. only `defaultValue`). `'auto'` per-connection inherits
       // the global explicitness.
       const globalConfig = vscode.workspace.getConfiguration('ollamaCloud');
-      const globalInspection = globalConfig.inspect<'responses' | 'chat' | 'auto'>('preferredEndpoint');
+      const globalInspection = globalConfig.inspect<'responses' | 'chat' | 'native' | 'auto'>('preferredEndpoint');
       const globalPreferredExplicit =
         globalInspection?.globalValue !== undefined ||
         globalInspection?.workspaceValue !== undefined ||
         globalInspection?.workspaceFolderValue !== undefined;
-      const globalPreferred = globalConfig.get<'responses' | 'chat'>(
+      // Phase 2 (2026-08-03 endpoint routing) — `auto` for cloud now
+      // resolves to `native` (the documented canonical endpoint per
+      // docs.ollama.com/cloud). `auto` for local stays `chat` (compat).
+      // Users can still explicitly choose `responses`/`chat`/`native` to
+      // override. The capability cache + 404 fallback (native → chat)
+      // covers connections that don't support `/api/chat`.
+      const globalPreferred = globalConfig.get<'responses' | 'chat' | 'native'>(
         'preferredEndpoint',
-        'responses',
+        'native',
       );
       const isPreferredEndpointExplicit =
         !isLocal &&
         (connectionPreferred === 'responses' ||
           connectionPreferred === 'chat' ||
+          connectionPreferred === 'native' ||
           (connectionPreferred === 'auto' && globalPreferredExplicit));
 
-      const primaryEndpoint: 'responses' | 'chat' =
+      const primaryEndpoint: 'responses' | 'chat' | 'native' =
         isLocal
           ? 'chat'
           : connectionPreferred === 'auto'
@@ -724,6 +753,83 @@ export class OllamaCloudChatProvider
           `Explicit /chat/completions cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
         );
         throw endpointExplicitUnavailableError('chat', connectionId);
+      }
+      // Phase 1 — native short-circuit guard (mirrors the chat one).
+      if (
+        isPreferredEndpointExplicit &&
+        primaryEndpoint === 'native' &&
+        isNativeChatKnownUnavailable(connectionId)
+      ) {
+        logger.info(
+          `Explicit /api/chat (native) cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+        );
+        throw endpointExplicitUnavailableError('native', connectionId);
+      }
+
+      // Phase 1 (2026-08-03 endpoint routing) — native `/api/chat`
+      // path. Opt-in only: triggered by explicit `preferredEndpoint:
+      // 'native'` (per-connection or global). `auto` never resolves
+      // to `native`, so this block is only reached when the user
+      // explicitly chose native. On 404 with explicit mode, throw the
+      // actionable error (no silent fallback). The native path is
+      // reached BEFORE the responses/chat blocks so an explicit
+      // `native` choice never accidentally routes to `/v1/responses`
+      // or `/chat/completions` first.
+      if (primaryEndpoint === 'native' && !isNativeChatKnownUnavailable(connectionId)) {
+        try {
+          // When `endpointConnection` is defined (the normal case — at
+          // least one of `connection` / `cloudConnection` exists for any
+          // valid model id), pass the native base URL explicitly via
+          // `nativeBaseUrl` so the request lands on `/api/chat`. When
+          // `endpointConnection` is undefined (a stale connection id
+          // pointing at a deleted connection), fall back to the legacy
+          // `clientBaseUrl` and let `OllamaClient.nativeChatUrl` strip
+          // `/v1` and append `/api/chat` itself.
+          const nativeClient = new OllamaClient(
+            endpointConnection ? nativeBaseUrl(endpointConnection) : clientBaseUrl,
+            apiKey ?? '',
+            endpointConnection,
+            'native',
+          );
+          const nativeMessages = convertMessagesToNative(messages);
+          const nativeTools = convertToolsToNative(options.tools);
+          const nativeConfig = resolveModelRequestConfiguration(model, modelOptions, 'native');
+          await this.runStream(
+            (callbacks) =>
+              nativeClient.streamChat(
+                {
+                  model: model.apiModel ?? model.id,
+                  messages: nativeMessages,
+                  ...(nativeTools !== undefined ? { tools: nativeTools } : {}),
+                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                  extraBody: nativeConfig.openaiBody,
+                },
+                callbacks,
+                token,
+              ),
+            progress,
+            model,
+            requestChars,
+            () => markNativeChatAvailable(connectionId),
+          );
+          return; // success — no fallback needed
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            markNativeChatUnavailable(connectionId);
+            if (isPreferredEndpointExplicit) {
+              logger.info(
+                `Explicit /api/chat (native) 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+              );
+              throw endpointExplicitUnavailableError('native', connectionId);
+            }
+            logger.info(
+              `Auto-mode fallback: /api/chat returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
+            );
+            // fall through to the /chat/completions path below
+          } else {
+            throw error; // non-404 — surface, no fallback (no double billing)
+          }
+        }
       }
 
       if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {

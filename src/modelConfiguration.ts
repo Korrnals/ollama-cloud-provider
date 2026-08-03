@@ -1,6 +1,13 @@
 import * as vscode from 'vscode';
 import type { ModelDefinition } from './modelCatalog.js';
 
+// Phase 1 (2026-08-03 endpoint routing) — the wire format the
+// resolved configuration targets. `'compat'` (default) keeps the
+// existing vendor-extension thinking fields (`thinking: {type}`,
+// `reasoning_effort`); `'native'` emits the Ollama-native top-level
+// `think` field (`true | 'high' | 'medium' | 'low' | 'max'`).
+export type EndpointFormat = 'compat' | 'native';
+
 // DeepSeek V4 supports reasoning_effort with levels high/max only.
 // Low and medium are mapped to high by the API. Off disables thinking.
 const DEEPSEEK_V4_SCHEMA = {
@@ -112,47 +119,60 @@ export function getModelConfigurationSchema(
 export function resolveModelRequestConfiguration(
   model: ModelDefinition,
   options: ModelConfigurationOptions,
+  endpointFormat: EndpointFormat = 'compat',
 ): ResolvedModelRequestConfiguration {
   if (!model.reasoning) {
     return {};
   }
 
-  // DeepSeek V4 sends reasoning_effort + thinking wrapper
+  // DeepSeek V4 sends reasoning_effort + thinking wrapper (compat) or
+  // native `think` levels (native).
   if (model.family === 'deepseek' && isDeepSeekV4(model.apiModel)) {
-    return resolveDeepSeekV4(options);
+    return resolveDeepSeekV4(options, endpointFormat);
   }
 
   // DeepSeek v3.1 sends think boolean
   if (model.family === 'deepseek') {
-    return resolveDeepSeekV3_1(options);
+    return resolveDeepSeekV3_1(options, endpointFormat);
   }
 
   switch (model.family) {
     case 'glm':
-      return resolveGlm(options);
+      return resolveGlm(options, endpointFormat);
     case 'kimi':
     case 'gemma':
-      return resolveKimi(options);
+      return resolveKimi(options, endpointFormat);
     case 'qwen':
     case 'gemini':
-      return resolveQwen(options);
+      return resolveQwen(options, endpointFormat);
     case 'gpt-oss':
-      return resolveGptOss(options);
+      return resolveGptOss(options, endpointFormat);
     case 'cogito':
     case 'nemotron':
     case 'ministral':
     case 'minimax':
-      return resolveBooleanThink(options);
+      return resolveBooleanThink(options, endpointFormat);
     default:
       return {};
   }
 }
 
 // DeepSeek V4: reasoning_effort (none/high/max) with thinking type
+// (compat) OR native `think` levels (none→false, high→'high', max→'max').
 function resolveDeepSeekV4(
   options: ModelConfigurationOptions,
+  endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
   const effort = readStringOption(options, 'reasoningEffort');
+  if (endpointFormat === 'native') {
+    // Native `/api/chat` top-level `think` field. DeepSeek V4 levels
+    // map: none → false (disable), high → 'high', max → 'max'. The
+    // native field accepts boolean | 'low' | 'medium' | 'high' | 'max'.
+    if (effort === 'none') {
+      return { openaiBody: { think: false } };
+    }
+    return { openaiBody: { think: effort === 'max' ? 'max' : 'high' } };
+  }
   if (effort === 'none') {
     return {
       openaiBody: {
@@ -169,9 +189,11 @@ function resolveDeepSeekV4(
   };
 }
 
-// DeepSeek v3.1: think boolean
+// DeepSeek v3.1: think boolean (same field name for compat and native;
+// native accepts the boolean form identically — no change needed).
 function resolveDeepSeekV3_1(
   options: ModelConfigurationOptions,
+  _endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
   const mode = readStringOption(options, 'thinkingMode');
   return {
@@ -181,11 +203,17 @@ function resolveDeepSeekV3_1(
   };
 }
 
-// GLM: thinking.type + clear_thinking
+// GLM: thinking.type + clear_thinking (compat) OR native `think` (true
+// when enabled, false when disabled — native does not support
+// clear_thinking; the field is dropped on the native path).
 function resolveGlm(
   options: ModelConfigurationOptions,
+  endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
   const mode = readStringOption(options, 'thinkingMode');
+  if (endpointFormat === 'native') {
+    return { openaiBody: { think: mode !== 'disabled' } };
+  }
   if (mode === 'disabled') {
     return {
       openaiBody: {
@@ -201,11 +229,15 @@ function resolveGlm(
   };
 }
 
-// Kimi: thinking.type on/off
+// Kimi: thinking.type on/off (compat) OR native `think` boolean (native).
 function resolveKimi(
   options: ModelConfigurationOptions,
+  endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
   const mode = readStringOption(options, 'thinkingMode');
+  if (endpointFormat === 'native') {
+    return { openaiBody: { think: mode !== 'disabled' } };
+  }
   return {
     openaiBody: {
       thinking: {
@@ -215,11 +247,19 @@ function resolveKimi(
   };
 }
 
-// Qwen: reasoning_effort (none/low/medium/high)
+// Qwen: reasoning_effort (none/low/medium/high) (compat) OR native `think`
+// levels (none → false, low → 'low', medium → 'medium', high → 'high').
 function resolveQwen(
   options: ModelConfigurationOptions,
+  endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
   const effort = readStringOption(options, 'reasoningEffort');
+  if (endpointFormat === 'native') {
+    if (!effort || effort === 'none') {
+      return { openaiBody: { think: false } };
+    }
+    return { openaiBody: { think: effort } };
+  }
   if (!effort || effort === 'none') {
     return {
       openaiBody: { reasoning_effort: 'none' },
@@ -232,8 +272,13 @@ function resolveQwen(
 }
 
 // GPT-OSS: think level (low/medium/high, cannot disable)
+//
+// The `think` field name is identical in native `/api/chat` and the
+// compat vendor extension, so the body does not branch on endpointFormat;
+// the parameter exists to satisfy the per-family resolver call site.
 function resolveGptOss(
   options: ModelConfigurationOptions,
+  _endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
   const level = readStringOption(options, 'thinkLevel');
   return {
@@ -241,13 +286,19 @@ function resolveGptOss(
   };
 }
 
-// Cogito, Nemotron, Minstral: think boolean
+// Cogito, Nemotron, Ministral, MiniMax: think boolean.
+// Native `/api/chat` emits a top-level `think` boolean; the compat path
+// emits the structured `thinking: { type: 'enabled' | 'disabled' }` body.
 function resolveBooleanThink(
   options: ModelConfigurationOptions,
+  endpointFormat: EndpointFormat,
 ): ResolvedModelRequestConfiguration {
-  const mode = readStringOption(options, 'thinkingMode');
+  const enabled = readStringOption(options, 'thinkingMode') !== 'disabled';
+  if (endpointFormat === 'native') {
+    return { openaiBody: { think: enabled } };
+  }
   return {
-    openaiBody: { think: mode !== 'disabled' },
+    openaiBody: { thinking: { type: enabled ? 'enabled' : 'disabled' } },
   };
 }
 

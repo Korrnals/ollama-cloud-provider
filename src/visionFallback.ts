@@ -302,13 +302,27 @@ export async function executePassThrough(
   const connectionPreferred = visionConnection?.preferredEndpoint ?? 'auto';
   const globalPreferred = vscode.workspace
     .getConfiguration('ollamaCloud')
-    .get<'responses' | 'chat'>('preferredEndpoint', 'responses');
+    .get<'responses' | 'chat' | 'native'>('preferredEndpoint', 'responses');
+  // Phase 1 — `native` is a third explicit endpoint. The vision
+  // pass-through path does NOT yet implement a native dispatch block
+  // (it would need `convertMessagesToNative` + a native `OllamaClient`).
+  // If the user explicitly chose `native` on a vision-fallback
+  // connection, fall back to the existing `/chat/completions` path
+  // (the OpenAI-compat shape) rather than silently mishandling the
+  // native wire format. Native vision pass-through is deferred to a
+  // follow-up slice — `auto` still resolves to `responses` (default)
+  // or `chat`, never `native`, so this branch is only reachable on
+  // an explicit `native` global/per-connection setting.
   const primaryEndpoint: 'responses' | 'chat' =
     isLocal
       ? 'chat'
       : connectionPreferred === 'auto'
-        ? globalPreferred
-        : connectionPreferred;
+        ? globalPreferred === 'native'
+          ? 'responses'
+          : globalPreferred
+        : connectionPreferred === 'native'
+          ? 'responses'
+          : connectionPreferred;
 
   const runResponsesStream = (): Promise<void> => {
     const responsesClient = new ResponsesClient(

@@ -269,13 +269,15 @@
           "type": "string",
           "enum": [
             "responses",
-            "chat"
+            "chat",
+            "native"
           ],
           "enumDescriptions": [
             "Use /v1/responses as primary (structured reasoning, typed events, first-class tool calling). Falls back to /chat/completions on HTTP 404. Recommended — newest and most advanced endpoint.",
-            "Use /chat/completions as primary (classic OpenAI-compatible). Falls back to /v1/responses on HTTP 404. Use this if you encounter issues with /v1/responses."
+            "Use /chat/completions as primary (classic OpenAI-compatible). Falls back to /v1/responses on HTTP 404. Use this if you encounter issues with /v1/responses.",
+            "Use the native Ollama /api/chat endpoint (ndjson wire format, object tool arguments, images[] for vision). Phase 1 opt-in — falls back to /chat/completions on HTTP 404 only in auto mode. Use this to bypass the OpenAI-compat translation layer."
           ],
-          "default": "responses",
+          "default": "native",
           "description": "Primary API endpoint for cloud and remote connections. The other endpoint is used as automatic fallback on HTTP 404. Local Ollama connections always use /chat/completions regardless of this setting. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this global setting.",
           "scope": "application"
         },
