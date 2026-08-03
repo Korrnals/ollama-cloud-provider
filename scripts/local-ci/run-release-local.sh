@@ -498,12 +498,19 @@ else
   if ! command -v gh >/dev/null 2>&1; then
     fail 10 "gh CLI not installed — cannot create GitHub Release. Install: https://cli.github.com/"
   fi
-  gh release create "$VERSION" \
-    --title "$VERSION" \
-    --notes-file "$NOTES_FILE" \
-    || fail 10 "gh release create failed"
+  # Idempotent: if the release already exists, upload to it; else create it.
+  if gh release view "$VERSION" >/dev/null 2>&1; then
+    warn "GitHub Release $VERSION already exists — uploading artifacts to existing release"
+  else
+    gh release create "$VERSION" \
+      --title "$VERSION" \
+      --notes-file "$NOTES_FILE" \
+      || fail 10 "gh release create failed"
+    ok "GitHub Release created: https://github.com/Korrnals/ollama-cloud-provider/releases/tag/${VERSION}"
+  fi
 
   # Upload from releases/ — all artefacts are already staged there.
+  # --clobber overwrites existing assets if the release pre-existed.
   UPLOAD_ARGS=()
   for f in "$VSIX_FILE" "$SHA256_FILE" "${SHA256_FILE}.asc" "${VSIX_FILE}.sigstore.bundle" "${SHA256_FILE}.sigstore.bundle" "$SBOM_FILE"; do
     [ -f "$f" ] && UPLOAD_ARGS+=("$f")
@@ -511,8 +518,8 @@ else
   if [ "${#UPLOAD_ARGS[@]}" -gt 0 ]; then
     gh release upload "$VERSION" "${UPLOAD_ARGS[@]}" --clobber \
       || fail 10 "gh release upload failed"
+    ok "Artifacts uploaded to GitHub Release $VERSION (${#UPLOAD_ARGS[@]} files)"
   fi
-  ok "GitHub Release created: https://github.com/Korrnals/ollama-cloud-provider/releases/tag/${VERSION}"
 fi
 echo
 
