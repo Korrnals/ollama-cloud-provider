@@ -38,6 +38,7 @@ import {
   ConnectTimeoutError,
   InactivityTimeoutError,
   MaxDurationError,
+  MidStreamError,
   defaultRetryOn,
   httpErrorFromResponse,
   withRetry,
@@ -485,6 +486,10 @@ function dispatchResponsesEvent(
   callbacks: StreamCallbacks,
 ): boolean {
   const obj = (payload ?? {}) as Record<string, unknown>;
+
+  if (typeof obj.error === 'string' && obj.error) {
+    throw new MidStreamError(obj.error);
+  }
 
   switch (eventType) {
     case 'response.reasoning_summary_text.delta': {

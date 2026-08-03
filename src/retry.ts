@@ -64,6 +64,24 @@ export class ConnectTimeoutError extends Error {
 }
 
 /**
+ * Mid-stream error — the server sent an error event or a non-OK status
+ * surfaced after the response stream had already begun. Terminal, NOT
+ * retriable: POST `/chat/completions` is not idempotent, retrying bills
+ * the user twice (ADR 0001 provider-not-agent, ADR 0005
+ * "No mid-stream retry"). Carries the raw server-provided message so
+ * callers can surface it to the user without exposing internal framing.
+ */
+export class MidStreamError extends Error {
+  readonly serverMessage: string;
+
+  constructor(serverMessage: string) {
+    super(serverMessage);
+    this.name = 'MidStreamError';
+    this.serverMessage = serverMessage;
+  }
+}
+
+/**
  * Mid-stream silence — no chunk AND no `: keep-alive` SSE comment for
  * `requestInactivityTimeoutMs` after the first byte arrived. Terminal,
  * NOT retriable: POST `/chat/completions` is not idempotent, retrying
@@ -162,6 +180,7 @@ export function isRetriableHttpStatus(status: number): boolean {
  *   retries on an already-cancelled request.
  *
  * Does NOT retry:
+ * - {@link MidStreamError} — server-sent mid-stream error, terminal
  * - {@link InactivityTimeoutError} — mid-stream silence, terminal
  * - {@link MaxDurationError} — total-duration cap, terminal
  */
@@ -173,6 +192,9 @@ export function defaultRetryOn(error: unknown): boolean {
     return false;
   }
   if (error instanceof MaxDurationError) {
+    return false;
+  }
+  if (error instanceof MidStreamError) {
     return false;
   }
   if (error instanceof HttpError) {

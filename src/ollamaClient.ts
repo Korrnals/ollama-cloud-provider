@@ -18,6 +18,7 @@ import {
   ConnectTimeoutError,
   InactivityTimeoutError,
   MaxDurationError,
+  MidStreamError,
   defaultRetryOn,
   httpErrorFromResponse,
   withRetry,
@@ -71,6 +72,7 @@ interface OpenAIStreamChunk {
     prompt_eval_count?: number;
     eval_count?: number;
   };
+  error?: string;
 }
 
 export class OllamaClient {
@@ -552,6 +554,10 @@ function processLine(
       error,
     );
     return false;
+  }
+
+  if (typeof chunk.error === 'string' && chunk.error) {
+    throw new MidStreamError(chunk.error);
   }
 
   const usage = mapUsage(chunk.usage);
