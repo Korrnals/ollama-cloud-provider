@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-03
+
+### Fixed
+- **Server-sent mid-stream `error` fields** — new `MidStreamError` class in `src/retry.ts` (non-retriable) carries the server's own error text. `ollamaClient.processLine` and `responsesClient.dispatchResponsesEvent` throw `MidStreamError` when a stream chunk carries an `error` field. Fixes the recurring `aborted: Error: aborted at TLSSocket.socketCloseListener` stack trace: the real server-side cause is now surfaced instead of the TLS socket-close side effect. The HTTP-retry layer no longer re-emits on these errors (explicit non-retriable case in `defaultRetryOn`).
+- **HTTP error classification** — new `classifyStreamError` helper in `src/provider.ts` translates `HttpError` 402 (payment required), 403 (forbidden), 429 (rate limit), 404 (not found), and 5xx into human-readable `vscode.LanguageModelError` messages in Russian. `provideLanguageModelChatResponse` is wrapped in try/catch so stream-time errors surface as structured `LanguageModelError` instead of raw `HTTP 402: HttpError: HTTP 402 at ...` stack traces that confused users.
+
+### Added
+- **`kimi-k3` in model catalog** — `SNAPSHOT_MODELS` entry mirroring `kimi-k2.6`: 262144 input and output tokens, image input, tool calling, reasoning support. `inferReasoning` recognises the `kimi-k3` prefix.
+
+### Notes
+- Hotfix release for stream error handling. Architectural Committee 2026-08-03 accepted Phases 1, 2, 4 (this release); Phase 3 (ADR 0005 revision + 0-byte retry) is deferred to a follow-up slice.
+
 ## [0.7.1] - 2026-07-29
 
 ### Added
