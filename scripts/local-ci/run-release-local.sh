@@ -115,10 +115,17 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would run: npm ci && npm run lint && npm run compile && npm run package"
   echo "  expected VSIX: $VSIX_FILE"
 else
-  # Defence-in-depth: remove stale VSIX from previous runs in both the
-  # project root and releases/ so the only VSIX after packaging is the
-  # freshly-built one in releases/.
-  rm -f releases/*.vsix *.vsix
+  # Defence-in-depth: remove stale VSIX from previous runs so the only VSIX
+  # after packaging is the freshly-built one. The VSIX is now selected by
+  # explicit filename (VSIX_FILE above), so we do NOT need to wipe releases/
+  # wholesale — that would destroy the user's rollback VSIX for other versions.
+  # Remove only the current-version VSIX from a prior run (defence-in-depth
+  # against a stale same-version VSIX being repackaged). Do NOT wipe other
+  # versions — releases/ holds rollback VSIX for the user.
+  rm -f "$VSIX_FILE" "$RELEASES_DIR/ollama-cloud-provider-${VERSION_NUM}.vsix"
+  # Also clean any stray VSIX in the project root (vsce's default output location
+  # if -o is ever omitted) — but ONLY the root, not releases/.
+  rm -f *.vsix
   if [ -f package-lock.json ]; then
     npm ci || fail 2 "npm ci failed"
   else
@@ -163,16 +170,33 @@ step 4 "Sigstore cosign signing (L2 — build provenance, optional)"
 if command -v cosign >/dev/null 2>&1; then
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  cosign installed — would sign: $VSIX_FILE, $SHA256_FILE"
+    COSIGN_OK=1
+    ARTIFACTS+=("${VSIX_BASENAME}.sigstore.bundle|L2 sigstore bundle — VSIX")
+    ARTIFACTS+=("sha256.txt.sigstore.bundle|L2 sigstore bundle — checksums")
+    ok "L2 Sigstore signatures would be produced"
   else
-    cosign sign-blob --yes "$VSIX_FILE" --output-signature "${VSIX_FILE}.sig" \
-      || fail 4 "cosign sign-blob VSIX failed"
-    cosign sign-blob --yes "$SHA256_FILE" --output-signature "${SHA256_FILE}.sig" \
-      || fail 4 "cosign sign-blob sha256.txt failed"
+    # L2 is optional per script contract — degrade on any cosign failure
+    # (deprecated flag, auth error, network, keyless unavailability) rather
+    # than aborting the whole release. Uses --bundle (new format); the
+    # legacy --output-signature flag is deprecated and fails on recent
+    # cosign with "must specify --bundle with --new-bundle-format".
+    VSIX_BUNDLE="${VSIX_FILE}.sigstore.bundle"
+    SHA_BUNDLE="${SHA256_FILE}.sigstore.bundle"
+    if cosign sign-blob --yes "$VSIX_FILE" --bundle "$VSIX_BUNDLE" 2>/tmp/cosign-vsix.err; then
+      COSIGN_OK=1
+      ARTIFACTS+=("${VSIX_BASENAME}.sigstore.bundle|L2 sigstore bundle — VSIX")
+      ok "L2 Sigstore VSIX bundle produced: $VSIX_BUNDLE"
+    else
+      warn "cosign sign-blob VSIX failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-vsix.err)"
+    fi
+    if cosign sign-blob --yes "$SHA256_FILE" --bundle "$SHA_BUNDLE" 2>/tmp/cosign-sha.err; then
+      ARTIFACTS+=("sha256.txt.sigstore.bundle|L2 sigstore bundle — checksums")
+      ok "L2 Sigstore checksum bundle produced: $SHA_BUNDLE"
+    else
+      warn "cosign sign-blob sha256.txt failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-sha.err)"
+    fi
+    rm -f /tmp/cosign-vsix.err /tmp/cosign-sha.err
   fi
-  COSIGN_OK=1
-  ARTIFACTS+=("${VSIX_BASENAME}.sig|L2 sigstore — VSIX")
-  ARTIFACTS+=("sha256.txt.sig|L2 sigstore — checksums")
-  ok "L2 Sigstore signatures produced"
 else
   warn "cosign not installed — L2 Sigstore signing skipped."
   warn "Install: https://github.com/sigstore/cosign/releases"
