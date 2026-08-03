@@ -38,7 +38,7 @@ import {
   markResponsesAvailable,
   markResponsesUnavailable,
 } from './capabilityCache.js';
-import { HttpError } from './retry.js';
+import { HttpError, MidStreamError } from './retry.js';
 import { loadConnections, openAiBaseUrl } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
@@ -102,6 +102,46 @@ function endpointExplicitUnavailableError(
   return vscode.LanguageModelError.NotFound(
     `Endpoint /chat/completions returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "responses".`,
   );
+}
+
+/**
+ * Phase 2 — classifies an error from `runStream` into a human-readable
+ * `vscode.LanguageModelError` so VS Code shows the user a clear message,
+ * not a raw stack trace. The raw error (with stack) is logged in
+ * `runStream`'s `onError` handler before it reaches here.
+ */
+function classifyStreamError(error: unknown): Error {
+  if (error instanceof MidStreamError) {
+    return new Error(`Ollama Cloud: ${error.serverMessage}`);
+  }
+  if (error instanceof HttpError) {
+    switch (error.status) {
+      case 402:
+        return vscode.LanguageModelError.Blocked(
+          'Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст.',
+        );
+      case 403:
+        return vscode.LanguageModelError.Blocked(
+          'Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером.',
+        );
+      case 429:
+        return vscode.LanguageModelError.Blocked(
+          'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
+        );
+      case 404:
+        return vscode.LanguageModelError.NotFound(
+          'Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен.',
+        );
+      default:
+        if (error.status >= 500) {
+          return new Error(
+            `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud.`,
+          );
+        }
+        return new Error(`Ollama Cloud: HTTP ${error.status} — ${error.message}`);
+    }
+  }
+  return error instanceof Error ? error : new Error(String(error));
 }
 
 /**
@@ -371,490 +411,495 @@ export class OllamaCloudChatProvider
       throw new Error(`Unknown Ollama Cloud model: ${modelInfo.id}`);
     }
 
-    // Resolve the connection for this model. Cloud connection models
-    // keep the legacy single-connection path (backward compatibility —
-    // the 192 existing tests exercise this branch). Non-cloud
-    // connection models resolve their connection via `connectionId`.
-    const connections = loadConnections();
-    // ADR 0006 — resolve the cloud connection object too (not just
-    // non-cloud). Cloud models keep the legacy apiKey path
-    // (`getApiKey()` + `connection = undefined` semantics for the
-    // 192 existing tests), but the dispatch block below reads
-    // `connection?.preferredEndpoint` to decide between
-    // `/v1/responses` and `/chat/completions`. Without the cloud
-    // connection object here, `preferredEndpoint: 'chat'` set on the
-    // cloud connection is invisible to dispatch and every cloud
-    // request routes to `/v1/responses` regardless of the override.
-    // `apiKeyForCloud` keeps the legacy resolution; `connection` is
-    // only used for endpoint selection + baseUrl (which already
-    // fall back to `getBaseUrl()` when undefined).
-    const cloudConnection =
-      model.connectionId === 'cloud'
-        ? connections.find((c) => c.id === model.connectionId)
-        : undefined;
-    const connection =
-      model.connectionId === 'cloud'
-        ? undefined
-        : connections.find((c) => c.id === model.connectionId);
+    try {
+      // Resolve the connection for this model. Cloud connection models
+      // keep the legacy single-connection path (backward compatibility —
+      // the 192 existing tests exercise this branch). Non-cloud
+      // connection models resolve their connection via `connectionId`.
+      const connections = loadConnections();
+      // ADR 0006 — resolve the cloud connection object too (not just
+      // non-cloud). Cloud models keep the legacy apiKey path
+      // (`getApiKey()` + `connection = undefined` semantics for the
+      // 192 existing tests), but the dispatch block below reads
+      // `connection?.preferredEndpoint` to decide between
+      // `/v1/responses` and `/chat/completions`. Without the cloud
+      // connection object here, `preferredEndpoint: 'chat'` set on the
+      // cloud connection is invisible to dispatch and every cloud
+      // request routes to `/v1/responses` regardless of the override.
+      // `apiKeyForCloud` keeps the legacy resolution; `connection` is
+      // only used for endpoint selection + baseUrl (which already
+      // fall back to `getBaseUrl()` when undefined).
+      const cloudConnection =
+        model.connectionId === 'cloud'
+          ? connections.find((c) => c.id === model.connectionId)
+          : undefined;
+      const connection =
+        model.connectionId === 'cloud'
+          ? undefined
+          : connections.find((c) => c.id === model.connectionId);
 
-    // API key resolution — cloud connection uses the legacy
-    // `getApiKey()` (SecretStorage + config + env fallback). Non-cloud
-    // connections use `getApiKeyForConnection()` (SecretStorage only,
-    // keyed `ollamaCloud.apiKey.<connectionId>`). Connections with
-    // `requiresApiKey === false` (local Ollama) skip the key entirely.
-    const apiKey = connection
-      ? await this.authManager.getApiKeyForConnection(connection)
-      : await this.authManager.getApiKey();
-    if (!apiKey && (!connection || connection.requiresApiKey)) {
-      throw new Error(
-        'Ollama Cloud API key not configured. Run "Ollama Cloud: Set API Key".',
+      // API key resolution — cloud connection uses the legacy
+      // `getApiKey()` (SecretStorage + config + env fallback). Non-cloud
+      // connections use `getApiKeyForConnection()` (SecretStorage only,
+      // keyed `ollamaCloud.apiKey.<connectionId>`). Connections with
+      // `requiresApiKey === false` (local Ollama) skip the key entirely.
+      const apiKey = connection
+        ? await this.authManager.getApiKeyForConnection(connection)
+        : await this.authManager.getApiKey();
+      if (!apiKey && (!connection || connection.requiresApiKey)) {
+        throw new Error(
+          'Ollama Cloud API key not configured. Run "Ollama Cloud: Set API Key".',
+        );
+      }
+
+      // Vision gate — SEC-03 complement: do NOT silently drop image
+      // attachments sent to a text-only model. Two outcomes:
+      //   - Fallback ENABLED (ADR 0004): when the primary model cannot
+      //     handle the image, route the turn to a vision-capable model
+      //     via `executePassThrough` (single-hop pass-through). The vision
+      //     model answers the user directly; the primary is not involved.
+      //   - Fallback DISABLED: throw a clear error so the user sees why
+      //     the request failed and can switch to a vision-capable model
+      //     (constraint 9 — no silent degradation; current behaviour).
+      const requestHasImages = messages.some((m) => hasImageParts(m.content));
+      const connectionVisionPatterns = connection?.visionModels ?? [];
+      const supportsImages = resolveVisionSupport(model, connectionVisionPatterns);
+      if (requestHasImages && !supportsImages) {
+        const fallbackEnabled = vscode.workspace
+          .getConfiguration('ollamaCloud')
+          .get<boolean>('visionFallback.enabled', false);
+        if (fallbackEnabled && shouldFallback(model, messages)) {
+          // ADR 0004 — pass-through. The vision model streams to the
+          // user via the same progress reporter + CancellationToken.
+          // Returns from here; the primary path below is not reached.
+          return await executePassThrough({
+            primaryModel: model,
+            primaryConnection: connection ?? cloudConnection,
+            messages,
+            options,
+            progress,
+            token,
+            authManager: this.authManager,
+            catalog: this.modelCatalog.list(),
+            connections,
+          });
+        }
+        throw new Error(
+          `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
+        );
+      }
+
+      const clientBaseUrl = connection
+        ? openAiBaseUrl(connection)
+        : this.authManager.getBaseUrl();
+      const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
+      const modelOptions = options as ModelConfigurationOptions;
+      const requestConfiguration = resolveModelRequestConfiguration(
+        model,
+        modelOptions,
       );
-    }
+      const openaiMessages = convertMessagesToOpenAI(messages);
 
-    // Vision gate — SEC-03 complement: do NOT silently drop image
-    // attachments sent to a text-only model. Two outcomes:
-    //   - Fallback ENABLED (ADR 0004): when the primary model cannot
-    //     handle the image, route the turn to a vision-capable model
-    //     via `executePassThrough` (single-hop pass-through). The vision
-    //     model answers the user directly; the primary is not involved.
-    //   - Fallback DISABLED: throw a clear error so the user sees why
-    //     the request failed and can switch to a vision-capable model
-    //     (constraint 9 — no silent degradation; current behaviour).
-    const requestHasImages = messages.some((m) => hasImageParts(m.content));
-    const connectionVisionPatterns = connection?.visionModels ?? [];
-    const supportsImages = resolveVisionSupport(model, connectionVisionPatterns);
-    if (requestHasImages && !supportsImages) {
-      const fallbackEnabled = vscode.workspace
-        .getConfiguration('ollamaCloud')
-        .get<boolean>('visionFallback.enabled', false);
-      if (fallbackEnabled && shouldFallback(model, messages)) {
-        // ADR 0004 — pass-through. The vision model streams to the
-        // user via the same progress reporter + CancellationToken.
-        // Returns from here; the primary path below is not reached.
-        return await executePassThrough({
-          primaryModel: model,
-          primaryConnection: connection ?? cloudConnection,
-          messages,
-          options,
-          progress,
-          token,
-          authManager: this.authManager,
-          catalog: this.modelCatalog.list(),
-          connections,
+      // ADR 0006 — endpoint selection deferred to the block below (it
+      // needs `endpointConnection` + `globalConfig`). ADR 0007 context
+      // filter is resolved in that same block so it can reuse
+      // `endpointConnection` + `globalConfig` without recomputing them.
+      // `requestChars` is computed AFTER the filter runs so it reflects
+      // the FILTERED payload (used for the convert audit line + the
+      // token estimator).
+      let filteredMessages = openaiMessages;
+      let filteredTools = convertToolsToOpenAI(options.tools);
+      let filterReport: ReturnType<typeof filterContext>['report'] | undefined;
+      let requestChars = 0;
+
+      // ADR 0006 — endpoint selection. The user picks a primary endpoint
+      // via `ollamaCloud.preferredEndpoint` (global setting, default
+      // `'responses'`). Per-connection `preferredEndpoint` overrides
+      // this: `'responses'`/`'chat'` are explicit; `'auto'` inherits the
+      // global setting.
+      //
+      // Issue #40 — fallback policy. When the user EXPLICITLY chose the
+      // primary endpoint (per-connection `'responses'`/`'chat'`, OR a
+      // global `preferredEndpoint` the user actually configured rather
+      // than the default), a 404 from that endpoint does NOT silently
+      // fall back. The provider throws a clear, actionable error so the
+      // user knows their explicit choice is unsupported by this
+      // connection and can switch endpoints or opt into `auto`. When the
+      // effective choice is `'auto'` (the default, or a per-connection
+      // `'auto'` inheriting a default global), the prior fallback +
+      // log-warning behaviour is preserved.
+      //
+      // The OTHER endpoint is the automatic fallback on HTTP 404:
+      //   primary=responses → fallback=chat (and vice versa).
+      // Local Ollama always uses /chat/completions (no /v1/responses).
+      //
+      // The capability cache short-circuits the primary attempt once a
+      // prior 404 has been memoized for the connection. No mid-stream
+      // fallback — POST is non-idempotent and a retry would bill twice
+      // (ADR 0001/0005). The cache is intentionally NOT bypassed for
+      // explicit mode: if an explicit endpoint is already known
+      // unavailable (memoized from a prior 404 in this session), the
+      // explicit-mode error must still fire — but it fires from the
+      // cache short-circuit path, not from a fresh 404 round-trip. See
+      // `endpointExplicitUnavailableError` below.
+      const endpointConnection = connection ?? cloudConnection;
+      const connectionPreferred = endpointConnection?.preferredEndpoint ?? 'auto';
+      const isLocal = endpointConnection?.type === 'local';
+      const connectionId = endpointConnection?.id ?? 'cloud';
+
+      // Resolve the effective primary endpoint AND whether the choice is
+      // explicit. Explicit = per-connection `'responses'`/`'chat'` (always
+      // an override) OR a global `preferredEndpoint` the user actually
+      // configured (detected via `inspect()` — `globalValue`/`workspaceValue`
+      // set, vs. only `defaultValue`). `'auto'` per-connection inherits
+      // the global explicitness.
+      const globalConfig = vscode.workspace.getConfiguration('ollamaCloud');
+      const globalInspection = globalConfig.inspect<'responses' | 'chat' | 'auto'>('preferredEndpoint');
+      const globalPreferredExplicit =
+        globalInspection?.globalValue !== undefined ||
+        globalInspection?.workspaceValue !== undefined ||
+        globalInspection?.workspaceFolderValue !== undefined;
+      const globalPreferred = globalConfig.get<'responses' | 'chat'>(
+        'preferredEndpoint',
+        'responses',
+      );
+      const isPreferredEndpointExplicit =
+        !isLocal &&
+        (connectionPreferred === 'responses' ||
+          connectionPreferred === 'chat' ||
+          (connectionPreferred === 'auto' && globalPreferredExplicit));
+
+      const primaryEndpoint: 'responses' | 'chat' =
+        isLocal
+          ? 'chat'
+          : connectionPreferred === 'auto'
+            ? globalPreferred
+            : connectionPreferred;
+
+      // ADR 0007 — resolve the effective context-filter level and run
+      // the filter (only at `safe`/`aggressive` — `off` is a fast path
+      // that skips `filterContext` entirely, preserving zero overhead
+      // when the filter is disabled). Per-connection `contextFilter.level`
+      // overrides the global; `'auto'`/`undefined` inherit the global
+      // (mirrors `preferredEndpoint`). The filter is pure + endpoint-
+      // agnostic: it runs once on the OpenAI-format `openaiMessages` and
+      // the filtered output feeds BOTH endpoints — `/chat/completions`
+      // via `filteredMessages` directly, `/v1/responses` via
+      // `convertOpenAIMessagesToResponsesInput` (shapes the filtered
+      // OpenAI messages into `/v1/responses` input without a VS Code ↔
+      // OpenAI round-trip). `requestChars` is computed AFTER the filter
+      // so it reflects the filtered payload (drives the convert audit
+      // line + the token estimator).
+      const connectionContextFilter = endpointConnection?.contextFilter ?? 'auto';
+      const globalContextFilter = globalConfig.get<'off' | 'safe' | 'aggressive'>(
+        'contextFilter.level',
+        'off',
+      );
+      const effectiveFilterLevel: ContextFilterLevel =
+        connectionContextFilter === 'auto'
+          ? globalContextFilter
+          : connectionContextFilter;
+      if (effectiveFilterLevel !== 'off') {
+        const filterResult = filterContext({
+          messages: openaiMessages,
+          tools: filteredTools,
+          level: effectiveFilterLevel,
+          maxInputTokens: model.maxInputTokens,
         });
+        filteredMessages = filterResult.messages;
+        filteredTools = filterResult.tools;
+        filterReport = filterResult.report;
       }
-      throw new Error(
-        `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
-      );
-    }
+      requestChars = countOpenAIRequestChars(filteredMessages);
 
-    const clientBaseUrl = connection
-      ? openAiBaseUrl(connection)
-      : this.authManager.getBaseUrl();
-    const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
-    const modelOptions = options as ModelConfigurationOptions;
-    const requestConfiguration = resolveModelRequestConfiguration(
-      model,
-      modelOptions,
-    );
-    const openaiMessages = convertMessagesToOpenAI(messages);
+      // Issue #41 — Strand 3.1: convert-path redundancy audit. Verdict
+      // (verified 2026-07-29): NO redundancy in either converter.
+      //   - `convertMessagesToOpenAI`: system prompt lives in exactly
+      //     one `role:system` message; tool definitions go only in the
+      //     top-level `tools` array (via `convertToolsToOpenAI`), never
+      //     inlined into a message; instructions are not a `/chat/
+      //     completions` concept so there is no `instructions`+message
+      //     duplication vector.
+      //   - `convertToResponsesInput`: the FIRST system message is
+      //     hoisted to top-level `instructions`; subsequent system
+      //     messages are dropped (logged). Tool definitions go only in
+      //     the top-level `tools` array (via `convertToolsToResponses`).
+      // No content is sent twice. The audit verdict is recorded in this
+      // comment (review fix Finding 6: the per-request `convert audit:`
+      // log line was removed — the verdict is static and `requestChars`
+      // is already carried by the `Endpoint selected` line below, so the
+      // per-request line was pure noise on the output channel).
 
-    // ADR 0006 — endpoint selection deferred to the block below (it
-    // needs `endpointConnection` + `globalConfig`). ADR 0007 context
-    // filter is resolved in that same block so it can reuse
-    // `endpointConnection` + `globalConfig` without recomputing them.
-    // `requestChars` is computed AFTER the filter runs so it reflects
-    // the FILTERED payload (used for the convert audit line + the
-    // token estimator).
-    let filteredMessages = openaiMessages;
-    let filteredTools = convertToolsToOpenAI(options.tools);
-    let filterReport: ReturnType<typeof filterContext>['report'] | undefined;
-    let requestChars = 0;
+      // ADR 0007 — context-filter log line. Emitted at `safe` /
+      // `aggressive` only (NOT `off` — no logging at `off` per ADR).
+      // The log carries char counts + drop counts ONLY — no message
+      // content (sensitive-data policy: the filter log is a telemetry
+      // line, not a content dump). Per-class diagnostics follow only
+      // when the count for that class is non-zero (no "dropped 0"
+      // noise), mirroring the Issue #41 convert-path diagnostic style.
+      if (filterReport !== undefined) {
+        const before = filterReport.beforeChars;
+        const after = filterReport.afterChars;
+        const saved =
+          before === 0 ? 0 : Math.round(((before - after) / before) * 100);
+        logger.info(
+          `Context filter: level=${filterReport.level} before=${before}chars after=${after}chars saved=${saved}% (${filterReport.droppedMessages} messages dropped, ${filterReport.droppedTools} tools dropped, ${filterReport.mergedMessages} merged, ${filterReport.truncatedMessages} truncated)`,
+        );
+        if (filterReport.droppedMessages > 0) {
+          logger.info(
+            `Context filter: dropped ${filterReport.droppedMessages} duplicate messages`,
+          );
+        }
+        if (filterReport.mergedMessages > 0) {
+          logger.info(
+            `Context filter: merged ${filterReport.mergedMessages} similar pairs`,
+          );
+        }
+        if (filterReport.truncatedMessages > 0) {
+          logger.info(
+            `Context filter: truncated ${filterReport.truncatedMessages} oldest messages`,
+          );
+        }
+        if (filterReport.droppedTools > 0) {
+          logger.info(
+            `Context filter: dropped ${filterReport.droppedTools} duplicate tools`,
+          );
+        }
+        if (filterReport.strippedMetadataFields > 0) {
+          logger.info(
+            `Context filter: stripped metadata from ${filterReport.strippedMetadataFields} fields`,
+          );
+        }
+      }
 
-    // ADR 0006 — endpoint selection. The user picks a primary endpoint
-    // via `ollamaCloud.preferredEndpoint` (global setting, default
-    // `'responses'`). Per-connection `preferredEndpoint` overrides
-    // this: `'responses'`/`'chat'` are explicit; `'auto'` inherits the
-    // global setting.
-    //
-    // Issue #40 — fallback policy. When the user EXPLICITLY chose the
-    // primary endpoint (per-connection `'responses'`/`'chat'`, OR a
-    // global `preferredEndpoint` the user actually configured rather
-    // than the default), a 404 from that endpoint does NOT silently
-    // fall back. The provider throws a clear, actionable error so the
-    // user knows their explicit choice is unsupported by this
-    // connection and can switch endpoints or opt into `auto`. When the
-    // effective choice is `'auto'` (the default, or a per-connection
-    // `'auto'` inheriting a default global), the prior fallback +
-    // log-warning behaviour is preserved.
-    //
-    // The OTHER endpoint is the automatic fallback on HTTP 404:
-    //   primary=responses → fallback=chat (and vice versa).
-    // Local Ollama always uses /chat/completions (no /v1/responses).
-    //
-    // The capability cache short-circuits the primary attempt once a
-    // prior 404 has been memoized for the connection. No mid-stream
-    // fallback — POST is non-idempotent and a retry would bill twice
-    // (ADR 0001/0005). The cache is intentionally NOT bypassed for
-    // explicit mode: if an explicit endpoint is already known
-    // unavailable (memoized from a prior 404 in this session), the
-    // explicit-mode error must still fire — but it fires from the
-    // cache short-circuit path, not from a fresh 404 round-trip. See
-    // `endpointExplicitUnavailableError` below.
-    const endpointConnection = connection ?? cloudConnection;
-    const connectionPreferred = endpointConnection?.preferredEndpoint ?? 'auto';
-    const isLocal = endpointConnection?.type === 'local';
-    const connectionId = endpointConnection?.id ?? 'cloud';
-
-    // Resolve the effective primary endpoint AND whether the choice is
-    // explicit. Explicit = per-connection `'responses'`/`'chat'` (always
-    // an override) OR a global `preferredEndpoint` the user actually
-    // configured (detected via `inspect()` — `globalValue`/`workspaceValue`
-    // set, vs. only `defaultValue`). `'auto'` per-connection inherits
-    // the global explicitness.
-    const globalConfig = vscode.workspace.getConfiguration('ollamaCloud');
-    const globalInspection = globalConfig.inspect<'responses' | 'chat' | 'auto'>('preferredEndpoint');
-    const globalPreferredExplicit =
-      globalInspection?.globalValue !== undefined ||
-      globalInspection?.workspaceValue !== undefined ||
-      globalInspection?.workspaceFolderValue !== undefined;
-    const globalPreferred = globalConfig.get<'responses' | 'chat'>(
-      'preferredEndpoint',
-      'responses',
-    );
-    const isPreferredEndpointExplicit =
-      !isLocal &&
-      (connectionPreferred === 'responses' ||
-        connectionPreferred === 'chat' ||
-        (connectionPreferred === 'auto' && globalPreferredExplicit));
-
-    const primaryEndpoint: 'responses' | 'chat' =
-      isLocal
-        ? 'chat'
-        : connectionPreferred === 'auto'
-          ? globalPreferred
-          : connectionPreferred;
-
-    // ADR 0007 — resolve the effective context-filter level and run
-    // the filter (only at `safe`/`aggressive` — `off` is a fast path
-    // that skips `filterContext` entirely, preserving zero overhead
-    // when the filter is disabled). Per-connection `contextFilter.level`
-    // overrides the global; `'auto'`/`undefined` inherit the global
-    // (mirrors `preferredEndpoint`). The filter is pure + endpoint-
-    // agnostic: it runs once on the OpenAI-format `openaiMessages` and
-    // the filtered output feeds BOTH endpoints — `/chat/completions`
-    // via `filteredMessages` directly, `/v1/responses` via
-    // `convertOpenAIMessagesToResponsesInput` (shapes the filtered
-    // OpenAI messages into `/v1/responses` input without a VS Code ↔
-    // OpenAI round-trip). `requestChars` is computed AFTER the filter
-    // so it reflects the filtered payload (drives the convert audit
-    // line + the token estimator).
-    const connectionContextFilter = endpointConnection?.contextFilter ?? 'auto';
-    const globalContextFilter = globalConfig.get<'off' | 'safe' | 'aggressive'>(
-      'contextFilter.level',
-      'off',
-    );
-    const effectiveFilterLevel: ContextFilterLevel =
-      connectionContextFilter === 'auto'
-        ? globalContextFilter
-        : connectionContextFilter;
-    if (effectiveFilterLevel !== 'off') {
-      const filterResult = filterContext({
-        messages: openaiMessages,
-        tools: filteredTools,
-        level: effectiveFilterLevel,
-        maxInputTokens: model.maxInputTokens,
-      });
-      filteredMessages = filterResult.messages;
-      filteredTools = filterResult.tools;
-      filterReport = filterResult.report;
-    }
-    requestChars = countOpenAIRequestChars(filteredMessages);
-
-    // Issue #41 — Strand 3.1: convert-path redundancy audit. Verdict
-    // (verified 2026-07-29): NO redundancy in either converter.
-    //   - `convertMessagesToOpenAI`: system prompt lives in exactly
-    //     one `role:system` message; tool definitions go only in the
-    //     top-level `tools` array (via `convertToolsToOpenAI`), never
-    //     inlined into a message; instructions are not a `/chat/
-    //     completions` concept so there is no `instructions`+message
-    //     duplication vector.
-    //   - `convertToResponsesInput`: the FIRST system message is
-    //     hoisted to top-level `instructions`; subsequent system
-    //     messages are dropped (logged). Tool definitions go only in
-    //     the top-level `tools` array (via `convertToolsToResponses`).
-    // No content is sent twice. The audit verdict is recorded in this
-    // comment (review fix Finding 6: the per-request `convert audit:`
-    // log line was removed — the verdict is static and `requestChars`
-    // is already carried by the `Endpoint selected` line below, so the
-    // per-request line was pure noise on the output channel).
-
-    // ADR 0007 — context-filter log line. Emitted at `safe` /
-    // `aggressive` only (NOT `off` — no logging at `off` per ADR).
-    // The log carries char counts + drop counts ONLY — no message
-    // content (sensitive-data policy: the filter log is a telemetry
-    // line, not a content dump). Per-class diagnostics follow only
-    // when the count for that class is non-zero (no "dropped 0"
-    // noise), mirroring the Issue #41 convert-path diagnostic style.
-    if (filterReport !== undefined) {
-      const before = filterReport.beforeChars;
-      const after = filterReport.afterChars;
-      const saved =
-        before === 0 ? 0 : Math.round(((before - after) / before) * 100);
       logger.info(
-        `Context filter: level=${filterReport.level} before=${before}chars after=${after}chars saved=${saved}% (${filterReport.droppedMessages} messages dropped, ${filterReport.droppedTools} tools dropped, ${filterReport.mergedMessages} merged, ${filterReport.truncatedMessages} truncated)`,
+        `Endpoint selected: primary=${primaryEndpoint}, explicit=${isPreferredEndpointExplicit}, connection="${connectionId}", isLocal=${isLocal}, apiModel="${model.apiModel ?? model.id}", requestChars=${requestChars}`,
       );
-      if (filterReport.droppedMessages > 0) {
-        logger.info(
-          `Context filter: dropped ${filterReport.droppedMessages} duplicate messages`,
-        );
-      }
-      if (filterReport.mergedMessages > 0) {
-        logger.info(
-          `Context filter: merged ${filterReport.mergedMessages} similar pairs`,
-        );
-      }
-      if (filterReport.truncatedMessages > 0) {
-        logger.info(
-          `Context filter: truncated ${filterReport.truncatedMessages} oldest messages`,
-        );
-      }
-      if (filterReport.droppedTools > 0) {
-        logger.info(
-          `Context filter: dropped ${filterReport.droppedTools} duplicate tools`,
-        );
-      }
-      if (filterReport.strippedMetadataFields > 0) {
-        logger.info(
-          `Context filter: stripped metadata from ${filterReport.strippedMetadataFields} fields`,
-        );
-      }
-    }
 
-    logger.info(
-      `Endpoint selected: primary=${primaryEndpoint}, explicit=${isPreferredEndpointExplicit}, connection="${connectionId}", isLocal=${isLocal}, apiModel="${model.apiModel ?? model.id}", requestChars=${requestChars}`,
-    );
-
-    // Issue #40 — capability-cache short-circuit guard for explicit
-    // mode. When the user explicitly chose `primaryEndpoint` AND the
-    // capability cache already memoized that endpoint as unavailable
-    // (a prior 404 in this session), the explicit-mode contract
-    // requires the actionable error — NOT a silent detour to the other
-    // endpoint. Without this guard, the cache would skip the primary
-    // `if` block and execution would fall through to the other
-    // endpoint, silently routing around the user's explicit choice.
-    // The cache itself is NOT bypassed (per task spec point 6); the
-    // guard reads it and translates "known unavailable + explicit"
-    // into the same error a live 404 would produce.
-    if (
-      isPreferredEndpointExplicit &&
-      primaryEndpoint === 'responses' &&
-      isResponsesKnownUnavailable(connectionId)
-    ) {
-      logger.info(
-        `Explicit /v1/responses cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-      );
-      throw endpointExplicitUnavailableError('responses', connectionId);
-    }
-    if (
-      isPreferredEndpointExplicit &&
-      primaryEndpoint === 'chat' &&
-      isChatKnownUnavailable(connectionId)
-    ) {
-      logger.info(
-        `Explicit /chat/completions cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-      );
-      throw endpointExplicitUnavailableError('chat', connectionId);
-    }
-
-    if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
-      try {
-        const responsesClient = new ResponsesClient(
-          clientBaseUrl,
-          apiKey ?? '',
-          connection,
+      // Issue #40 — capability-cache short-circuit guard for explicit
+      // mode. When the user explicitly chose `primaryEndpoint` AND the
+      // capability cache already memoized that endpoint as unavailable
+      // (a prior 404 in this session), the explicit-mode contract
+      // requires the actionable error — NOT a silent detour to the other
+      // endpoint. Without this guard, the cache would skip the primary
+      // `if` block and execution would fall through to the other
+      // endpoint, silently routing around the user's explicit choice.
+      // The cache itself is NOT bypassed (per task spec point 6); the
+      // guard reads it and translates "known unavailable + explicit"
+      // into the same error a live 404 would produce.
+      if (
+        isPreferredEndpointExplicit &&
+        primaryEndpoint === 'responses' &&
+        isResponsesKnownUnavailable(connectionId)
+      ) {
+        logger.info(
+          `Explicit /v1/responses cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
         );
-        // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
-        // When the filter ran (`filterReport !== undefined`), shape
-        // the filtered `OpenAICompatibleMessage[]` directly into
-        // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
-        // (no VS Code ↔ OpenAI round-trip — keeps the filter
-        // endpoint-agnostic and avoids lossy re-conversion). When the
-        // filter did NOT run (`off` fast path), use the original
-        // `convertToResponsesInput` on the VS Code `messages` (the
-        // 375-test regression path is untouched).
-        const { input, instructions } =
-          filterReport !== undefined
-            ? convertOpenAIMessagesToResponsesInput(filteredMessages)
-            : convertToResponsesInput(messages);
-        const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
-        await this.runStream(
-          (callbacks) =>
-            responsesClient.streamResponses(
-              {
-                model: model.apiModel ?? model.id,
-                input,
-                ...(instructions !== undefined ? { instructions } : {}),
-                ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
-                tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                extraBody: requestConfiguration.openaiBody,
-              },
-              callbacks,
-              token,
-            ),
-          progress,
-          model,
-          requestChars,
-          () => markResponsesAvailable(connectionId),
+        throw endpointExplicitUnavailableError('responses', connectionId);
+      }
+      if (
+        isPreferredEndpointExplicit &&
+        primaryEndpoint === 'chat' &&
+        isChatKnownUnavailable(connectionId)
+      ) {
+        logger.info(
+          `Explicit /chat/completions cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
         );
-        return; // success — no fallback needed
-      } catch (error) {
-        if (error instanceof HttpError && error.status === 404) {
-          markResponsesUnavailable(connectionId);
-          // Issue #40 — explicit choice: do NOT silently fall back.
-          // Surface an actionable error so the user knows their
-          // explicit endpoint is unsupported by this connection.
-          if (isPreferredEndpointExplicit) {
+        throw endpointExplicitUnavailableError('chat', connectionId);
+      }
+
+      if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
+        try {
+          const responsesClient = new ResponsesClient(
+            clientBaseUrl,
+            apiKey ?? '',
+            connection,
+          );
+          // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
+          // When the filter ran (`filterReport !== undefined`), shape
+          // the filtered `OpenAICompatibleMessage[]` directly into
+          // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
+          // (no VS Code ↔ OpenAI round-trip — keeps the filter
+          // endpoint-agnostic and avoids lossy re-conversion). When the
+          // filter did NOT run (`off` fast path), use the original
+          // `convertToResponsesInput` on the VS Code `messages` (the
+          // 375-test regression path is untouched).
+          const { input, instructions } =
+            filterReport !== undefined
+              ? convertOpenAIMessagesToResponsesInput(filteredMessages)
+              : convertToResponsesInput(messages);
+          const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
+          await this.runStream(
+            (callbacks) =>
+              responsesClient.streamResponses(
+                {
+                  model: model.apiModel ?? model.id,
+                  input,
+                  ...(instructions !== undefined ? { instructions } : {}),
+                  ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
+                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                  extraBody: requestConfiguration.openaiBody,
+                },
+                callbacks,
+                token,
+              ),
+            progress,
+            model,
+            requestChars,
+            () => markResponsesAvailable(connectionId),
+          );
+          return; // success — no fallback needed
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            markResponsesUnavailable(connectionId);
+            // Issue #40 — explicit choice: do NOT silently fall back.
+            // Surface an actionable error so the user knows their
+            // explicit endpoint is unsupported by this connection.
+            if (isPreferredEndpointExplicit) {
+              logger.info(
+                `Explicit /v1/responses 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+              );
+              throw endpointExplicitUnavailableError('responses', connectionId);
+            }
             logger.info(
-              `Explicit /v1/responses 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+              `Auto-mode fallback: /v1/responses returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
             );
-            throw endpointExplicitUnavailableError('responses', connectionId);
+            // fall through to /chat/completions below
+          } else {
+            throw error; // non-404 — surface, no fallback (no double billing)
           }
-          logger.info(
-            `Auto-mode fallback: /v1/responses returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
-          );
-          // fall through to /chat/completions below
-        } else {
-          throw error; // non-404 — surface, no fallback (no double billing)
         }
       }
-    }
 
-    // /chat/completions path — primary when global/per-connection
-    // setting is 'chat', fallback when 'responses' returned 404, or
-    // always for local Ollama.
-    if (!isLocal && primaryEndpoint === 'chat' && !isChatKnownUnavailable(connectionId)) {
-      try {
-        await this.runStream(
-          (callbacks) =>
-            client.streamChat(
-              {
-                model: model.apiModel,
-                // ADR 0007 — `/chat/completions` consumes the
-                // FILTERED payload (`filteredMessages` +
-                // `filteredTools`). At `off` these are the unfiltered
-                // originals, so the 375-test regression path is
-                // untouched.
-                messages: filteredMessages,
-                tools: filteredTools,
-                tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                extraBody: requestConfiguration.openaiBody,
-              },
-              callbacks,
-              token,
-            ),
-          progress,
-          model,
-          requestChars,
-          () => markChatAvailable(connectionId),
-        );
-        return; // success — no fallback needed
-      } catch (error) {
-        if (error instanceof HttpError && error.status === 404) {
-          markChatUnavailable(connectionId);
-          // Issue #40 — explicit choice: do NOT silently fall back.
-          if (isPreferredEndpointExplicit) {
+      // /chat/completions path — primary when global/per-connection
+      // setting is 'chat', fallback when 'responses' returned 404, or
+      // always for local Ollama.
+      if (!isLocal && primaryEndpoint === 'chat' && !isChatKnownUnavailable(connectionId)) {
+        try {
+          await this.runStream(
+            (callbacks) =>
+              client.streamChat(
+                {
+                  model: model.apiModel,
+                  // ADR 0007 — `/chat/completions` consumes the
+                  // FILTERED payload (`filteredMessages` +
+                  // `filteredTools`). At `off` these are the unfiltered
+                  // originals, so the 375-test regression path is
+                  // untouched.
+                  messages: filteredMessages,
+                  tools: filteredTools,
+                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                  extraBody: requestConfiguration.openaiBody,
+                },
+                callbacks,
+                token,
+              ),
+            progress,
+            model,
+            requestChars,
+            () => markChatAvailable(connectionId),
+          );
+          return; // success — no fallback needed
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            markChatUnavailable(connectionId);
+            // Issue #40 — explicit choice: do NOT silently fall back.
+            if (isPreferredEndpointExplicit) {
+              logger.info(
+                `Explicit /chat/completions 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+              );
+              throw endpointExplicitUnavailableError('chat', connectionId);
+            }
             logger.info(
-              `Explicit /chat/completions 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+              `Auto-mode fallback: /chat/completions returned 404 for connection "${connectionId}" — retrying on /v1/responses`,
             );
-            throw endpointExplicitUnavailableError('chat', connectionId);
+            // fall through to /v1/responses below
+          } else {
+            throw error; // non-404 — surface, no fallback
           }
-          logger.info(
-            `Auto-mode fallback: /chat/completions returned 404 for connection "${connectionId}" — retrying on /v1/responses`,
-          );
-          // fall through to /v1/responses below
-        } else {
-          throw error; // non-404 — surface, no fallback
         }
       }
-    }
 
-    // If we reach here, either:
-    //   - primary was 'responses' and 404'd → /chat/completions fallback
-    //   - primary was 'chat' and 404'd → /v1/responses fallback
-    //   - local connection → /chat/completions (the only path)
-    // For local connections, this is the only path and there is no
-    // fallback. For cloud/remote, this is the fallback from the
-    // primary endpoint's 404.
-    if (!isLocal && primaryEndpoint === 'chat' && isChatKnownUnavailable(connectionId)) {
-      // /chat/completions 404'd earlier → try /v1/responses as fallback
-      try {
-        const responsesClient = new ResponsesClient(
-          clientBaseUrl,
-          apiKey ?? '',
-          connection,
-        );
-        // ADR 0007 — same filtered-payload routing as the primary
-        // /v1/responses path above.
-        const { input, instructions } =
-          filterReport !== undefined
-            ? convertOpenAIMessagesToResponsesInput(filteredMessages)
-            : convertToResponsesInput(messages);
-        const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
-        await this.runStream(
-          (callbacks) =>
-            responsesClient.streamResponses(
-              {
-                model: model.apiModel ?? model.id,
-                input,
-                ...(instructions !== undefined ? { instructions } : {}),
-                ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
-                tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                extraBody: requestConfiguration.openaiBody,
-              },
-              callbacks,
-              token,
-            ),
-          progress,
-          model,
-          requestChars,
-          () => markResponsesAvailable(connectionId),
-        );
-        return;
-      } catch (error) {
-        if (error instanceof HttpError && error.status === 404) {
-          markResponsesUnavailable(connectionId);
-          logger.info(
-            `/v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
+      // If we reach here, either:
+      //   - primary was 'responses' and 404'd → /chat/completions fallback
+      //   - primary was 'chat' and 404'd → /v1/responses fallback
+      //   - local connection → /chat/completions (the only path)
+      // For local connections, this is the only path and there is no
+      // fallback. For cloud/remote, this is the fallback from the
+      // primary endpoint's 404.
+      if (!isLocal && primaryEndpoint === 'chat' && isChatKnownUnavailable(connectionId)) {
+        // /chat/completions 404'd earlier → try /v1/responses as fallback
+        try {
+          const responsesClient = new ResponsesClient(
+            clientBaseUrl,
+            apiKey ?? '',
+            connection,
           );
+          // ADR 0007 — same filtered-payload routing as the primary
+          // /v1/responses path above.
+          const { input, instructions } =
+            filterReport !== undefined
+              ? convertOpenAIMessagesToResponsesInput(filteredMessages)
+              : convertToResponsesInput(messages);
+          const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
+          await this.runStream(
+            (callbacks) =>
+              responsesClient.streamResponses(
+                {
+                  model: model.apiModel ?? model.id,
+                  input,
+                  ...(instructions !== undefined ? { instructions } : {}),
+                  ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
+                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                  extraBody: requestConfiguration.openaiBody,
+                },
+                callbacks,
+                token,
+              ),
+            progress,
+            model,
+            requestChars,
+            () => markResponsesAvailable(connectionId),
+          );
+          return;
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            markResponsesUnavailable(connectionId);
+            logger.info(
+              `/v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
+            );
+          }
+          throw error;
         }
-        throw error;
       }
-    }
 
-    // /chat/completions — the final fallback (from responses 404) or
-    // the only path for local Ollama.
-    await this.runStream(
-      (callbacks) =>
-        client.streamChat(
-          {
-            model: model.apiModel,
-            // ADR 0007 — `/chat/completions` consumes the FILTERED
-            // payload (`filteredMessages` + `filteredTools`). At `off`
-            // these are the unfiltered originals.
-            messages: filteredMessages,
-            tools: filteredTools,
-            tool_choice: resolveToolChoice(options.toolMode, options.tools),
-            extraBody: requestConfiguration.openaiBody,
-          },
-          callbacks,
-          token,
-        ),
-      progress,
-      model,
-      requestChars,
-      isLocal ? undefined : () => markChatAvailable(connectionId),
-    );
+      // /chat/completions — the final fallback (from responses 404) or
+      // the only path for local Ollama.
+      await this.runStream(
+        (callbacks) =>
+          client.streamChat(
+            {
+              model: model.apiModel,
+              // ADR 0007 — `/chat/completions` consumes the FILTERED
+              // payload (`filteredMessages` + `filteredTools`). At `off`
+              // these are the unfiltered originals.
+              messages: filteredMessages,
+              tools: filteredTools,
+              tool_choice: resolveToolChoice(options.toolMode, options.tools),
+              extraBody: requestConfiguration.openaiBody,
+            },
+            callbacks,
+            token,
+          ),
+        progress,
+        model,
+        requestChars,
+        isLocal ? undefined : () => markChatAvailable(connectionId),
+      );
+    } catch (error) {
+      logger.error('provideLanguageModelChatResponse failed.', error);
+      throw classifyStreamError(error);
+    }
   }
 
   async provideTokenCount(
