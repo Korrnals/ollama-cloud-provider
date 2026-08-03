@@ -115,27 +115,45 @@ function classifyStreamError(error: unknown): Error {
     return new Error(`Ollama Cloud: ${error.serverMessage}`);
   }
   if (error instanceof HttpError) {
+    // Surface the server's actual error message when present (extracted
+    // from the `{"error":"..."}` body by `extractErrorMessage`). Fall
+    // back to a generic Russian message only when the server gave no
+    // detail. Avoid duplicating the HTTP status prefix.
+    const serverMsg =
+      error.message && !error.message.startsWith('HTTP ')
+        ? error.message
+        : '';
     switch (error.status) {
       case 402:
         return vscode.LanguageModelError.Blocked(
-          'Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст.',
+          serverMsg
+            ? `Ollama Cloud: ${serverMsg}`
+            : 'Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст.',
         );
       case 403:
         return vscode.LanguageModelError.Blocked(
-          'Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером.',
+          serverMsg
+            ? `Ollama Cloud: ${serverMsg}`
+            : 'Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером.',
         );
       case 429:
         return vscode.LanguageModelError.Blocked(
-          'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
+          serverMsg
+            ? `Ollama Cloud: ${serverMsg}`
+            : 'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
         );
       case 404:
         return vscode.LanguageModelError.NotFound(
-          'Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен.',
+          serverMsg
+            ? `Ollama Cloud: ${serverMsg}`
+            : 'Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен.',
         );
       default:
         if (error.status >= 500) {
           return new Error(
-            `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud.`,
+            serverMsg
+              ? `Ollama Cloud: Server error (HTTP ${error.status}) — ${serverMsg}`
+              : `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud.`,
           );
         }
         return new Error(`Ollama Cloud: HTTP ${error.status} — ${error.message}`);
