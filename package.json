@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-cloud-provider-icon.png",
