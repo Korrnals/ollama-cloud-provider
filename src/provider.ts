@@ -865,15 +865,10 @@ export class OllamaCloudChatProvider
         throw endpointExplicitUnavailableError('native', connectionId);
       }
 
-      // Phase 1 (2026-08-03 endpoint routing) — native `/api/chat`
-      // path. Opt-in only: triggered by explicit `preferredEndpoint:
-      // 'native'` (per-connection or global). `auto` never resolves
-      // to `native`, so this block is only reached when the user
-      // explicitly chose native. On 404 with explicit mode, throw the
-      // actionable error (no silent fallback). The native path is
-      // reached BEFORE the responses/chat blocks so an explicit
-      // `native` choice never accidentally routes to `/v1/responses`
-      // or `/chat/completions` first.
+      // native `/api/chat` path — reached when primaryEndpoint==='native',
+      // i.e. explicit 'native' OR 'auto' (the default) resolving to native
+      // for cloud. Auto mode uses the 3×404 auto-recovery below; explicit
+      // mode throws on 404 (no silent fallback).
       // Responses API path — restored from v0.7.3 (accidentally removed in v0.8.0
       // endpoint routing rewrite). Uses compat schema (thinking: {type}, not think: true).
       if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {

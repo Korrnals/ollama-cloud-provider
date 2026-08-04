@@ -475,7 +475,7 @@ function normalizeBaseUrl(value: string): string {
 /**
  * ADR 0006 — resolves the `preferredEndpoint` for a connection.
  *
- * - Explicit `'responses'` / `'chat'` are honoured verbatim.
+ * - Explicit `'responses'` / `'chat'` / `'native'` are honoured verbatim.
  * - `'auto'` is honoured verbatim (the provider resolves it at request
  *   time using the capability cache).
  * - Any other value (including `undefined`) falls back to the
@@ -487,7 +487,12 @@ function normalizePreferredEndpoint(
   value: unknown,
   type: ConnectionType,
 ): PreferredEndpoint {
-  if (value === 'responses' || value === 'chat' || value === 'auto') {
+  if (
+    value === 'responses' ||
+    value === 'chat' ||
+    value === 'native' ||
+    value === 'auto'
+  ) {
     return value;
   }
   return type === 'local' ? 'chat' : 'auto';
