@@ -120,18 +120,18 @@
         },
         "ollamaCloud.requestConnectTimeoutMs": {
           "type": "integer",
-          "default": 30000,
+          "default": 60000,
           "minimum": 5000,
           "maximum": 120000,
-          "description": "Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
+          "markdownDescription": "**Advanced** — Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.requestInactivityTimeoutMs": {
           "type": "integer",
-          "default": 90000,
+          "default": 300000,
           "minimum": 10000,
           "maximum": 600000,
-          "description": "Inactivity timeout in milliseconds — reset on every stream chunk and :keep-alive SSE comment. NO retry (mid-stream retry = double billing). Detects dead connections vs slow reasoning. ADR 0005.",
+          "markdownDescription": "⚠️ **Max silence = 120s + this value** (420s at the default). The soft warning fires at 120s and extends the timer to this value — the name reflects the grace ceiling, NOT the total silence budget. See [ADR 0005](docs/adr/0005-streaming-timeout-architecture.md).\n\n**Advanced** — Inactivity timeout in milliseconds — grace period ceiling applied AFTER the soft warning fires. Reset on every stream chunk and :keep-alive SSE comment. Soft warning fires at 120s (logs + extends the timer to this value). Hard kill fires after the full grace period elapses with no new chunks — so total max silence before kill = 120s + this value (420s at the 300s default). Only applies when this value > 120s; at or below 120s the timer fires hard directly (short-timeout path). NO retry (mid-stream retry = double billing). Detects dead connections vs slow reasoning. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.requestMaxDurationMs": {
@@ -139,7 +139,7 @@
           "default": 1800000,
           "minimum": 60000,
           "maximum": 3600000,
-          "description": "Max stream duration in milliseconds — hard ceiling from streamChat entry, never reset. NO retry. Protects token budget from forgotten tabs / crashed callers. ADR 0005.",
+          "markdownDescription": "**Advanced** — Max stream duration in milliseconds — hard ceiling from streamChat entry, never reset. NO retry. Protects token budget from forgotten tabs / crashed callers. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.maxRetries": {
