@@ -56,12 +56,15 @@ test-results/
 .junit.xml
 
 # === Sigstore / SLSA / SBOM artifacts (generated in CI) ===
+# NOTE: cosign.pub is the PUBLIC verification key — it is committed to
+# the repo (see SECURITY.md) so downstream consumers can verify sigstore
+# bundles without an out-of-band channel. The PRIVATE key (cosign.key)
+# stays gitignored via *.key below.
 *.sig
 *.bundle
 *.intoto.json
 *.spdx.json
 *.spdx.xml
-cosign.pub
 
 # === Code review (team-local, never commit) ===
 .cr/
