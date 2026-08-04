@@ -5,41 +5,70 @@
 [![Version](https://img.shields.io/visual-studio-marketplace/v/Korrnals.ollama-cloud-provider?style=flat-square&label=Marketplace)](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/Korrnals.ollama-cloud-provider?style=flat-square)](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider)
 
-# Ollama Cloud Provider
+# Ollama Cloud Provider ✨
 
 **Use Ollama Cloud models in VS Code Copilot Chat.**
 
-## Overview
+## 📖 Overview
 
 Ollama Cloud Provider registers Ollama Cloud models as native VS Code language models, making them available in the Copilot Chat model picker. Configure an API key, select a model, and chat — no wrappers, no extra UI, no separate chat window.
 
 The extension is built for reliability and safety: API keys live in OS-backed secret storage, requests only go to URLs you explicitly allow, and every release is signed and checksummed.
 
-## Key features
+## Contents
+
+- [Quick start](#quick-start)
+- [Key features](#key-features)
+- [Security posture](#security-posture)
+- [Installation](#installation)
+- [Setup](#setup)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Model sync](#model-sync)
+- [Endpoint routing](#endpoint-routing)
+- [Context filtering](#context-filtering)
+- [Vision fallback](#vision-fallback)
+- [License](#license)
+
+## 🚀 Quick start
+
+Three steps from install to first message.
+
+1. **Install** — from the [Marketplace](https://marketplace.visualstudio.com/items?itemName=Korrnals.ollama-cloud-provider) or `code --install-extension Korrnals.ollama-cloud-provider`.
+2. **Set your key** — `Ctrl+Shift+P` (or `Cmd+Shift+P`) → `Ollama Cloud: Set API Key`. Get one at [ollama.com](https://ollama.com/).
+3. **Chat** — open Copilot Chat, pick an Ollama Cloud model from the picker, and send a message. Run `Ollama Cloud: Check Connection` first if you want to confirm the endpoint.
+
+The default endpoint (`auto`, which resolves to `native` `/api/chat` for cloud) works out of the box. No `settings.json` edits required for a standard cloud setup.
+
+## ⭐ Key features
 
 - **Native Copilot Chat integration** — Ollama Cloud models appear in the Copilot Chat model picker as first-class VS Code language models.
+- **Endpoint routing with auto-recovery** — four-way `preferredEndpoint` (`auto` / `native` / `responses` / `chat`). The default is `auto`, which resolves to `native` (`/api/chat`) for cloud and `chat` (`/chat/completions`) for local. In `auto` mode, `native` switches to `/chat/completions` only after 3 consecutive 404s in a 5-min window and returns to `native` after 5 min of silence — connections self-heal without a restart. See [Endpoint routing](#endpoint-routing) and ADR 0009.
+- **Native `/api/chat` for cloud, OpenAI-compat for local** — cloud uses Ollama's native API by default (first-class `think`, object `tool_calls`, full-event streaming, Ollama metrics). Local uses `/chat/completions` (OpenAI-compat, SSE).
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
 - **Context filtering (token savings)** — optional pre-processing that drops duplicate messages, empty content parts, and redundant tool definitions, and compacts the system prompt — reducing token cost without touching semantic content. Tool-call integrity is guaranteed; vision content is never filtered. Three levels (`off` / `safe` / `aggressive`), `off` by default. See [Context filtering](#context-filtering).
-- **Native `/api/chat` for cloud, OpenAI-compat for local** — cloud connections use Ollama's native API by default (first-class `think`, object tool_calls, full-event streaming, Ollama metrics). Local connections use `/chat/completions` (OpenAI-compat, SSE). 4-way `preferredEndpoint` override (`auto`/`native`/`chat`/`responses`). See ADR 0009.
 - **Structured error surfacing** — server-sent mid-stream errors (`{"error":"..."}`) are caught as `MidStreamError` and shown with the real server message instead of a raw `aborted at TLSSocket.socketCloseListener` stack. HTTP 402/403/429/5xx are classified into human-readable `LanguageModelError` messages (including the server's actual reason, e.g. "this model uses extra usage only"). Zero-byte socket close (HTTP 200 + headers + no body) is surfaced as a retryable error instead of a silent empty success. See ADR 0008.
 - **Proxy-aware networking** — a native HTTP client bypasses VS Code's `global.fetch()` interception, fixing connect-timeout issues under `chat.agent.sandbox.enabled: "on"`. Respects the `http.proxy` VS Code setting.
-- **Tool calling** — fully supported via `/v1/responses` with top-level `function_call` / `function_call_output` input items (OpenAI Responses API spec). Handled natively by VS Code, with no shell execution from the extension.
+- **Tool calling** — fully supported on `/v1/responses` (top-level `function_call` / `function_call_output` items) and on native `/api/chat` (object tool args). Handled natively by VS Code, with no shell execution from the extension.
 - **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
 - **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
-- **Retry and timeout** — exponential backoff for transient failures, three-tier streaming timeout (see ADR 0005).
-- **Streaming timeout architecture** — three timers protect against dead connections without killing legitimate long-reasoning streams: connect timeout (30s, retried), inactivity timeout (90s, reset on each chunk), max-duration safety cap (30 min, prevents forgotten-tab token leaks).
+- **Retry and streaming timeouts** — exponential backoff for transient failures, plus a soft/grace inactivity timer that accommodates long-reasoning streams while still killing dead connections.
+- **Soft/grace streaming timers (ADR 0005)** — three timers protect against dead connections without killing legitimate long-reasoning streams: **connect** 60 s (retried via `maxRetries`), **inactivity** soft warning at 120 s → grace ceiling 300 s (reset on every chunk; total max silence = 120 s + 300 s = **420 s** before kill), **max-duration** safety cap 30 min (never reset, prevents forgotten-tab token leaks).
+- **Manual endpoint override** — `Ollama Cloud: Switch Endpoint` opens a picker to override the endpoint (`auto` / `native` / `chat` / `responses`) at any time, without editing `settings.json`.
 - **Health check** — probe the endpoint and discover models before chatting.
 - **Configuration validation** — catch misconfiguration (missing key, URL not whitelisted) before it breaks a chat.
 
-## Security posture
+## 🔒 Security posture
 
 Security is a first-class concern:
 
-- **Supply chain integrity** — every release is signed and checksummed.
+- **Supply chain integrity** — every release is signed and checksummed (SHA256 + cosign keypair + GPG).
 - **Secret safety** — API keys live in OS-backed secret storage, never in settings files or logs.
 - **Network boundary** — requests only go to URLs you explicitly allow.
 
-## Installation
+See [SECURITY.md](SECURITY.md) for the full threat model and [ADR 0001](docs/adr/0001-security-goals.md) / [ADR 0002](docs/adr/0002-signing-strategy.md).
+
+## 📦 Installation
 
 ### From the VS Code Marketplace (recommended)
 
@@ -60,7 +89,7 @@ sha256sum -c sha256.txt
 code --install-extension ollama-cloud-provider-*.vsix
 ```
 
-Releases are signed; see the release notes for signature verification details.
+Releases are signed with cosign (keypair mode) and GPG; see [SECURITY.md](SECURITY.md) and the release notes for signature verification details.
 
 ### From source
 
@@ -75,7 +104,7 @@ npm run package
 code --install-extension ollama-cloud-provider-*.vsix
 ```
 
-## Setup
+## ⚙️ Setup
 
 ### 1. Get an API key
 
@@ -107,8 +136,9 @@ Three ways to configure — pick one.
 {
   "ollamaCloud.baseUrl": "https://ollama.com/v1",
   "ollamaCloud.allowedBaseUrls": ["https://ollama.com/v1"],
-  "ollamaCloud.requestConnectTimeoutMs": 30000,
-  "ollamaCloud.requestInactivityTimeoutMs": 90000,
+  "ollamaCloud.preferredEndpoint": "auto",
+  "ollamaCloud.requestConnectTimeoutMs": 60000,
+  "ollamaCloud.requestInactivityTimeoutMs": 300000,
   "ollamaCloud.requestMaxDurationMs": 1800000,
   "ollamaCloud.maxRetries": 3,
   "ollamaCloud.connections": [
@@ -131,16 +161,17 @@ For the API key, use `Ollama Cloud: Set API Key` — it stores the key in secret
 
 Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endpoint and discover models. Then open Copilot Chat and select a model from the picker.
 
-## Configuration
+## 🔧 Configuration
 
 | Setting | Default | Description |
 |---|---|---|
 | `ollamaCloud.apiKey` | `""` | Fallback API key. Prefer `Ollama Cloud: Set API Key` (stores in secret storage). |
 | `ollamaCloud.baseUrl` | `https://ollama.com/v1` | API base URL. Must be in `allowedBaseUrls`. |
 | `ollamaCloud.allowedBaseUrls` | `["https://ollama.com/v1"]` | Whitelist of permitted base URLs. |
-| `ollamaCloud.requestConnectTimeoutMs` | `30000` | Max time for initial connection. Retried via `maxRetries` on timeout. |
-| `ollamaCloud.requestInactivityTimeoutMs` | `90000` | Max gap between stream chunks. Reset on every chunk. No retry (mid-stream retry = double billing). |
-| `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (safety cap). Never reset. No retry. |
+| `ollamaCloud.preferredEndpoint` | `"auto"` | Primary endpoint for cloud/remote. Enum: `"auto"` (default — resolves to `native` (`/api/chat`) for cloud, `chat` (`/chat/completions`) for local; auto-select with 3×404 auto-recovery — switches after 3 consecutive 404s in 5 min, returns to native after 5 min silence), `"native"` (`/api/chat` — ndjson, first-class `think`, object tool args), `"responses"` (`/v1/responses` — structured reasoning, typed events), `"chat"` (`/chat/completions` — classic OpenAI-compatible). Local Ollama always uses `/chat/completions`. Per-connection `preferredEndpoint` overrides this. See [Endpoint routing](#endpoint-routing). |
+| `ollamaCloud.requestConnectTimeoutMs` | `60000` | Max time for the initial connection (60 s). Retried via `maxRetries` on timeout. ADR 0005. |
+| `ollamaCloud.requestInactivityTimeoutMs` | `300000` | Grace ceiling applied **after** the 120 s soft warning (300 s default). Reset on every chunk. Total max silence before kill = 120 s + this value (**420 s** at default). No retry (mid-stream retry = double billing). ADR 0005. |
+| `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (30 min, safety cap). Never reset. No retry. |
 | `ollamaCloud.requestTimeoutMs` | `120000` | **Deprecated** — use `requestMaxDurationMs`. Alias for backward compat. |
 | `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx, connect timeout). |
 | `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. Each connection can override the global `ollamaCloud.contextFilter.level` via a per-connection `contextFilter.level` (`off`/`safe`/`aggressive` override; `auto` inherits). |
@@ -148,17 +179,17 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback. Opt-in. |
 | `ollamaCloud.visionFallback.model` | `""` | Vision-capable model id for fallback. If empty, auto-searches the primary connection's catalog for the first vision-capable model. |
 | `ollamaCloud.visionFallback.connection` | `""` | Connection id for the vision model. If empty, uses the primary connection. |
-| `ollamaCloud.preferredEndpoint` | `"responses"` | Primary API endpoint for cloud/remote connections. `"responses"` uses `/v1/responses` (structured reasoning, typed events, first-class tool calling); `"chat"` uses `/chat/completions` (classic OpenAI-compatible). The other endpoint is the automatic fallback on HTTP 404. Local Ollama always uses `/chat/completions` regardless. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this. |
 | `ollamaCloud.contextFilter.level` | `"off"` | Context filtering level (ADR 0007): `off` (no filtering), `safe` (structural cleanup — duplicate messages, empty parts, redundant tools, system-prompt whitespace), `aggressive` (safe + context-window truncation + similar-message merging + metadata stripping). See [Context filtering](#context-filtering). Per-connection `contextFilter.level` overrides this global (`auto` inherits). |
 
 All settings are `scope: "application"` — workspace folders cannot override them.
 
-## Commands
+## 🎯 Commands
 
 | Command | Description |
 |---|---|
 | `Ollama Cloud: Set API Key` | Store the API key in OS-backed secret storage. |
 | `Ollama Cloud: Clear API Key` | Remove the stored key. |
+| `Ollama Cloud: Switch Endpoint` | Pick an endpoint override (`auto` / `native` / `chat` / `responses`) and update `preferredEndpoint`. Capability cache refreshes immediately; model-picker tooltip follows. |
 | `Ollama Cloud: Check Connection` | Probe the configured endpoint. |
 | `Ollama Cloud: Validate Configuration` | Validate settings (URL in whitelist, key present). |
 | `Ollama Cloud: Set Vision Fallback Model` | Pick a vision-capable model from the catalog. |
@@ -167,7 +198,7 @@ All settings are `scope: "application"` — workspace folders cannot override th
 | `Ollama Cloud: Show Registered Models` | List models registered with VS Code. |
 | `Ollama Cloud: Show Logs` | Open the extension output channel. |
 
-## Model Sync
+## 🔄 Model sync
 
 The extension automatically syncs the model catalog from the cloud endpoint:
 
@@ -175,17 +206,44 @@ The extension automatically syncs the model catalog from the cloud endpoint:
 - **On config change** — changing `ollamaCloud.baseUrl`, `ollamaCloud.connections`, or `ollamaCloud.allowedBaseUrls` triggers a sync (with a 30s cooldown to avoid spamming).
 - **Manual refresh** — run `Ollama Cloud: Refresh Models` to force a sync at any time, bypassing the cooldown. The command shows a progress notification and displays the model count on completion.
 
-## `/v1/responses` Endpoint
+## 🔀 Endpoint routing
 
-Since v0.6.0, cloud connections use the OpenAI `/v1/responses` API as the primary endpoint, with `/chat/completions` as a fallback. Benefits:
+The extension supports four endpoints, selected by `preferredEndpoint` (default `auto`):
 
-- **Structured reasoning** — reasoning/thinking tokens are surfaced as collapsed thinking blocks in Copilot Chat (`LanguageModelThinkingPart`, VS Code 1.103+).
-- **Typed streaming events** — `response.created`, `response.reasoning_summary_text.delta`, `response.output_text.delta`, `response.completed`.
-- **First-class tool calling** — tool calls and results are top-level `function_call` / `function_call_output` input items, matching the OpenAI Responses API spec.
+| Value | Path | Wire format | Notes |
+|---|---|---|---|
+| `auto` | resolves to `native` (cloud) / `chat` (local) / `responses` (vision pass-through) | — | **Setting default.** Auto-select with auto-recovery (see below). |
+| `native` | `/api/chat` | Ollama ndjson | First-class `think`, object `tool_calls`, full-event streaming, Ollama metrics. What `auto` resolves to for cloud. |
+| `responses` | `/v1/responses` | OpenAI Responses SSE | Structured reasoning (`reasoning_summary_text.delta`), typed events (`response.created` / `response.completed`), first-class tool calling via top-level `function_call` / `function_call_output` items. What `auto` resolves to for vision pass-through. |
+| `chat` | `/chat/completions` | OpenAI SSE | Classic OpenAI-compatible. What `auto` resolves to for local. Local Ollama always uses this regardless of the setting. |
 
-Local Ollama connections always use `/chat/completions` (local Ollama does not implement `/v1/responses`). Cloud connections with `preferredEndpoint: 'chat'` also use `/chat/completions` directly. The capability cache memoizes 404 responses per connection, so the fallback to `/chat/completions` happens instantly after the first 404.
+Local Ollama connections always use `/chat/completions` regardless of `preferredEndpoint` (local Ollama does not implement `/api/chat` in OpenAI-native form or `/v1/responses`). Vision pass-through always uses `/v1/responses` (`auto`/`native` resolve to `responses` for the vision turn).
 
-## Context filtering
+### Auto-recovery (3×404 counter)
+
+In `auto` mode, a single native (`/api/chat`) 404 does **not** switch the connection off for the rest of the session. The recovery logic:
+
+- **3 consecutive 404s** within a 5-min sliding window (`shouldAutoSwitch`) → switch to `/chat/completions`.
+- **Any success** resets the 404 counter (`reset404s`).
+- **After 5 min of silence** the native endpoint is retried (`shouldRetryAfterSilence`), so connections auto-recover without a restart or config change.
+- **Stale entries older than 10 min** are pruned (`sweepStaleEntries`, anti-flapping).
+
+The `responses` and `chat` endpoints still mark unavailable on the **first** 404 — they are stable, so a single 404 means truly unsupported. Only `native` uses the 3×404 counter because it is newer and may flap during rollout. The capability cache memoizes 404s per connection, so the fallback path is instant after the first 404.
+
+To override the endpoint manually at any time, run `Ollama Cloud: Switch Endpoint`.
+
+See [ADR 0006](docs/adr/0006-responses-endpoint-primary.md), [ADR 0008](docs/adr/0008-stream-error-handling.md), and [ADR 0009](docs/adr/0009-endpoint-routing.md).
+
+### When to choose which endpoint
+
+| If you want… | Use |
+|---|---|
+| The documented Ollama Cloud default, self-healing, no tuning | `auto` (default) |
+| Native `/api/chat` without auto-recovery | `native` |
+| Structured reasoning blocks in Copilot Chat | `responses` |
+| Maximum OpenAI-compat compatibility | `chat` |
+
+## ✂️ Context filtering
 
 Long chat sessions and tool-heavy workflows re-send the same trailing context every turn, advertise duplicate tool definitions, and accumulate whitespace the model bills for but ignores. Context filtering is an optional pre-processing step that removes this structural redundancy from the payload **before** it reaches the convert step — lowering token cost while preserving the semantic content of the request and the quality of the response. It removes redundancy only (duplicates, empty parts, whitespace, ignorable metadata); it never removes meaning. Both `/v1/responses` and `/chat/completions` benefit, because the filter runs at the shared provider entry point before the endpoint-specific convert. See [ADR 0007](docs/adr/0007-context-filtering.md) for the full specification.
 
@@ -248,7 +306,7 @@ Context filter: level=safe before=12345chars after=10500chars saved=15% (3 messa
 
 `before`/`after` are char-based estimates (the extension has no tokenizer dependency); `saved` is the percentage reduction. The parenthetical field order is `messages dropped, tools dropped, merged, truncated`. Additional one-line diagnostics list each class of action (`dropped N duplicate messages`, `merged N similar pairs`, `truncated N oldest messages`, `dropped N duplicate tools`, `stripped metadata from N fields`), emitted only when that count is non-zero. Orphaned tool outputs (e.g. a tool result whose matching assistant call was dropped) are folded into `messages dropped` and reported under `dropped N duplicate messages`, not as a separate line.
 
-## Vision Fallback
+## 👁️ Vision fallback
 
 When the selected model cannot handle images, the extension can automatically use a vision-capable model you configure. The vision model answers for that turn only; the next turn returns to the primary model. Opt-in, with a routing disclosure notification.
 
@@ -259,6 +317,6 @@ To enable:
 3. Optionally run `Ollama Cloud: Set Vision Fallback Connection` if the vision model lives on a different connection.
 4. Send an image to a non-vision model — the extension swaps to the vision model for that turn and notifies.
 
-## License
+## 📄 License
 
 MIT — see [LICENSE](LICENSE).

@@ -70,13 +70,16 @@ const PROVIDER_TOOLTIP = 'Ollama Cloud';
  *   - explicit `responses`    → `/v1/responses`
  *   - explicit `chat`         → `/chat/completions`
  *   - explicit `native`       → `/api/chat (native)`
- *   - `auto` (default)        → `auto (resolves to /v1/responses)` when
- *     the global `preferredEndpoint` is the default `'responses'`,
- *     otherwise `auto (resolves to /chat/completions)`.
+ *   - `auto` (default)        → `auto (resolves to /api/chat (native))`
+ *     when the global `preferredEndpoint` is the default `'auto'`,
+ *     otherwise reflects the explicit global choice.
  *
- * Phase 1 (2026-08-03 endpoint routing) — `'native'` is a third
- * explicit option. `'auto'` still resolves to `'responses'` or
- * `'chat'` (NOT `'native'`), so the default behaviour is unchanged.
+ * Endpoint routing (ADR 0009) — `auto` (the default) resolves to
+ * `native` (`/api/chat`) for cloud connections and `chat`
+ * (`/chat/completions`) for local connections. Users can explicitly
+ * choose `native` / `responses` / `chat` to override. The capability
+ * cache + 404 fallback (native → chat) covers connections that don't
+ * support `/api/chat`.
  *
  * The label is deliberately short and contains no host or auth material
  * so it is safe to surface in a tooltip and in the output log.
@@ -95,11 +98,19 @@ function resolveEndpointLabel(connection: ConnectionConfig | undefined): string 
   if (preferred === 'native') {
     return '/api/chat (native)';
   }
-  // auto — resolves against the global setting.
+  // auto — resolves against the global setting. The package.json default
+  // is 'auto', which resolves to native (/api/chat) for cloud. An explicit
+  // global 'responses'/'chat'/'native' overrides that.
   const globalPreferred = vscode.workspace
     .getConfiguration('ollamaCloud')
-    .get<'responses' | 'chat' | 'native'>('preferredEndpoint', 'responses');
-  return `auto (resolves to ${globalPreferred === 'chat' ? '/chat/completions' : globalPreferred === 'native' ? '/api/chat (native)' : '/v1/responses'})`;
+    .get<'responses' | 'chat' | 'native' | 'auto'>('preferredEndpoint', 'auto');
+  const resolvesTo =
+    globalPreferred === 'auto' || globalPreferred === 'native'
+      ? '/api/chat (native)'
+      : globalPreferred === 'chat'
+        ? '/chat/completions'
+        : '/v1/responses';
+  return `auto (resolves to ${resolvesTo})`;
 }
 
 /**
@@ -429,7 +440,7 @@ export class OllamaCloudChatProvider
     type EndpointPick = vscode.QuickPickItem & { value: 'auto' | 'native' | 'chat' | 'responses' };
     const current = vscode.workspace
       .getConfiguration('ollamaCloud')
-      .get<'auto' | 'native' | 'chat' | 'responses'>('preferredEndpoint', 'native');
+      .get<'auto' | 'native' | 'chat' | 'responses'>('preferredEndpoint', 'auto');
     const items: EndpointPick[] = [
       {
         label: 'Auto',
@@ -622,7 +633,7 @@ export class OllamaCloudChatProvider
 
       // ADR 0006 — endpoint selection. The user picks a primary endpoint
       // via `ollamaCloud.preferredEndpoint` (global setting, default
-      // `'responses'`). Per-connection `preferredEndpoint` overrides
+      // `'auto'`). Per-connection `preferredEndpoint` overrides
       // this: `'responses'`/`'chat'` are explicit; `'auto'` inherits the
       // global setting.
       //
@@ -673,9 +684,18 @@ export class OllamaCloudChatProvider
       // Users can still explicitly choose `responses`/`chat`/`native` to
       // override. The capability cache + 404 fallback (native → chat)
       // covers connections that don't support `/api/chat`.
-      const globalPreferred = globalConfig.get<'responses' | 'chat' | 'native'>(
+      //
+      // The package.json default for `preferredEndpoint` is `'auto'`, so
+      // when a user never configures the setting, `.get()` returns
+      // `'auto'`. Resolve `'auto'` explicitly to `native` (cloud) / `chat`
+      // (local) below — without this, `globalPreferred === 'auto'` would
+      // flow into `primaryEndpoint`, and no dispatch block matches
+      // `primaryEndpoint === 'auto'` (see the dispatch blocks below and
+      // ADR 0009).
+      const globalPreferred = globalConfig.get<'responses' | 'chat' | 'native' | 'auto'>
+      (
         'preferredEndpoint',
-        'native',
+        'auto',
       );
       const isPreferredEndpointExplicit =
         !isLocal &&
@@ -684,11 +704,22 @@ export class OllamaCloudChatProvider
           connectionPreferred === 'native' ||
           (connectionPreferred === 'auto' && globalPreferredExplicit));
 
+      // Resolve 'auto' explicitly: cloud → native (/api/chat per ADR 0009),
+      // local → chat (local Ollama has no /api/chat). Without this, a user
+      // who never configured preferredEndpoint inherits package.json
+      // default 'auto', and globalPreferred would be 'auto' — a value no
+      // dispatch block matches.
+      const resolvedGlobal =
+        isLocal
+          ? 'chat'
+          : globalPreferred === 'auto'
+            ? 'native'
+            : globalPreferred;
       const primaryEndpoint: 'responses' | 'chat' | 'native' =
         isLocal
           ? 'chat'
           : connectionPreferred === 'auto'
-            ? globalPreferred
+            ? resolvedGlobal
             : connectionPreferred;
 
       // ADR 0007 — resolve the effective context-filter level and run
@@ -834,15 +865,10 @@ export class OllamaCloudChatProvider
         throw endpointExplicitUnavailableError('native', connectionId);
       }
 
-      // Phase 1 (2026-08-03 endpoint routing) — native `/api/chat`
-      // path. Opt-in only: triggered by explicit `preferredEndpoint:
-      // 'native'` (per-connection or global). `auto` never resolves
-      // to `native`, so this block is only reached when the user
-      // explicitly chose native. On 404 with explicit mode, throw the
-      // actionable error (no silent fallback). The native path is
-      // reached BEFORE the responses/chat blocks so an explicit
-      // `native` choice never accidentally routes to `/v1/responses`
-      // or `/chat/completions` first.
+      // native `/api/chat` path — reached when primaryEndpoint==='native',
+      // i.e. explicit 'native' OR 'auto' (the default) resolving to native
+      // for cloud. Auto mode uses the 3×404 auto-recovery below; explicit
+      // mode throws on 404 (no silent fallback).
       // Responses API path — restored from v0.7.3 (accidentally removed in v0.8.0
       // endpoint routing rewrite). Uses compat schema (thinking: {type}, not think: true).
       if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {

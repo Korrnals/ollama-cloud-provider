@@ -5,6 +5,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-05
+
+### Fixed
+- **`preferredEndpoint` default corrected to `auto`** — the setting default was `"native"`, but the intended behaviour (per ADR 0009) is `auto`, which resolves to `native` (`/api/chat`) for cloud connections and `chat` (`/chat/completions`) for local. The previous `"native"` default worked only because the runtime relied on the package.json default flowing through `config.get()`, which masked a latent bug: no dispatch block matched `primaryEndpoint === 'auto'` literally.
+- **Latent `auto`-resolution bug fixed** — `globalPreferred === 'auto'` (the package.json default flowing through `.get()`) is now explicitly resolved to `native` (cloud) / `chat` (local) / `responses` (vision pass-through) at the dispatch point. Without this, changing the default to `auto` would have regressed cloud routing (requests fell through all dispatch blocks unmatched). All four `.get('preferredEndpoint', ...)` call sites aligned to the `'auto'` fallback; the type union widened to include `'auto'`.
+- **Regression test added** — `(e) production-default routing` covers the package.json-default-through-`.get()` path that the test harness previously masked.
+- **Stale Phase-1 JSDoc removed** — the comment claiming "`auto` resolves to `responses` or `chat` (NOT native)" contradicted the Phase-2 code; rewritten to match ADR 0009.
+
+### Notes
+- Requires `package.json` version bump `0.9.0` → `0.9.1` (tracked separately — SSE owns the version line).
+
 ## [0.9.0] - 2026-08-04
 
 ### Added

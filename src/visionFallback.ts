@@ -289,9 +289,9 @@ export async function executePassThrough(
 
   // ADR 0006 Phase 3 — endpoint dispatch mirrors `provider.ts`.
   // The user picks a primary endpoint via the global
-  // `ollamaCloud.preferredEndpoint` setting (default 'responses').
-  // Per-connection `preferredEndpoint` overrides this. The other
-  // endpoint is the automatic fallback on HTTP 404. Local Ollama
+  // `ollamaCloud.preferredEndpoint` setting (default 'auto'). An
+  // explicit per-connection `preferredEndpoint` overrides this. The
+  // other endpoint is the automatic fallback on HTTP 404. Local Ollama
   // always uses /chat/completions. The capability cache
   // short-circuits the primary attempt once a prior 404 has been
   // memoized. No mid-stream fallback — POST is non-idempotent and a
@@ -302,24 +302,25 @@ export async function executePassThrough(
   const connectionPreferred = visionConnection?.preferredEndpoint ?? 'auto';
   const globalPreferred = vscode.workspace
     .getConfiguration('ollamaCloud')
-    .get<'responses' | 'chat' | 'native'>('preferredEndpoint', 'responses');
-  // Phase 1 — `native` is a third explicit endpoint. The vision
-  // pass-through path does NOT yet implement a native dispatch block
-  // (it would need `convertMessagesToNative` + a native `OllamaClient`).
-  // If the user explicitly chose `native` on a vision-fallback
-  // connection, fall back to the existing `/chat/completions` path
-  // (the OpenAI-compat shape) rather than silently mishandling the
-  // native wire format. Native vision pass-through is deferred to a
-  // follow-up slice — `auto` still resolves to `responses` (default)
-  // or `chat`, never `native`, so this branch is only reachable on
-  // an explicit `native` global/per-connection setting.
+    .get<'responses' | 'chat' | 'native' | 'auto'>('preferredEndpoint', 'auto');
+  // Resolve `auto`/`native` explicitly. The vision pass-through path
+  // does NOT yet implement a native dispatch block (it would need
+  // `convertMessagesToNative` + a native `OllamaClient`), so both the
+  // package.json default `'auto'` and an explicit `'native'` resolve to
+  // `responses` (the OpenAI-compat shape). Without this, the default
+  // `'auto'` would flow through as an invalid `'responses' | 'chat'`
+  // value (no dispatch block matches `'auto'`, and `'native'` would
+  // silently mishandle the native wire format). Native vision
+  // pass-through is deferred to a follow-up slice.
+  const resolvedGlobal =
+    globalPreferred === 'auto' || globalPreferred === 'native'
+      ? 'responses'
+      : globalPreferred;
   const primaryEndpoint: 'responses' | 'chat' =
     isLocal
       ? 'chat'
       : connectionPreferred === 'auto'
-        ? globalPreferred === 'native'
-          ? 'responses'
-          : globalPreferred
+        ? resolvedGlobal
         : connectionPreferred === 'native'
           ? 'responses'
           : connectionPreferred;

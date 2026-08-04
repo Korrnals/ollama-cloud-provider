@@ -543,3 +543,68 @@ describe('connections.openAiBaseUrl — baseUrl + openaiCompatiblePath', () => {
     );
   });
 });
+
+/**
+ * Exercises `normalizePreferredEndpoint` via `loadConnections()` (the
+ * function is private; it runs on every declared connection). Covers
+ * all four valid values plus the type-based fallback for invalid /
+ * undefined input.
+ *
+ * Finding #10 (v0.9.1 review): explicit `'native'` previously fell
+ * through to the type-based default because the validation clause
+ * omitted it.
+ */
+describe('connections.loadConnections — preferredEndpoint normalization', () => {
+  function preferredEndpointFor(
+    preferredEndpoint: unknown,
+    type: 'local' | 'remote' = 'remote',
+  ): ConnectionConfig['preferredEndpoint'] {
+    setConfig({
+      baseUrl: 'https://ollama.com/v1',
+      allowedBaseUrls: ['https://ollama.com/v1'],
+      connections: [
+        {
+          id: 'sut',
+          type,
+          baseUrl:
+            type === 'local'
+              ? 'http://localhost:11434'
+              : 'https://vps.example.com/v1',
+          preferredEndpoint,
+        },
+      ],
+    });
+    const conn = findConnection(loadConnections(), 'sut');
+    assert.ok(conn, 'declared connection must survive normalization');
+    return conn!.preferredEndpoint;
+  }
+
+  it('honours an explicit "responses" value verbatim', () => {
+    assert.equal(preferredEndpointFor('responses'), 'responses');
+  });
+
+  it('honours an explicit "chat" value verbatim', () => {
+    assert.equal(preferredEndpointFor('chat'), 'chat');
+  });
+
+  it('honours an explicit "native" value verbatim (finding #10)', () => {
+    // Before the fix this fell through to the type-based default.
+    assert.equal(preferredEndpointFor('native'), 'native');
+  });
+
+  it('honours an explicit "auto" value verbatim', () => {
+    assert.equal(preferredEndpointFor('auto'), 'auto');
+  });
+
+  it('falls back to "auto" for an invalid value on a non-local connection', () => {
+    assert.equal(preferredEndpointFor('yolo'), 'auto');
+  });
+
+  it('falls back to "chat" for an invalid value on a local connection', () => {
+    assert.equal(preferredEndpointFor('yolo', 'local'), 'chat');
+  });
+
+  it('falls back to "chat" for undefined on a local connection', () => {
+    assert.equal(preferredEndpointFor(undefined, 'local'), 'chat');
+  });
+});
