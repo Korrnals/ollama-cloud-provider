@@ -417,6 +417,70 @@ export class OllamaCloudChatProvider
     );
   }
 
+  /**
+   * v0.9.0 Fix 4 — command handler for `ollamaCloud.switchEndpoint`.
+   * Shows a QuickPick with auto/native/chat/responses and updates the
+   * global `ollamaCloud.preferredEndpoint` setting. Fires the
+   * information emitter so the model picker tooltip refreshes
+   * immediately (no reload needed). The onDidChangeConfiguration
+   * listener clears the capability cache on the setting change.
+   */
+  async switchEndpoint(): Promise<void> {
+    type EndpointPick = vscode.QuickPickItem & { value: 'auto' | 'native' | 'chat' | 'responses' };
+    const current = vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .get<'auto' | 'native' | 'chat' | 'responses'>('preferredEndpoint', 'native');
+    const items: EndpointPick[] = [
+      {
+        label: 'Auto',
+        description: 'Automatically select endpoint with auto-recovery',
+        detail: 'Switches to fallback on 3 consecutive 404s, returns to primary after 5 min',
+        value: 'auto',
+        picked: current === 'auto',
+      },
+      {
+        label: 'Native (/api/chat)',
+        description: 'Native Ollama endpoint',
+        detail: 'ndjson wire format, object tool arguments, images[] for vision',
+        value: 'native',
+        picked: current === 'native',
+      },
+      {
+        label: 'Chat (/chat/completions)',
+        description: 'Classic OpenAI-compatible endpoint',
+        detail: 'Falls back to /v1/responses on HTTP 404',
+        value: 'chat',
+        picked: current === 'chat',
+      },
+      {
+        label: 'Responses (/v1/responses)',
+        description: 'Structured reasoning, typed events, first-class tool calling',
+        detail: 'Falls back to /chat/completions on HTTP 404',
+        value: 'responses',
+        picked: current === 'responses',
+      },
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Ollama Cloud: Switch Endpoint',
+      placeHolder: `Current: ${current}`,
+      canPickMany: false,
+    });
+    if (picked === undefined) {
+      return; // user dismissed
+    }
+    await vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .update('preferredEndpoint', picked.value, vscode.ConfigurationTarget.Global);
+    logger.info(
+      `Endpoint switched via command palette: ${picked.value} (was ${current})`,
+    );
+    // The onDidChangeConfiguration listener fires the emitter and clears
+    // the cache, so no explicit fire is needed here. But fire once more
+    // defensively in case the update was a no-op (same value) and the
+    // tooltip detail still needs a refresh.
+    this.onDidChangeLanguageModelChatInformationEmitter.fire();
+  }
+
   async validateConfig(): Promise<void> {
     // Issue 16 — delegate to the configValidator module. It runs the
     // full validation suite (baseUrl whitelist, API key, reachability,

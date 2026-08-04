@@ -82,6 +82,11 @@
       {
         "command": "ollamaCloud.refreshModels",
         "title": "Ollama Cloud: Refresh Models"
+      },
+      {
+        "command": "ollamaCloud.switchEndpoint",
+        "title": "Ollama Cloud: Switch Endpoint",
+        "category": "Ollama Cloud"
       }
     ],
     "configuration": {

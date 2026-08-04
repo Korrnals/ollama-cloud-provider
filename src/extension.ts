@@ -125,6 +125,9 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.commands.registerCommand('ollamaCloud.refreshModels', () =>
         provider.refreshModelsCommand(),
       ),
+      vscode.commands.registerCommand('ollamaCloud.switchEndpoint', () =>
+        provider.switchEndpoint(),
+      ),
       vscode.lm.registerLanguageModelChatProvider('ollama-cloud', provider),
     );
 
