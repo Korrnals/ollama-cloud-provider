@@ -167,6 +167,13 @@ echo
 
 # ─── → Step 4: Sigstore cosign signing (L2 — build provenance, optional)
 
+# Cosign L2 runs in keypair mode (cosign.key/cosign.pub): `--key cosign.key`
+# selects the keypair so cosign never enters keyless mode (which would
+# trigger an interactive OAuth browser flow and hang a non-interactive
+# terminal). COSIGN_PASSWORD must be present in the env when the keypair is
+# encrypted. Degrades gracefully if cosign is absent or signing fails — L2
+# is optional; L1 SHA256 + L3 GPG remain the required layers.
+if command -v cosign >/dev/null 2>&1; then
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "  cosign installed — would sign: $VSIX_FILE, $SHA256_FILE"
     COSIGN_OK=1
@@ -175,20 +182,21 @@ echo
     ok "L2 Sigstore signatures would be produced"
   else
     # L2 is optional per script contract — degrade on any cosign failure
-    # (deprecated flag, auth error, network, keyless unavailability) rather
-    # than aborting the whole release. Uses --bundle (new format); the
-    # legacy --output-signature flag is deprecated and fails on recent
-    # cosign with "must specify --bundle with --new-bundle-format".
+    # (missing/bad keypair, passphrase error, network) rather than aborting
+    # the whole release. Uses --key cosign.key (keypair mode, no OAuth) and
+    # --bundle (new format); the legacy --output-signature flag is
+    # deprecated and fails on recent cosign with "must specify --bundle
+    # with --new-bundle-format".
     VSIX_BUNDLE="${VSIX_FILE}.sigstore.bundle"
     SHA_BUNDLE="${SHA256_FILE}.sigstore.bundle"
-    if cosign sign-blob --yes "$VSIX_FILE" --bundle "$VSIX_BUNDLE" 2>/tmp/cosign-vsix.err; then
+    if cosign sign-blob --yes --key cosign.key "$VSIX_FILE" --bundle "$VSIX_BUNDLE" 2>/tmp/cosign-vsix.err; then
       COSIGN_OK=1
       ARTIFACTS+=("${VSIX_BASENAME}.sigstore.bundle|L2 sigstore bundle — VSIX")
       ok "L2 Sigstore VSIX bundle produced: $VSIX_BUNDLE"
     else
       warn "cosign sign-blob VSIX failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-vsix.err)"
     fi
-    if cosign sign-blob --yes "$SHA256_FILE" --bundle "$SHA_BUNDLE" 2>/tmp/cosign-sha.err; then
+    if cosign sign-blob --yes --key cosign.key "$SHA256_FILE" --bundle "$SHA_BUNDLE" 2>/tmp/cosign-sha.err; then
       ARTIFACTS+=("sha256.txt.sigstore.bundle|L2 sigstore bundle — checksums")
       ok "L2 Sigstore checksum bundle produced: $SHA_BUNDLE"
     else
@@ -203,9 +211,7 @@ else
 fi
 echo
 
-# ─── 
-
-Step 5: GPG sign checksums (L3 — identity, required) ──────────────────
+# ─── Step 5: GPG sign checksums (L3 — identity, required) ──────────────────
 step 5 "GPG detached-sign checksums (L3 — identity, required)"
 
 GPG_KEY_AVAILABLE=0

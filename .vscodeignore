@@ -30,7 +30,21 @@ HANDOFF.md
 CONTRIBUTING.md
 docs/**
 
-# GPG / signing
+# GPG / cosign / signing material
+# Private signing keys MUST never ship in the VSIX — leaking a private key
+# is a credential compromise. cosign.key is the cosign keypair private half;
+# *.key is a catch-all for any future key files. cosign.pub is the public
+# verification key, distributed via the repo + GitHub Release assets (not VSIX).
+cosign.key
+cosign.pub
+*.key
+# Compromised keypair backups (forensic, kept in repo root, NEVER package).
+# *.key above does NOT match these — the filename ends in a date suffix
+# (-2026-08-04), not .key. Without these patterns the compromised private
+# key backup ships inside the VSIX (2026-08-04 incident, second-order leak).
+cosign.key.compromised-*
+cosign.pub.compromised-*
+*.compromised-*
 gpg-public-key.asc
 *.sig
 *.asc

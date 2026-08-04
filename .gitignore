@@ -45,6 +45,13 @@ secring.gpg
 publishing.gpg
 !gpg-public-key.asc
 
+# === Compromised cosign keypair backups (forensic, NEVER commit) ===
+# Backups of the cosign keypair compromised in v0.8.1/v0.9.0 VSIX (2026-08-04).
+# Kept locally for forensic reference only — they contain the OLD private key
+# that was packaged into VSIX. Never commit, never distribute.
+cosign.key.compromised-*
+cosign.pub.compromised-*
+
 # === Logs ===
 *.log
 logs/
