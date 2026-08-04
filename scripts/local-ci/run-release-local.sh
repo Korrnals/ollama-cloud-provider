@@ -21,7 +21,7 @@
 #
 # Signing layers:
 #   L1 SHA256      — always (integrity)
-#   L2 Sigstore    — optional, degrades with warning if cosign missing
+#   L2 Sigstore    — optional (disabled by default; set SIGSTORE_L2=1 to enable — triggers OAuth)
 #   L3 GPG         — required; uses env vars GPG_PRIVATE_KEY/GPG_PASSPHRASE
 #                    or an already-imported key in the gpg keyring
 set -euo pipefail
@@ -165,46 +165,51 @@ fi
 ok "L1 checksum written to $SHA256_FILE (verified: references $VSIX_BASENAME)"
 echo
 
-# ─── Step 4: Sigstore cosign (L2 — build provenance, optional) ─────────────
-step 4 "Sigstore cosign signing (L2 — build provenance, optional)"
-if command -v cosign >/dev/null 2>&1; then
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "  cosign installed — would sign: $VSIX_FILE, $SHA256_FILE"
-    COSIGN_OK=1
-    ARTIFACTS+=("${VSIX_BASENAME}.sigstore.bundle|L2 sigstore bundle — VSIX")
-    ARTIFACTS+=("sha256.txt.sigstore.bundle|L2 sigstore bundle — checksums")
-    ok "L2 Sigstore signatures would be produced"
-  else
-    # L2 is optional per script contract — degrade on any cosign failure
-    # (deprecated flag, auth error, network, keyless unavailability) rather
-    # than aborting the whole release. Uses --bundle (new format); the
-    # legacy --output-signature flag is deprecated and fails on recent
-    # cosign with "must specify --bundle with --new-bundle-format".
-    VSIX_BUNDLE="${VSIX_FILE}.sigstore.bundle"
-    SHA_BUNDLE="${SHA256_FILE}.sigstore.bundle"
-    if cosign sign-blob --yes "$VSIX_FILE" --bundle "$VSIX_BUNDLE" 2>/tmp/cosign-vsix.err; then
+# ─── → Step 4: Sigstore cosign signing (L2 — build provenance, optional)
+
+if [[ "${SIGSTORE_L2:-0}" != "1" ]]; then
+  warn "L2 Sigstore signing disabled (set SIGSTORE_L2=1 to enable). Triggers OAuth browser flow by default — opt-in only."
+else
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "  cosign installed — would sign: $VSIX_FILE, $SHA256_FILE"
       COSIGN_OK=1
       ARTIFACTS+=("${VSIX_BASENAME}.sigstore.bundle|L2 sigstore bundle — VSIX")
-      ok "L2 Sigstore VSIX bundle produced: $VSIX_BUNDLE"
-    else
-      warn "cosign sign-blob VSIX failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-vsix.err)"
-    fi
-    if cosign sign-blob --yes "$SHA256_FILE" --bundle "$SHA_BUNDLE" 2>/tmp/cosign-sha.err; then
       ARTIFACTS+=("sha256.txt.sigstore.bundle|L2 sigstore bundle — checksums")
-      ok "L2 Sigstore checksum bundle produced: $SHA_BUNDLE"
+      ok "L2 Sigstore signatures would be produced"
     else
-      warn "cosign sign-blob sha256.txt failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-sha.err)"
+      # L2 is optional per script contract — degrade on any cosign failure
+      # (deprecated flag, auth error, network, keyless unavailability) rather
+      # than aborting the whole release. Uses --bundle (new format); the
+      # legacy --output-signature flag is deprecated and fails on recent
+      # cosign with "must specify --bundle with --new-bundle-format".
+      VSIX_BUNDLE="${VSIX_FILE}.sigstore.bundle"
+      SHA_BUNDLE="${SHA256_FILE}.sigstore.bundle"
+      if cosign sign-blob --yes "$VSIX_FILE" --bundle "$VSIX_BUNDLE" 2>/tmp/cosign-vsix.err; then
+        COSIGN_OK=1
+        ARTIFACTS+=("${VSIX_BASENAME}.sigstore.bundle|L2 sigstore bundle — VSIX")
+        ok "L2 Sigstore VSIX bundle produced: $VSIX_BUNDLE"
+      else
+        warn "cosign sign-blob VSIX failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-vsix.err)"
+      fi
+      if cosign sign-blob --yes "$SHA256_FILE" --bundle "$SHA_BUNDLE" 2>/tmp/cosign-sha.err; then
+        ARTIFACTS+=("sha256.txt.sigstore.bundle|L2 sigstore bundle — checksums")
+        ok "L2 Sigstore checksum bundle produced: $SHA_BUNDLE"
+      else
+        warn "cosign sign-blob sha256.txt failed (L2 optional, continuing): $(tr -d '\n' < /tmp/cosign-sha.err)"
+      fi
+      rm -f /tmp/cosign-vsix.err /tmp/cosign-sha.err
     fi
-    rm -f /tmp/cosign-vsix.err /tmp/cosign-sha.err
+  else
+    warn "cosign not installed — L2 Sigstore signing skipped."
+    warn "Install: https://github.com/sigstore/cosign/releases"
+    echo "  (L2 is optional; L1 SHA256 + L3 GPG remain the required layers.)"
   fi
-else
-  warn "cosign not installed — L2 Sigstore signing skipped."
-  warn "Install: https://github.com/sigstore/cosign/releases"
-  echo "  (L2 is optional; L1 SHA256 + L3 GPG remain the required layers.)"
-fi
-echo
+  echo
 
-# ─── Step 5: GPG sign checksums (L3 — identity, required) ──────────────────
+  # ─── 
+fi
+
+Step 5: GPG sign checksums (L3 — identity, required) ──────────────────
 step 5 "GPG detached-sign checksums (L3 — identity, required)"
 
 GPG_KEY_AVAILABLE=0

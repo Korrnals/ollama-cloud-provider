@@ -775,6 +775,71 @@ export class OllamaCloudChatProvider
       // reached BEFORE the responses/chat blocks so an explicit
       // `native` choice never accidentally routes to `/v1/responses`
       // or `/chat/completions` first.
+      // Responses API path — restored from v0.7.3 (accidentally removed in v0.8.0
+      // endpoint routing rewrite). Uses compat schema (thinking: {type}, not think: true).
+      if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
+        try {
+          const responsesClient = new ResponsesClient(
+            clientBaseUrl,
+            apiKey ?? '',
+            connection,
+          );
+          // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
+          // When the filter ran (`filterReport !== undefined`), shape
+          // the filtered `OpenAICompatibleMessage[]` directly into
+          // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
+          // (no VS Code ↔ OpenAI round-trip — keeps the filter
+          // endpoint-agnostic and avoids lossy re-conversion). When the
+          // filter did NOT run (`off` fast path), use the original
+          // `convertToResponsesInput` on the VS Code `messages` (the
+          // 375-test regression path is untouched).
+          const { input, instructions } =
+            filterReport !== undefined
+              ? convertOpenAIMessagesToResponsesInput(filteredMessages)
+              : convertToResponsesInput(messages);
+          const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
+          await this.runStream(
+            (callbacks) =>
+              responsesClient.streamResponses(
+                {
+                  model: model.apiModel ?? model.id,
+                  input,
+                  ...(instructions !== undefined ? { instructions } : {}),
+                  ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
+                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
+                  extraBody: requestConfiguration.openaiBody,
+                },
+                callbacks,
+                token,
+              ),
+            progress,
+            model,
+            requestChars,
+            () => markResponsesAvailable(connectionId),
+          );
+          return; // success — no fallback needed
+        } catch (error) {
+          if (error instanceof HttpError && error.status === 404) {
+            markResponsesUnavailable(connectionId);
+            // Issue #40 — explicit choice: do NOT silently fall back.
+            // Surface an actionable error so the user knows their
+            // explicit endpoint is unsupported by this connection.
+            if (isPreferredEndpointExplicit) {
+              logger.info(
+                `Explicit /v1/responses 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
+              );
+              throw endpointExplicitUnavailableError('responses', connectionId);
+            }
+            logger.info(
+              `Auto-mode fallback: /v1/responses returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
+            );
+            // fall through to /chat/completions below
+          } else {
+            throw error; // non-404 — surface, no fallback (no double billing)
+          }
+        }
+      }
+
       if (primaryEndpoint === 'native' && !isNativeChatKnownUnavailable(connectionId)) {
         try {
           // When `endpointConnection` is defined (the normal case — at
