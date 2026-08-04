@@ -284,7 +284,7 @@
             "Use /v1/responses as primary (structured reasoning, typed events, first-class tool calling). Falls back to /chat/completions on HTTP 404. Recommended — newest and most advanced endpoint.",
             "Use /chat/completions as primary (classic OpenAI-compatible). Falls back to /v1/responses on HTTP 404. Use this if you encounter issues with /v1/responses."
           ],
-          "default": "native",
+          "default": "auto",
           "description": "Primary API endpoint for cloud and remote connections. The other endpoint is used as automatic fallback on HTTP 404. Local Ollama connections always use /chat/completions regardless of this setting. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this global setting.",
           "scope": "application"
         },
