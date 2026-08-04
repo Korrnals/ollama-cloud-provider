@@ -1516,6 +1516,87 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
       'logged the cache-guard decision (no live 404)',
     );
   });
+
+  it('(e) production-default routing — global preferredEndpoint unset (package.json default "auto") resolves a cloud auto connection to native, not fall-through', async () => {
+    // Regression guard for the companion runtime fix to the
+    // preferredEndpoint default change (package.json default is now
+    // "auto"). The vscode stub's `.get(section, defaultValue)` returns
+    // the code's fallback arg when the key is absent from the store —
+    // which mirrors production, where a user who never configured
+    // preferredEndpoint receives the package.json default ("auto")
+    // from `.get()`. Before the fix, no dispatch block matched
+    // `primaryEndpoint === "auto"`; the fix resolves "auto" → "native"
+    // (cloud) explicitly. This test asserts the resolution actually
+    // happens: the primary endpoint is `native` (logged + routed to
+    // /api/chat), not an unmatched "auto" fall-through.
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      // No `preferredEndpoint` key at all → stub returns the code's
+      // fallback ("auto"), exactly like the package.json default in
+      // production.
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    // Clear any inspect() metadata so globalPreferredExplicit is false
+    // (no user-configured global) — the pure production-default case.
+    vscode.workspace
+      .getConfiguration('ollamaCloud')
+      ._setInspection('preferredEndpoint', null);
+
+    global.fetch = (async (input: string | URL, _init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      fetchCalls.push({ url, status: 200 });
+      // Native /api/chat uses ndjson (one JSON object per line, no
+      // `data:` prefix; terminal marker is `done: true`, not `[DONE]`).
+      // A content chunk then a done chunk — proves the native dispatch
+      // ran and parsed its wire format.
+      return mockResponse(
+        streamFromChunks([
+          encode('{"message":{"content":"native ok"}}\n'),
+          encode('{"done":true}\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('hi')],
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The single fetch hit /api/chat (native) — "auto" resolved to
+    // native and the native dispatch block ran. If the fix regressed
+    // (primaryEndpoint === "auto", no match), the request would take a
+    // different path (throw or fall through) and this assertion fails.
+    assert.equal(fetchCalls.length, 1, 'single native dispatch attempt');
+    assert.ok(fetchCalls[0].url.endsWith('/api/chat'), 'routed to /api/chat (native)');
+    // The selection log line embeds the resolved primaryEndpoint —
+    // `primary=native` is the direct proof that "auto" was resolved,
+    // not passed through as "auto".
+    assert.ok(
+      logged.some(
+        (line) =>
+          line.includes('Endpoint selected') &&
+          line.includes('primary=native') &&
+          line.includes('explicit=false'),
+      ),
+      'logged primary=native (auto resolved to native), explicit=false',
+    );
+    // The native stream was surfaced to the user.
+    assert.equal(progress.parts.length, 1, 'one text delta reported from native dispatch');
+  });
 });
 
 /**
@@ -1840,22 +1921,25 @@ describe('OllamaCloudChatProvider — endpoint indicator tooltip (Issue #41)', (
     return match.tooltip ?? '';
   }
 
-  it('(a) cloud auto — tooltip includes Endpoint: auto (resolves to /v1/responses)', async () => {
+  it('(a) cloud auto — tooltip includes Endpoint: auto (resolves to /api/chat (native))', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
     setConfig({
       baseUrl: BASE_URL,
       allowedBaseUrls: [BASE_URL],
       apiKey: '',
-      // Default global preferredEndpoint is 'responses'; connection is 'auto'.
+      // No explicit global preferredEndpoint configured — the stub's
+      // `.get()` returns the code's fallback, which mirrors the
+      // package.json default ('auto'). Cloud 'auto' resolves to native.
       connections: [
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
       ],
     });
 
     const tooltip = await tooltipFor(ctx, 'gpt-oss:120b');
-    // auto resolves against the global default ('responses') and the
-    // label surfaces both the auto choice and what it resolves to.
-    assert.match(tooltip, /Endpoint: auto \(resolves to \/v1\/responses\)/);
+    // auto resolves against the package.json default ('auto') → native
+    // (/api/chat) for cloud, and the label surfaces both the auto
+    // choice and what it resolves to.
+    assert.match(tooltip, /Endpoint: auto \(resolves to \/api\/chat \(native\)\)/);
   });
 
   it('(b) cloud explicit responses — tooltip includes Endpoint: /v1/responses', async () => {
@@ -1994,16 +2078,16 @@ describe('OllamaCloudChatProvider — endpoint indicator tooltip (Issue #41)', (
     try {
       assert.ok(configListener, 'provider registered a config-change listener');
 
-      // Sanity baseline: the tooltip reflects the default global
-      // `preferredEndpoint: 'responses'`. `tooltipFor` awaits the
-      // info query, which also drains the constructor's
-      // `queueMicrotask(() => emitter.fire())` (line ~193) so the
-      // baseline fire is observed and discarded before the regression
-      // measurement begins.
+      // Sanity baseline: the tooltip reflects the package.json default
+      // `preferredEndpoint: 'auto'`, which resolves to native for cloud.
+      // `tooltipFor` awaits the info query, which also drains the
+      // constructor's `queueMicrotask(() => emitter.fire())` (line ~193)
+      // so the baseline fire is observed and discarded before the
+      // regression measurement begins.
       const before = await tooltipFor(ctx, 'gpt-oss:120b');
       assert.match(
         before,
-        /Endpoint: auto \(resolves to \/v1\/responses\)/,
+        /Endpoint: auto \(resolves to \/api\/chat \(native\)\)/,
         'tooltip reflects the default global preferredEndpoint before the change',
       );
       // Discard the constructor's microtask fire so `fired` measures
