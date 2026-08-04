@@ -698,11 +698,13 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
     assert.equal((textParts[0] as vscode.LanguageModelTextPart).value, 'final answer');
   });
 
-  it('falls back to /chat/completions when /v1/responses returns 404 (no reasoning)', async () => {
+  it('falls back to /chat/completions only after 3x404 on /api/chat (auto-recovery)', async () => {
+    // v0.9.0 blocker fix — auto-recovery: native endpoint gets 3 retries
+    // before switching. First 2 404s → retry native (throw 404 to caller).
+    // 3rd 404 → shouldAutoSwitch returns true → markNativeChatUnavailable
+    // → fallback to /chat/completions. This test drives THREE separate
+    // provideLanguageModelChatResponse calls; the third triggers fallback.
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
-    // Override to 'auto' for this test — it exercises fallback behaviour,
-    // not the explicit 'responses' the describe-block beforeEach sets.
-    // Phase 2: auto → native (/api/chat) first, 404 → fallback to /chat/completions.
     setConfig({
       baseUrl: BASE_URL,
       allowedBaseUrls: [BASE_URL],
@@ -724,9 +726,9 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
       const url = typeof input === 'string' ? input : input.toString();
       const body = init?.body ? JSON.parse(String(init.body)) : null;
       fetchCalls.push({ url, body });
-      // First call — /api/chat (native) → 404 (Phase 2: auto resolves to native). Second call —
-      // /chat/completions → success stream.
-      if (callCount === 1) {
+      // First 3 calls — /api/chat (native) → 404. 4th call —
+      // /chat/completions → success stream (the fallback after 3×404).
+      if (callCount <= 3) {
         return new Response(JSON.stringify({ error: { message: 'not found' } }), {
           status: 404,
           headers: { 'content-type': 'application/json' },
@@ -741,30 +743,45 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
     }) as typeof fetch;
 
     const provider = new OllamaCloudChatProvider(ctx);
-    const progress = makeProgress();
     const token = new vscode.CancellationTokenSource().token;
 
+    // Calls 1 and 2: native returns 404, counter increments, 404 thrown
+    // to caller (no fallback yet — below the 3×404 threshold).
+    for (let i = 1; i <= 2; i++) {
+      const progress = makeProgress();
+      await assert.rejects(
+        () => provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+        /not found/,
+      );
+    }
+
+    // Call 3: native returns 404 a third time → shouldAutoSwitch fires
+    // → markNativeChatUnavailable → fallback to /chat/completions.
+    const progress3 = makeProgress();
     await provider.provideLanguageModelChatResponse(
       chatInfoFor('gpt-oss:120b'),
       [userMsg('hi')],
-      {
-        modelOptions: {},
-        justification: 'test',
-      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-      progress,
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress3,
       token,
     );
 
-    // Two fetches: /v1/responses (404) then /chat/completions.
-    assert.equal(callCount, 2, 'fallback issued a second chat fetch');
+    // 4 fetches: /api/chat ×3 (404) then /chat/completions ×1 (200).
+    assert.equal(callCount, 4, 'third 404 triggered fallback to chat');
     assert.ok(fetchCalls[0].url.endsWith('/api/chat'));
-    assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
+    assert.ok(fetchCalls[1].url.endsWith('/api/chat'));
+    assert.ok(fetchCalls[2].url.endsWith('/api/chat'));
+    assert.ok(fetchCalls[3].url.endsWith('/chat/completions'));
 
-    // Only the chat text delta surfaces — no thinking parts on the
-    // /chat/completions path (it never emits onThinking).
-    assert.equal(progress.parts.length, 1, 'one text delta reported');
+    assert.equal(progress3.parts.length, 1, 'one text delta reported on fallback');
     assert.equal(
-      (progress.parts[0] as vscode.LanguageModelTextPart).value,
+      (progress3.parts[0] as vscode.LanguageModelTextPart).value,
       'chat answer',
     );
   });
@@ -1171,13 +1188,11 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
     );
   });
 
-  it('(c) auto + 404 → falls back to chat and logs the auto-mode decision', async () => {
+  it('(c) auto + 3x404 → falls back to chat and logs the auto-mode decision', async () => {
+    // v0.9.0 blocker fix — auto-recovery: native endpoint gets 3 retries
+    // before switching. This test drives THREE calls; the third triggers
+    // fallback to /chat/completions.
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
-    // Per-connection 'auto' with NO explicitly-configured global
-    // preferredEndpoint → inherits the default → auto mode. The stub's
-    // inspect() returns undefined for keys without inspection metadata,
-    // so globalPreferredExplicit is false and isPreferredEndpointExplicit
-    // is false.
     setConfig({
       baseUrl: BASE_URL,
       allowedBaseUrls: [BASE_URL],
@@ -1188,15 +1203,13 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
       ],
     });
-    // No _setInspection call → inspect('preferredEndpoint') returns undefined.
 
     let callCount = 0;
     global.fetch = (async (input: string | URL, _init?: RequestInit) => {
       callCount += 1;
       const url = typeof input === 'string' ? input : input.toString();
-      // First call — /v1/responses → 404 (auto default is 'native' (Phase 2 — endpoint routing)).
-      // Second call — /chat/completions → success stream.
-      const status = callCount === 1 ? 404 : 200;
+      // First 3 calls — /api/chat → 404. 4th call — /chat/completions → 200.
+      const status = callCount <= 3 ? 404 : 200;
       fetchCalls.push({ url, status });
       if (status === 404) {
         return new Response(JSON.stringify({ error: { message: 'not found' } }), {
@@ -1213,9 +1226,25 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
     }) as typeof fetch;
 
     const provider = new OllamaCloudChatProvider(ctx);
-    const progress = makeProgress();
     const token = new vscode.CancellationTokenSource().token;
 
+    // Calls 1 and 2: 404 thrown (below threshold, no fallback).
+    for (let i = 1; i <= 2; i++) {
+      const p = makeProgress();
+      await assert.rejects(
+        () => provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          p,
+          token,
+        ),
+        /not found/,
+      );
+    }
+
+    // Call 3: third 404 → shouldAutoSwitch → fallback to /chat/completions.
+    const progress = makeProgress();
     await provider.provideLanguageModelChatResponse(
       chatInfoFor('gpt-oss:120b'),
       [userMsg('hi')],
@@ -1224,28 +1253,28 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
       token,
     );
 
-    // Two fetches: /api/chat (native, 404) then /chat/completions (200) —
-    // the prior fallback behaviour is preserved in auto mode.
-    assert.equal(callCount, 2, 'auto mode issued a fallback chat fetch');
+    // 4 fetches: /api/chat ×3 (404) then /chat/completions ×1 (200).
+    assert.equal(callCount, 4, 'third 404 triggered fallback to chat');
     assert.ok(fetchCalls[0].url.endsWith('/api/chat'));
     assert.equal(fetchCalls[0].status, 404);
-    assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
-    assert.equal(fetchCalls[1].status, 200);
-    // The chat text delta surfaced — fallback succeeded.
+    assert.ok(fetchCalls[1].url.endsWith('/api/chat'));
+    assert.equal(fetchCalls[1].status, 404);
+    assert.ok(fetchCalls[2].url.endsWith('/api/chat'));
+    assert.equal(fetchCalls[2].status, 404);
+    assert.ok(fetchCalls[3].url.endsWith('/chat/completions'));
+    assert.equal(fetchCalls[3].status, 200);
     assert.equal(progress.parts.length, 1, 'one text delta reported');
     assert.equal(
       (progress.parts[0] as vscode.LanguageModelTextPart).value,
       'chat answer',
     );
-    // Auto mode is non-explicit.
     assert.ok(
       logged.some((line) => line.includes('Endpoint selected') && line.includes('explicit=false')),
       'logged endpoint selection with explicit=false',
     );
-    // The auto-mode fallback decision was logged (task spec point 5).
     assert.ok(
-      logged.some((line) => line.includes('Auto-mode fallback')),
-      'logged the auto-mode fallback decision',
+      logged.some((line) => line.includes('Auto-recovery') && line.includes('switching to chat')),
+      'logged the auto-recovery switch decision',
     );
   });
 
@@ -2281,5 +2310,114 @@ describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Findi
       hasToolResult,
       'safe preserved the matching tool result (tool_call_id=call-1) — integrity held',
     );
+  });
+});
+
+/**
+ * v0.9.0 Fix 4 — command handler `ollamaCloud.switchEndpoint` coverage
+ * (Code Review finding 2/3). The method shows a QuickPick, detects the
+ * current `preferredEndpoint`, and writes the picked value to the global
+ * config. Previously untested. These tests stub `vscode.window.showQuickPick`
+ * (monkey-patched via the same cast-through-unknown pattern used by the
+ * `onDidChangeConfiguration` test above, since the vscode types mark `window`
+ * read-only) and assert the config was updated. No network stub is needed —
+ * switchEndpoint never calls fetch.
+ */
+describe('OllamaCloudChatProvider — switchEndpoint command (v0.9.0 Fix 4)', () => {
+  let originalQuickPick: typeof vscode.window.showQuickPick;
+  let writableWindow: {
+    showQuickPick: typeof vscode.window.showQuickPick;
+  };
+
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      apiKey: '',
+      preferredEndpoint: 'native',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    originalQuickPick = vscode.window.showQuickPick;
+    writableWindow = vscode.window as unknown as {
+      showQuickPick: typeof vscode.window.showQuickPick;
+    };
+  });
+
+  afterEach(() => {
+    // Restore the stub's no-op showQuickPick so the monkey-patch does
+    // not leak past this suite.
+    writableWindow.showQuickPick = originalQuickPick;
+  });
+
+  it('updates ollamaCloud.preferredEndpoint to the picked value', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    const provider = new OllamaCloudChatProvider(ctx);
+
+    // Stub showQuickPick to return the 'responses' item. switchEndpoint
+    // builds the QuickPick items with a `value` discriminator; we surface
+    // the matching item from the items array the method passes in, then
+    // assert the config reflects its `value`. Cast through `unknown` because
+    // the real showQuickPick is a complex overload set whose parameter type
+    // (readonly string[] | Thenable<...>) does not overlap our item-array fn.
+    const pickResponses = async (
+      items: ReadonlyArray<vscode.QuickPickItem & { value?: string }>,
+    ): Promise<vscode.QuickPickItem> => {
+      const picked = items.find((i) => i.value === 'responses');
+      assert.ok(picked, 'responses option present in the QuickPick');
+      return picked as vscode.QuickPickItem;
+    };
+    writableWindow.showQuickPick =
+      pickResponses as unknown as typeof vscode.window.showQuickPick;
+
+    await provider.switchEndpoint();
+
+    const after = vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .get<string>('preferredEndpoint');
+    assert.equal(after, 'responses', 'preferredEndpoint updated to the picked value');
+  });
+
+  it('marks the current value as picked in the QuickPick items', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    const provider = new OllamaCloudChatProvider(ctx);
+
+    // The current config is 'native' (set in beforeEach). switchEndpoint
+    // must mark the matching item `picked: true` so the QuickPick pre-selects
+    // it — capture the items to verify the discriminator, then return one.
+    let seenItems: Array<vscode.QuickPickItem & { value?: string }> = [];
+    const captureAndPickChat = async (
+      items: ReadonlyArray<vscode.QuickPickItem & { value?: string }>,
+    ): Promise<vscode.QuickPickItem> => {
+      seenItems = [...items];
+      return items.find((i) => i.value === 'chat') as vscode.QuickPickItem;
+    };
+    writableWindow.showQuickPick =
+      captureAndPickChat as unknown as typeof vscode.window.showQuickPick;
+
+    await provider.switchEndpoint();
+
+    const nativeItem = seenItems.find((i) => i.value === 'native');
+    assert.ok(nativeItem, 'native option present');
+    assert.equal(nativeItem!.picked, true, 'current value (native) pre-selected');
+  });
+
+  it('is a no-op when the user dismisses the QuickPick (undefined)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    const provider = new OllamaCloudChatProvider(ctx);
+
+    // Dismissed QuickPick returns undefined — switchEndpoint must early-return
+    // WITHOUT touching the config (preferredEndpoint stays 'native').
+    const dismiss = async (): Promise<undefined> => undefined;
+    writableWindow.showQuickPick =
+      dismiss as unknown as typeof vscode.window.showQuickPick;
+
+    await provider.switchEndpoint();
+
+    const after = vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .get<string>('preferredEndpoint');
+    assert.equal(after, 'native', 'dismissed pick leaves config unchanged');
   });
 });
