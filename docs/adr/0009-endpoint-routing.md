@@ -18,8 +18,10 @@ Spike (2026-08-03, qwen3.5:397b, curl): native `/api/chat` streaming emits `mess
 
 ## Decision
 
-- **Cloud default → native `/api/chat`** (canonical per docs.ollama.com/cloud)
-- **Local default → OpenAI-compat `/v1/chat/completions`** (ecosystem, SSE, already works)
+- **Setting default → `auto`** (the `preferredEndpoint` setting defaults to `auto`). `auto` resolves at dispatch time:
+  - **cloud** → `native` `/api/chat` (canonical per docs.ollama.com/cloud)
+  - **local** → `chat` `/v1/chat/completions` (ecosystem, SSE, already works)
+  - **vision pass-through** → `responses` `/v1/responses` (vision pass-through has no native dispatch)
 - **4-way override**: `auto`/`native`/`chat`/`responses` (via `preferredEndpoint` setting)
 - **Implementation**: endpoint-format-aware rewrite of `ollamaClient.ts` (not a third parallel client) — `endpointFormat: 'compat' | 'native'` parameter, `processNdjsonLine` parser
 - **Phasing**: Phase 1 (opt-in native) → Phase 2 (cloud default → native) → Phase 3 (this ADR + ADR 0006 revision)
