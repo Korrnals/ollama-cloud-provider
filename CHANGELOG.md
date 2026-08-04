@@ -5,6 +5,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-04
+
+### Added
+- **Endpoint routing with auto-recovery** — the `preferredEndpoint` setting now exposes `auto` / `native` / `responses` / `chat` (enum reordered to list `auto` and `native` first). `auto` selects the endpoint automatically and recovers from transient outages; `native` = `/api/chat` (ndjson, first-class `think`, object `tool_calls`), `responses` = `/v1/responses`, `chat` = `/v1/chat/completions`. Default `native`. Per-connection override unchanged.
+- **3×404 auto-recovery from native-endpoint outages** — in `auto` mode, a native (`/api/chat`) 404 no longer switches the connection to the fallback for the rest of the session. Three consecutive 404s within a 5-min sliding window (`shouldAutoSwitch`) trigger the switch to `/chat/completions`; any success resets the counter (`reset404s`); after 5 min of silence the native endpoint is retried (`shouldRetryAfterSilence`), so connections auto-recover without a restart or config change. `sweepStaleEntries` prunes entries older than 10 min (anti-flapping).
+- **Soft/grace inactivity timer pattern (ADR 0005)** — replaced the single hard inactivity timeout with a two-phase timer in both `ollamaClient.ts` and `responsesClient.ts`. First fire at the soft threshold (120s) logs a warning and extends to the full grace period; the hard kill fires only after the full grace period elapses with no new chunks. Short-timeout path (≤ 120s) still fires hard directly. Default connect 30s → 60s, inactivity 90s → 300s — total max silence before kill = 120s + 300s = 420s. Accommodates long-reasoning models that go silent between reasoning and token emission without being truly dead.
+- **`switchEndpoint` command** — new Ctrl+Shift+P picker (`ollamaCloud.switchEndpoint`) for manual endpoint override. Shows `auto` / `native` / `chat` / `responses` with detail lines and updates the global `preferredEndpoint` setting; the model-picker tooltip refreshes immediately (no reload), capability cache cleared on change.
+- **Signing hardening** — release script L2 sigstore layer switched from opt-in keyless mode (interactive OAuth) to always-on keypair mode (`cosign.key` / `cosign.pub`, no browser flow). `cosign.pub` (the public verification key) committed to the repo root so consumers can verify `.sigstore.bundle` artefacts without an out-of-band channel; `cosign.key` stays gitignored.
+
+### Fixed
+- **Blocker — native endpoint switched on the first 404 (dead counter)** — `markNativeChatUnavailable` was called on the 1st native 404, bypassing the 3×404 counter entirely. Moved inside the `shouldAutoSwitch` check so native is now retried 3× before switching to `/chat/completions`.
+
+### Changed
+- **Timer settings descriptions** — `requestConnectTimeoutMs` / `requestInactivityTimeoutMs` / `requestMaxDurationMs` switched to `markdownDescription` with an `**Advanced**` prefix; the inactivity description now states explicitly that max silence = 120s + the value (420s at default) and that the name reflects the grace ceiling, not the total silence budget.
+- **Responses / chat 404 asymmetry documented** — responses and chat still mark the endpoint unavailable on the first 404 (stable endpoints — 1×404 means truly unsupported); only native uses the 3×404 counter (experimental, may flap during rollout).
+
+### Notes
+- The flat-schema `convertToolsToResponses` (not nested) for `/v1/responses` shipped in v0.6.1; this release only adds a breadcrumb in `convert.ts` pointing to `convertResponses.ts`.
+
+## [0.8.1] - 2026-08-03
+
+### Fixed
+- **Hotfix for broken v0.8.0** — `v0.8.0` shipped with a regression that broke cloud connections; restored the `/v1/responses` dispatch path in the provider and disabled L2 sigstore signing by default (it triggered an OAuth browser flow under the keyless mode). L2 sigstore is re-enabled in v0.9.0 via keypair mode (see above).
+
 ## [0.8.0] - 2026-08-03
 
 ### Added

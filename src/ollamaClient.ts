@@ -32,11 +32,19 @@ import {
 // Each guard mirrors the package.json schema maximum; below-minimum
 // values are accepted (package.json enforces the UI minimum, the
 // resolver only guards against garbage). See resolve* docstring.
+// v0.9.0 — connect default raised to 60s (1 min), inactivity default
+// raised to 300s (5 min) with a soft/grace extension (see
+// resetInactivity). The max stays at 600s (10 min).
 const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
-const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 30000;
+const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 60000;
 
 const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
-const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 90000;
+const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 300000;
+// v0.9.0 — soft threshold: when the inactivity timer first fires at this
+// duration, instead of killing the stream, we log a warning and extend
+// to the full inactivityTimeoutMs grace period. Only the SECOND fire
+// (hard kill) aborts. Must be <= REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS.
+const REQUEST_INACTIVITY_SOFT_THRESHOLD_MS = 120000;
 
 const REQUEST_MAX_DURATION_MAX_MS = 3600000;
 const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
@@ -272,18 +280,67 @@ export class OllamaClient {
     // Inactivity: started after fetch resolves (first byte), reset per
     // chunk + per :keep-alive. Declared here so the finally block can
     // clear it from both the stream path and the early-throw path.
+    // v0.9.0 — soft/grace period: the FIRST fire at the soft threshold
+    // (120s) logs a warning and extends the timer to the full
+    // `inactivityTimeoutMs` grace period (300s default). Only the SECOND
+    // fire hard-kills the stream. This accommodates long reasoning
+    // models that go silent between the reasoning phase and token
+    // emission without being truly dead.
     let inactivityHandle: ReturnType<typeof setTimeout> | undefined;
+    let inactivitySoftFired = false;
     const resetInactivity = (): void => {
       if (inactivityHandle !== undefined) {
         clearTimeout(inactivityHandle);
       }
+      inactivitySoftFired = false;
+      // Short-timeout path: when the configured inactivity timeout is
+      // at or below the soft threshold (tests, or users who explicitly
+      // want a short timeout), fire HARD directly at the configured
+      // duration. No soft extension — this is the pre-v0.9.0 behaviour
+      // for short timeouts and keeps a short test budget satisfied.
+      if (inactivityTimeoutMs <= REQUEST_INACTIVITY_SOFT_THRESHOLD_MS) {
+        inactivityHandle = setTimeout(() => {
+          abortReason = 'inactivity';
+          logger.error(
+            `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
+          );
+          controller.abort();
+        }, inactivityTimeoutMs);
+        return;
+      }
+      // Long-timeout path: soft threshold + grace extension. The FIRST
+      // fire at the soft threshold logs a warning and extends the timer
+      // to the full `inactivityTimeoutMs` grace period (300s default).
+      // Only the SECOND fire hard-kills the stream. This accommodates
+      // long reasoning models that go silent between the reasoning
+      // phase and token emission without being truly dead.
       inactivityHandle = setTimeout(() => {
+        if (!inactivitySoftFired) {
+          // Soft fire — extend to the full grace period.
+          inactivitySoftFired = true;
+          if (inactivityHandle !== undefined) {
+            clearTimeout(inactivityHandle);
+          }
+          logger.warn(
+            `Ollama Cloud: stream stalled for ${REQUEST_INACTIVITY_SOFT_THRESHOLD_MS}ms — extending to ${inactivityTimeoutMs}ms grace period`,
+          );
+          inactivityHandle = setTimeout(() => {
+            abortReason = 'inactivity';
+            logger.error(
+              `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
+            );
+            controller.abort();
+          }, inactivityTimeoutMs);
+          return;
+        }
+        // Should not reach here — the soft-fire callback re-arms with a
+        // fresh timer; this branch is defensive.
         abortReason = 'inactivity';
         logger.error(
           `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
         );
         controller.abort();
-      }, inactivityTimeoutMs);
+      }, REQUEST_INACTIVITY_SOFT_THRESHOLD_MS);
     };
     const clearInactivity = (): void => {
       if (inactivityHandle !== undefined) {

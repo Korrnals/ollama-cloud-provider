@@ -54,4 +54,22 @@ Every release VSIX is signed with:
 
 See [ADR-0002](docs/adr/0002-signing-strategy.md) for the full rationale.
 
+### Public verification key (`cosign.pub`)
+
+The repo root ships `cosign.pub` — the **public** half of the keyless
+signing keypair. It is committed (not gitignored) so downstream
+consumers can verify `.sigstore.bundle` artifacts without an
+out-of-band channel:
+
+```bash
+cosign verify-blob --certificate-identity <identity> \
+  --certificate-oidc-issuer <issuer> \
+  --bundle releases/*.sigstore.bundle <VSIX> \
+  --key cosign.pub
+```
+
+The private key (`cosign.key`) stays gitignored (via `*.key`) and never
+leaves the maintainer's machine. `cosign.pub` is safe to redistribute —
+it can only verify signatures, not create them.
+
 > **Note (2026-07-22):** GitHub Actions release workflow is disabled due to billing lock. Signing is performed locally via `scripts/local-ci/run-release-local.sh` until billing is resolved. The three-layer strategy is unchanged; only the execution environment moved from GitHub Actions to local.

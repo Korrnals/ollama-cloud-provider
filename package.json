@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-cloud-provider-icon.png",
@@ -82,6 +82,11 @@
       {
         "command": "ollamaCloud.refreshModels",
         "title": "Ollama Cloud: Refresh Models"
+      },
+      {
+        "command": "ollamaCloud.switchEndpoint",
+        "title": "Ollama Cloud: Switch Endpoint",
+        "category": "Ollama Cloud"
       }
     ],
     "configuration": {
@@ -120,18 +125,18 @@
         },
         "ollamaCloud.requestConnectTimeoutMs": {
           "type": "integer",
-          "default": 30000,
+          "default": 60000,
           "minimum": 5000,
           "maximum": 120000,
-          "description": "Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
+          "markdownDescription": "**Advanced** — Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.requestInactivityTimeoutMs": {
           "type": "integer",
-          "default": 90000,
+          "default": 300000,
           "minimum": 10000,
           "maximum": 600000,
-          "description": "Inactivity timeout in milliseconds — reset on every stream chunk and :keep-alive SSE comment. NO retry (mid-stream retry = double billing). Detects dead connections vs slow reasoning. ADR 0005.",
+          "markdownDescription": "⚠️ **Max silence = 120s + this value** (420s at the default). The soft warning fires at 120s and extends the timer to this value — the name reflects the grace ceiling, NOT the total silence budget. See [ADR 0005](docs/adr/0005-streaming-timeout-architecture.md).\n\n**Advanced** — Inactivity timeout in milliseconds — grace period ceiling applied AFTER the soft warning fires. Reset on every stream chunk and :keep-alive SSE comment. Soft warning fires at 120s (logs + extends the timer to this value). Hard kill fires after the full grace period elapses with no new chunks — so total max silence before kill = 120s + this value (420s at the 300s default). Only applies when this value > 120s; at or below 120s the timer fires hard directly (short-timeout path). NO retry (mid-stream retry = double billing). Detects dead connections vs slow reasoning. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.requestMaxDurationMs": {
@@ -139,7 +144,7 @@
           "default": 1800000,
           "minimum": 60000,
           "maximum": 3600000,
-          "description": "Max stream duration in milliseconds — hard ceiling from streamChat entry, never reset. NO retry. Protects token budget from forgotten tabs / crashed callers. ADR 0005.",
+          "markdownDescription": "**Advanced** — Max stream duration in milliseconds — hard ceiling from streamChat entry, never reset. NO retry. Protects token budget from forgotten tabs / crashed callers. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.maxRetries": {
@@ -268,14 +273,16 @@
         "ollamaCloud.preferredEndpoint": {
           "type": "string",
           "enum": [
+            "auto",
+            "native",
             "responses",
-            "chat",
-            "native"
+            "chat"
           ],
           "enumDescriptions": [
+            "Automatically select endpoint with auto-recovery (switches on 3 consecutive 404s, returns after 5 min).",
+            "Use the native Ollama /api/chat endpoint (ndjson wire format, object tool arguments, images[] for vision). Phase 1 opt-in — falls back to /chat/completions on HTTP 404 only in auto mode. Use this to bypass the OpenAI-compat translation layer.",
             "Use /v1/responses as primary (structured reasoning, typed events, first-class tool calling). Falls back to /chat/completions on HTTP 404. Recommended — newest and most advanced endpoint.",
-            "Use /chat/completions as primary (classic OpenAI-compatible). Falls back to /v1/responses on HTTP 404. Use this if you encounter issues with /v1/responses.",
-            "Use the native Ollama /api/chat endpoint (ndjson wire format, object tool arguments, images[] for vision). Phase 1 opt-in — falls back to /chat/completions on HTTP 404 only in auto mode. Use this to bypass the OpenAI-compat translation layer."
+            "Use /chat/completions as primary (classic OpenAI-compatible). Falls back to /v1/responses on HTTP 404. Use this if you encounter issues with /v1/responses."
           ],
           "default": "native",
           "description": "Primary API endpoint for cloud and remote connections. The other endpoint is used as automatic fallback on HTTP 404. Local Ollama connections always use /chat/completions regardless of this setting. Per-connection `preferredEndpoint` in `ollamaCloud.connections` overrides this global setting.",

@@ -45,6 +45,13 @@ secring.gpg
 publishing.gpg
 !gpg-public-key.asc
 
+# === Compromised cosign keypair backups (forensic, NEVER commit) ===
+# Backups of the cosign keypair compromised in v0.8.1/v0.9.0 VSIX (2026-08-04).
+# Kept locally for forensic reference only — they contain the OLD private key
+# that was packaged into VSIX. Never commit, never distribute.
+cosign.key.compromised-*
+cosign.pub.compromised-*
+
 # === Logs ===
 *.log
 logs/
@@ -56,12 +63,15 @@ test-results/
 .junit.xml
 
 # === Sigstore / SLSA / SBOM artifacts (generated in CI) ===
+# NOTE: cosign.pub is the PUBLIC verification key — it is committed to
+# the repo (see SECURITY.md) so downstream consumers can verify sigstore
+# bundles without an out-of-band channel. The PRIVATE key (cosign.key)
+# stays gitignored via *.key below.
 *.sig
 *.bundle
 *.intoto.json
 *.spdx.json
 *.spdx.xml
-cosign.pub
 
 # === Code review (team-local, never commit) ===
 .cr/

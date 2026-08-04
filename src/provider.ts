@@ -36,12 +36,16 @@ import {
   isChatKnownUnavailable,
   isNativeChatKnownUnavailable,
   isResponsesKnownUnavailable,
+  mark404,
   markChatAvailable,
   markChatUnavailable,
   markNativeChatAvailable,
   markNativeChatUnavailable,
   markResponsesAvailable,
   markResponsesUnavailable,
+  reset404s,
+  shouldAutoSwitch,
+  shouldRetryAfterSilence,
 } from './capabilityCache.js';
 import { HttpError, MidStreamError } from './retry.js';
 import {
@@ -411,6 +415,70 @@ export class OllamaCloudChatProvider
     vscode.window.showInformationMessage(
       `Ollama Cloud: ${count} models available.`,
     );
+  }
+
+  /**
+   * v0.9.0 Fix 4 — command handler for `ollamaCloud.switchEndpoint`.
+   * Shows a QuickPick with auto/native/chat/responses and updates the
+   * global `ollamaCloud.preferredEndpoint` setting. Fires the
+   * information emitter so the model picker tooltip refreshes
+   * immediately (no reload needed). The onDidChangeConfiguration
+   * listener clears the capability cache on the setting change.
+   */
+  async switchEndpoint(): Promise<void> {
+    type EndpointPick = vscode.QuickPickItem & { value: 'auto' | 'native' | 'chat' | 'responses' };
+    const current = vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .get<'auto' | 'native' | 'chat' | 'responses'>('preferredEndpoint', 'native');
+    const items: EndpointPick[] = [
+      {
+        label: 'Auto',
+        description: 'Automatically select endpoint with auto-recovery',
+        detail: 'Switches to fallback on 3 consecutive 404s, returns to primary after 5 min',
+        value: 'auto',
+        picked: current === 'auto',
+      },
+      {
+        label: 'Native (/api/chat)',
+        description: 'Native Ollama endpoint',
+        detail: 'ndjson wire format, object tool arguments, images[] for vision',
+        value: 'native',
+        picked: current === 'native',
+      },
+      {
+        label: 'Chat (/chat/completions)',
+        description: 'Classic OpenAI-compatible endpoint',
+        detail: 'Falls back to /v1/responses on HTTP 404',
+        value: 'chat',
+        picked: current === 'chat',
+      },
+      {
+        label: 'Responses (/v1/responses)',
+        description: 'Structured reasoning, typed events, first-class tool calling',
+        detail: 'Falls back to /chat/completions on HTTP 404',
+        value: 'responses',
+        picked: current === 'responses',
+      },
+    ];
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Ollama Cloud: Switch Endpoint',
+      placeHolder: `Current: ${current}`,
+      canPickMany: false,
+    });
+    if (picked === undefined) {
+      return; // user dismissed
+    }
+    await vscode.workspace
+      .getConfiguration('ollamaCloud')
+      .update('preferredEndpoint', picked.value, vscode.ConfigurationTarget.Global);
+    logger.info(
+      `Endpoint switched via command palette: ${picked.value} (was ${current})`,
+    );
+    // The onDidChangeConfiguration listener fires the emitter and clears
+    // the cache, so no explicit fire is needed here. But fire once more
+    // defensively in case the update was a no-op (same value) and the
+    // tooltip detail still needs a refresh.
+    this.onDidChangeLanguageModelChatInformationEmitter.fire();
   }
 
   async validateConfig(): Promise<void> {
@@ -820,6 +888,7 @@ export class OllamaCloudChatProvider
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && error.status === 404) {
+            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
             // Issue #40 — explicit choice: do NOT silently fall back.
             // Surface an actionable error so the user knows their
@@ -838,6 +907,24 @@ export class OllamaCloudChatProvider
             throw error; // non-404 — surface, no fallback (no double billing)
           }
         }
+      }
+
+      // v0.9.0 Fix 3 — auto-recovery: if native was marked unavailable
+      // (prior 404) but 5+ min have passed since the last 404, clear the
+      // memo so the native path gets retried. This lets connections
+      // recover from transient native-endpoint outages without a manual
+      // config change or VS Code restart. Only applies in auto mode
+      // (explicit mode throws on 404 and does not silently switch).
+      if (
+        primaryEndpoint === 'native' &&
+        isNativeChatKnownUnavailable(connectionId) &&
+        !isPreferredEndpointExplicit &&
+        shouldRetryAfterSilence(connectionId)
+      ) {
+        logger.info(
+          `Auto-recovery: connection "${connectionId}" — native was unavailable, 5+ min elapsed since last 404 — retrying native`,
+        );
+        markNativeChatAvailable(connectionId);
       }
 
       if (primaryEndpoint === 'native' && !isNativeChatKnownUnavailable(connectionId)) {
@@ -875,17 +962,40 @@ export class OllamaCloudChatProvider
             progress,
             model,
             requestChars,
-            () => markNativeChatAvailable(connectionId),
+            () => {
+              markNativeChatAvailable(connectionId);
+              // v0.9.0 Fix 3 — reset the 404 counter on native success
+              // so the auto-recovery window does not accumulate stale 404s.
+              reset404s(connectionId, 'native');
+            },
           );
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && error.status === 404) {
-            markNativeChatUnavailable(connectionId);
+            // v0.9.0 Fix 3 (corrected) — track 404s for auto-recovery.
+            // Do NOT mark unavailable on first 404 — that would switch
+            // immediately, bypassing the 3×404 threshold. Instead:
+            // increment counter, only mark unavailable when threshold hit.
             if (isPreferredEndpointExplicit) {
               logger.info(
                 `Explicit /api/chat (native) 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
               );
               throw endpointExplicitUnavailableError('native', connectionId);
+            }
+            mark404(connectionId, 'native');
+            if (shouldAutoSwitch(connectionId, 'native')) {
+              logger.info(
+                `Auto-recovery: connection "${connectionId}" hit 3×404 on native — switching to chat`,
+              );
+              markNativeChatUnavailable(connectionId);
+            } else {
+              logger.info(
+                `Auto-mode: /api/chat returned 404 for connection "${connectionId}" — will retry native on next request (see capability cache log for 404 count)`,
+              );
+              // Do NOT fall through to chat yet — retry native on next request.
+              // Only after 3×404 do we switch (markNativeChatUnavailable above).
+              // For THIS request, surface the 404 so the caller sees it.
+              throw error;
             }
             logger.info(
               `Auto-mode fallback: /api/chat returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
@@ -940,6 +1050,7 @@ export class OllamaCloudChatProvider
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && error.status === 404) {
+            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
             // Issue #40 — explicit choice: do NOT silently fall back.
             // Surface an actionable error so the user knows their
@@ -991,6 +1102,7 @@ export class OllamaCloudChatProvider
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && error.status === 404) {
+            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markChatUnavailable(connectionId);
             // Issue #40 — explicit choice: do NOT silently fall back.
             if (isPreferredEndpointExplicit) {
@@ -1053,6 +1165,7 @@ export class OllamaCloudChatProvider
           return;
         } catch (error) {
           if (error instanceof HttpError && error.status === 404) {
+            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
             logger.info(
               `/v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,

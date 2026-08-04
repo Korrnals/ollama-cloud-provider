@@ -375,3 +375,7 @@ export function convertToolsToNative(
     },
   }));
 }
+
+// NOTE: `convertToolsToResponses` lives in `convertResponses.ts`
+// (flat `/v1/responses` tool schema) — do NOT re-add it here.
+
