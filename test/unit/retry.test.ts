@@ -260,9 +260,23 @@ describe('retry — socket-close error detection (ADR 0008 Phase 2 level-4)', ()
       assert.match(err.message, /connection interrupted after 5 chunk/);
     });
 
-    it('uses a distinct message when zero chunks received', () => {
-      const err = new ConnectionInterruptedError(0);
-      assert.match(err.message, /interrupted before any data arrived/);
+    it('throws RangeError when constructed with zero chunks (invalid state)', () => {
+      // ADR 0008 taxonomy — 0 chunks MUST be ZeroByteSocketCloseError,
+      // never ConnectionInterruptedError. The constructor enforces this
+      // invariant by rejecting the invalid state at construction time.
+      assert.throws(
+        () => new ConnectionInterruptedError(0),
+        RangeError,
+        'constructor must reject chunksReceived <= 0',
+      );
+    });
+
+    it('throws RangeError when constructed with negative chunks (invalid state)', () => {
+      assert.throws(
+        () => new ConnectionInterruptedError(-1),
+        RangeError,
+        'constructor must reject chunksReceived <= 0',
+      );
     });
   });
 

@@ -114,10 +114,13 @@ export class ConnectionInterruptedError extends Error {
   readonly chunksReceived: number;
 
   constructor(chunksReceived: number) {
+    if (chunksReceived <= 0) {
+      throw new RangeError(
+        'ConnectionInterruptedError requires chunksReceived > 0; use ZeroByteSocketCloseError for the 0-chunk case',
+      );
+    }
     super(
-      chunksReceived > 0
-        ? `Ollama Cloud: connection interrupted after ${chunksReceived} chunk(s)`
-        : 'Ollama Cloud: connection interrupted before any data arrived',
+      `Ollama Cloud: connection interrupted after ${chunksReceived} chunk(s)`,
     );
     this.name = 'ConnectionInterruptedError';
     this.chunksReceived = chunksReceived;
