@@ -5,6 +5,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Added
+- **Models now appear in the VS Code Agents window model picker** when the extension is opted in via `extensions.supportAgentsWindow` — `toChatInformation` sets `isBYOK: true` on the `LanguageModelChatInformation` it returns. The Agents window picker only surfaces models whose `LanguageModelChatInformation` carries `isBYOK === true`; without it, Ollama Cloud models were invisible in the picker even when the extension was active. `isBYOK` is a proposed-only field passed through at runtime via type augmentation (no `enabledApiProposals` needed), mirroring the existing `isUserSelectable` / `statusIcon` augmentation.
+
 ### Fixed
 - **Raw Node socket-close errors reclassified into typed errors (ADR 0008 Phase 2 level-4)** — a raw Node socket/network error (e.g. `aborted at TLSSocket.socketCloseListener`, `socket hang up`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `EHOSTUNREACH`, `ENETUNREACH`, `ETIMEDOUT`, `EAI_AGAIN`) that escaped the streaming clients' `AbortError` routing no longer surfaces to the user as a raw stack trace. New `isSocketCloseError(error)` predicate in `retry.ts` detects these; `ollamaClient.streamChat` and `responsesClient.streamResponse` reclassify them by chunks received (`ZeroByteSocketCloseError` at 0 chunks = retryable; new `ConnectionInterruptedError` at >0 chunks = terminal, non-idempotent per ADR 0005 "No mid-stream retry"); `provider.classifyStreamError` propagates a clean user-facing message instead of the stack trace.
 - **Mid-stream connection interrupt now classified as terminal** — a bare `AbortError` (no caller-tag) that arrives AFTER chunks were received is now surfaced as `ConnectionInterruptedError` (terminal — tokens already billed) instead of silently completing as `onDone`.

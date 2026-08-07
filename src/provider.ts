@@ -270,6 +270,12 @@ type ModelPickerInformation = vscode.LanguageModelChatInformation & {
   detail?: string;
   tooltip?: string;
   configurationSchema?: ModelConfigurationSchema;
+  // PART B workaround — the Agents window model picker only surfaces
+  // models whose LanguageModelChatInformation carries `isBYOK === true`.
+  // This is a proposed-only field passed through at runtime via type
+  // augmentation (no `enabledApiProposals` needed), mirroring
+  // `isUserSelectable` / `statusIcon` above.
+  isBYOK?: boolean;
 };
 
 export class OllamaCloudChatProvider
@@ -1465,6 +1471,7 @@ function toChatInformation(
       toolCalling: model.capabilities.toolCalling,
     },
     isUserSelectable: true,
+    isBYOK: true,
     statusIcon: hasApiKey ? undefined : new vscode.ThemeIcon('warning'),
     ...(configurationSchema ? { configurationSchema } : {}),
   } as ModelPickerInformation;
