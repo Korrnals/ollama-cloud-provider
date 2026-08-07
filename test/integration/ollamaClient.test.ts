@@ -800,3 +800,203 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
     global.fetch = originalFetch;
   });
 });
+
+/**
+ * ADR 0008 Phase 2 level-4 — raw Node socket-close errors (the
+ * `aborted at TLSSocket.socketCloseListener` stack trace the user saw
+ * in production) must be classified by the streaming client, not
+ * surfaced verbatim. These tests reproduce the failure mode: fetch
+ * resolves 200 + headers, then the underlying TLS socket closes
+ * before/after the first body byte, emitting a plain Node `Error`
+ * (name='Error', message='aborted') through the response stream.
+ *
+ * Reproduction strategy: the mock fetch returns a ReadableStream whose
+ * controller ERRORS with the raw socket-close Error (not an
+ * AbortError). The streaming client's `reader.read()` rejects with
+ * this raw Error, which must be reclassified before reaching
+ * `onError`.
+ */
+describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () => {
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+    });
+  });
+
+  afterEach(() => {
+    const stub = global.fetch as any;
+    if (stub.__isStub && stub.__original) global.fetch = stub.__original;
+  });
+
+  it('classifies a 0-byte socket close (before any chunk) as ZeroByteSocketCloseError', async function () {
+    // Reproduces the production symptom: fetch resolves 200 + headers,
+    // then the TLS socket closes before any body byte. The raw Error
+    // (`aborted`) reaches reader.read() and must be reclassified to
+    // ZeroByteSocketCloseError — NOT surfaced as a raw stack trace.
+    this.timeout(5000);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Emit zero chunks, then error the stream with the raw Node
+          // socket-close Error — exactly what TLSSocket.socketCloseListener
+          // surfaces in production.
+          const socketErr = new Error('aborted');
+          // NOTE: name stays 'Error' (NOT 'AbortError') — this is the
+          // gap. A real AbortError would route through the abort branch;
+          // a plain 'aborted' Error escapes every AbortError check.
+          controller.error(socketErr);
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError must fire once');
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
+    assert.match(
+      recorder.errors[0]!.message,
+      /stream closed before any chunk arrived/,
+      'must be reclassified as ZeroByteSocketCloseError, not a raw stack trace',
+    );
+    assert.equal(
+      recorder.errors[0]!.constructor.name,
+      'ZeroByteSocketCloseError',
+    );
+
+    global.fetch = originalFetch;
+  });
+
+  it('classifies a mid-stream socket close (after chunks) as ConnectionInterruptedError', async function () {
+    // Reproduces: stream emits some chunks, then the TLS socket closes.
+    // The raw Error must be reclassified to ConnectionInterruptedError
+    // (terminal, tokens already billed) — NOT a raw stack trace.
+    //
+    // The mock enqueues two chunks, then errors the stream on the next
+    // microtask. The reader's read() loop consumes the two chunks
+    // (incrementing chunksReceived to 2), then the third read() rejects
+    // with the raw socket-close Error. The outer catch sees
+    // chunksReceived=2 > 0 → ConnectionInterruptedError.
+    this.timeout(5000);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Emit two chunks immediately (enqueue places them in the
+          // stream's internal queue; the reader drains them via read()).
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"content":"hel"}}]}\n'),
+          );
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"content":"lo"}}]}\n'),
+          );
+          // Defer the socket-close error so the reader has a chance to
+          // consume the enqueued chunks first. Without the deferral the
+          // stream's errored-state transition may discard the queued
+          // chunks before read() sees them (implementation-dependent),
+          // which would make chunksReceived stay 0.
+          setTimeout(() => {
+            // Raw Node socket-close Error — no [DONE], no clean close.
+            const socketErr = new Error(
+              'aborted at TLSSocket.socketCloseListener (node:_http_client:553:19)',
+            );
+            controller.error(socketErr);
+          }, 20);
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError must fire once');
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
+    assert.equal(
+      recorder.errors[0]!.constructor.name,
+      'ConnectionInterruptedError',
+      'mid-stream socket close must be ConnectionInterruptedError, not raw',
+    );
+    assert.match(
+      recorder.errors[0]!.message,
+      /connection interrupted after \d+ chunk/,
+    );
+    // The user-facing message must NOT contain the raw Node stack trace.
+    assert.doesNotMatch(
+      recorder.errors[0]!.message,
+      /socketCloseListener|node:_http_client/,
+      'message must be clean, not the raw stack trace',
+    );
+    // The partial text was delivered before the socket closed.
+    assert.equal(recorder.text.join(''), 'hello');
+
+    global.fetch = originalFetch;
+  });
+
+  it('retries a connect-phase socket close when maxRetries > 0', async function () {
+    // Connect-phase socket close: the TLS socket closes BEFORE the
+    // response arrives, so `httpRequest` rejects inside `withRetry`.
+    // `defaultRetryOn` must treat the raw socket-close as retryable
+    // (mirrors ZeroByteSocketCloseError, ADR 0008 Phase 3) so a
+    // transient TLS reset recovers instead of surfacing to the user.
+    this.timeout(10000);
+
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 2,
+    });
+
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls < 3) {
+        // Attempts 1, 2: socket closes before the response — fetch
+        // REJECTS with a raw socket-close Error (name='Error', NOT
+        // AbortError). This is the connect-phase path `withRetry` sees.
+        throw new Error('aborted');
+      }
+      // Attempt 3: clean stream.
+      const body = streamFromChunks([
+        encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
+        encode('data: [DONE]\n'),
+      ]);
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      recorder,
+    );
+
+    assert.equal(fetchCalls, 3, 'fetch must retry on connect-phase socket close');
+    assert.equal(recorder.doneCount, 1, 'onDone must fire after retry recovers');
+    assert.equal(recorder.errors.length, 0, 'onError must NOT fire');
+    assert.equal(recorder.text.join(''), 'ok');
+
+    global.fetch = originalFetch;
+  });
+});
