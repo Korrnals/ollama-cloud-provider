@@ -36,12 +36,14 @@ import type {
 } from './protocolTypes.js';
 import {
   ConnectTimeoutError,
+  ConnectionInterruptedError,
   InactivityTimeoutError,
   MaxDurationError,
   MidStreamError,
   ZeroByteSocketCloseError,
   defaultRetryOn,
   httpErrorFromResponse,
+  isSocketCloseError,
   withRetry,
 } from './retry.js';
 
@@ -446,7 +448,36 @@ export class ResponsesClient {
           callbacks.onError(new ZeroByteSocketCloseError());
           return;
         }
+        if (abortReason === null && chunksReceived > 0) {
+          // Bare socket close AFTER chunks were received — the
+          // connection dropped mid-stream. Terminal (no retry):
+          // tokens were already billed. Surface as a typed
+          // `ConnectionInterruptedError` so `classifyStreamError`
+          // shows a clean message instead of the raw AbortError.
+          callbacks.onError(
+            new ConnectionInterruptedError(chunksReceived),
+          );
+          return;
+        }
         callbacks.onDone();
+        return;
+      }
+      // Raw Node socket-close errors (TLS socket closed, ECONNRESET,
+      // "aborted at TLSSocket.socketCloseListener", "socket hang up",
+      // etc.) are emitted as plain `Error` (name='Error', NOT
+      // 'AbortError') and escape every AbortError branch above.
+      // Without this translation they reach the user as a raw stack
+      // trace — the ADR 0008 Phase 2 level-4 gap. Reclassify by chunks:
+      //   - 0 chunks  → ZeroByteSocketCloseError (retryable, connect-equiv)
+      //   - >0 chunks → ConnectionInterruptedError (terminal, mid-stream)
+      if (isSocketCloseError(error)) {
+        if (chunksReceived === 0) {
+          callbacks.onError(new ZeroByteSocketCloseError());
+        } else {
+          callbacks.onError(
+            new ConnectionInterruptedError(chunksReceived),
+          );
+        }
         return;
       }
       callbacks.onError(
