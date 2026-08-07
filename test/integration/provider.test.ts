@@ -1,6 +1,12 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
-import { OllamaCloudChatProvider } from '../../src/provider.js';
+import { OllamaCloudChatProvider, classifyStreamError } from '../../src/provider.js';
+import {
+  ConnectionInterruptedError,
+  HttpError,
+  MidStreamError,
+  ZeroByteSocketCloseError,
+} from '../../src/retry.js';
 import { clearCapabilityCache, markResponsesUnavailable } from '../../src/capabilityCache.js';
 import { logger } from '../../src/logger.js';
 
@@ -2503,5 +2509,67 @@ describe('OllamaCloudChatProvider — switchEndpoint command (v0.9.0 Fix 4)', ()
       .getConfiguration('ollamaCloud')
       .get<string>('preferredEndpoint');
     assert.equal(after, 'native', 'dismissed pick leaves config unchanged');
+  });
+});
+
+/**
+ * Finding #2 (ADR 0008 Phase 2) — provider-level coverage for
+ * `classifyStreamError`. This is the function that turns the typed
+ * streaming errors (ZeroByteSocketCloseError, ConnectionInterruptedError,
+ * MidStreamError, HttpError, and raw socket-close errors) into a
+ * human-readable `vscode.LanguageModelError` so the user never sees a
+ * raw stack trace. These tests pin the mapping the Agents window and
+ * chat participant surface to the user.
+ */
+describe('classifyStreamError — ADR 0008 provider-level mapping', () => {
+  it('maps ConnectionInterruptedError to Blocked("соединение прервано")', () => {
+    const result = classifyStreamError(new ConnectionInterruptedError(3));
+    // vscode.LanguageModelError factories set name === 'LanguageModelError'
+    // and carry the discriminator in the `code` property ('Blocked').
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal(
+      (result as vscode.LanguageModelError).code,
+      'Blocked',
+      'mid-stream interrupt must be Blocked',
+    );
+    assert.match(result.message, /соединение прервано/);
+  });
+
+  it('maps ZeroByteSocketCloseError to Blocked("закрыто сервером до получения данных")', () => {
+    const result = classifyStreamError(new ZeroByteSocketCloseError());
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /закрыто сервером до получения данных/);
+  });
+
+  it('maps MidStreamError to a plain Error carrying the server message', () => {
+    const result = classifyStreamError(new MidStreamError('upstream blew up'));
+    // MidStreamError → generic Error (NOT a LanguageModelError): the server
+    // already gave a message, surfaced verbatim without an error code.
+    assert.equal(result instanceof vscode.LanguageModelError, false);
+    assert.equal(result.name, 'Error');
+    assert.match(result.message, /upstream blew up/);
+  });
+
+  it('maps HttpError 429 to Blocked (rate limit)', () => {
+    const err = new HttpError(429, 'HTTP 429');
+    const result = classifyStreamError(err);
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /Rate limit|429/);
+  });
+
+  it('maps HttpError 404 to NotFound', () => {
+    const err = new HttpError(404, 'HTTP 404');
+    const result = classifyStreamError(err);
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'NotFound');
+  });
+
+  it('maps a raw socket-close Error to Blocked (unclassified network drop)', () => {
+    const result = classifyStreamError(new Error('read ECONNRESET'));
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /соединение прервано/);
   });
 });

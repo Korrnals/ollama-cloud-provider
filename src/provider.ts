@@ -153,7 +153,7 @@ function endpointExplicitUnavailableError(
  * not a raw stack trace. The raw error (with stack) is logged in
  * `runStream`'s `onError` handler before it reaches here.
  */
-function classifyStreamError(error: unknown): Error {
+export function classifyStreamError(error: unknown): Error {
   if (error instanceof MidStreamError) {
     return new Error(`Ollama Cloud: ${error.serverMessage}`);
   }
