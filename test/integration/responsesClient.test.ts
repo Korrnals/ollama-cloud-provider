@@ -391,3 +391,135 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
     global.fetch = originalFetch;
   });
 });
+
+/**
+ * ADR 0008 Phase 2 level-4 — raw Node socket-close errors must be
+ * classified by `responsesClient.streamResponses` (the /v1/responses
+ * PRIMARY path per ADR 0006), not surfaced verbatim. These tests
+ * mirror the `ollamaClient.test.ts` socket-close suite: the stream
+ * errors with a plain Node `Error` (`aborted at TLSSocket.socketCloseListener`)
+ * and the client must reclassify it by chunks received.
+ */
+describe('responsesClient.streamResponses — ADR 0008 socket-close classification', () => {
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMs: 1800000,
+      maxRetries: 0,
+    });
+  });
+
+  afterEach(() => {
+    const stub = global.fetch as any;
+    if (stub.__isStub && stub.__original) global.fetch = stub.__original;
+  });
+
+  it('classifies a 0-byte socket close (before any chunk) as ZeroByteSocketCloseError', async function () {
+    // Reproduces the production symptom: fetch resolves 200 + headers,
+    // then the TLS socket closes before any body byte. The raw Error
+    // (`aborted`) reaches reader.read() and must be reclassified to
+    // ZeroByteSocketCloseError — NOT surfaced as a raw stack trace.
+    this.timeout(5000);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Emit zero chunks, then error the stream with the raw Node
+          // socket-close Error — exactly what TLSSocket.socketCloseListener
+          // surfaces in production. name stays 'Error' (NOT 'AbortError').
+          const socketErr = new Error('aborted');
+          controller.error(socketErr);
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new ResponsesClient(BASE_URL, 'sk-test-key');
+    await client.streamResponses(
+      { model: 'm', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError must fire once');
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
+    assert.match(
+      recorder.errors[0]!.message,
+      /stream closed before any chunk arrived/,
+      'must be reclassified as ZeroByteSocketCloseError, not a raw stack trace',
+    );
+    assert.equal(
+      recorder.errors[0]!.constructor.name,
+      'ZeroByteSocketCloseError',
+    );
+
+    global.fetch = originalFetch;
+  });
+
+  it('classifies a mid-stream socket close (after chunks) as ConnectionInterruptedError', async function () {
+    // Reproduces: the /v1/responses stream emits some chunks, then the
+    // TLS socket closes. The raw Error must be reclassified to
+    // ConnectionInterruptedError (terminal, tokens already billed) — NOT
+    // a raw stack trace.
+    this.timeout(5000);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Emit two /v1/responses delta chunks immediately.
+          controller.enqueue(
+            event('response.output_text.delta', '{"delta":"hel","item_id":"m1"}'),
+          );
+          controller.enqueue(
+            event('response.output_text.delta', '{"delta":"lo","item_id":"m1"}'),
+          );
+          // Defer the socket-close error so the reader has a chance to
+          // consume the enqueued chunks first (otherwise the stream's
+          // errored-state transition may discard the queued chunks).
+          setTimeout(() => {
+            // Raw Node socket-close Error — no completed event, no clean close.
+            const socketErr = new Error(
+              'aborted at TLSSocket.socketCloseListener (node:_http_client:553:19)',
+            );
+            controller.error(socketErr);
+          }, 20);
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new ResponsesClient(BASE_URL, 'sk-test-key');
+    await client.streamResponses(
+      { model: 'm', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'onError must fire once');
+    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
+    assert.equal(
+      recorder.errors[0]!.constructor.name,
+      'ConnectionInterruptedError',
+      'mid-stream socket close must be ConnectionInterruptedError, not raw',
+    );
+    assert.match(
+      recorder.errors[0]!.message,
+      /connection interrupted after \d+ chunk/,
+    );
+    // The user-facing message must NOT contain the raw Node stack trace.
+    assert.doesNotMatch(
+      recorder.errors[0]!.message,
+      /socketCloseListener|node:_http_client/,
+      'message must be clean, not the raw stack trace',
+    );
+    // The partial text was delivered before the socket closed.
+    assert.equal(recorder.text.join(''), 'hello');
+
+    global.fetch = originalFetch;
+  });
+});
