@@ -97,6 +97,122 @@ export class ZeroByteSocketCloseError extends Error {
 }
 
 /**
+ * Mid-stream connection interrupted — the TLS socket closed after one
+ * or more chunks had already been received. Terminal, NOT retriable:
+ * POST `/chat/completions` is not idempotent and tokens were already
+ * billed (ADR 0005 "No mid-stream retry"). Distinct from
+ * {@link ZeroByteSocketCloseError} (0 chunks, retryable) and
+ * {@link InactivityTimeoutError} (timeout, not socket close).
+ *
+ * This class closes the ADR 0008 Phase 2 priority-level-4 gap: a raw
+ * Node socket-close Error (e.g. `aborted at TLSSocket.socketCloseListener`)
+ * that arrives AFTER the stream started used to surface to the user as a
+ * raw stack trace. The streaming clients translate it into this typed
+ * error so `classifyStreamError` can show a clean message.
+ */
+export class ConnectionInterruptedError extends Error {
+  readonly chunksReceived: number;
+
+  constructor(chunksReceived: number) {
+    super(
+      chunksReceived > 0
+        ? `Ollama Cloud: connection interrupted after ${chunksReceived} chunk(s)`
+        : 'Ollama Cloud: connection interrupted before any data arrived',
+    );
+    this.name = 'ConnectionInterruptedError';
+    this.chunksReceived = chunksReceived;
+  }
+}
+
+/**
+ * Detects a raw Node socket-close / network-reset error that escaped
+ * the streaming clients' AbortError routing. Node's HTTP client emits
+ * these as plain `Error` objects (name = 'Error', NOT 'AbortError')
+ * when the underlying TLS socket closes prematurely — e.g.:
+ *
+ *   - `aborted at TLSSocket.socketCloseListener (node:_http_client:...)`
+ *   - `socket hang up`
+ *   - `read ECONNRESET` / `write EPIPE`
+ *   - `connect ECONNREFUSED`
+ *
+ * These errors reach the clients' outer catch as plain `Error` and fall
+ * through every `error.name === 'AbortError'` branch, surfacing to the
+ * user as a raw stack trace (the ADR 0008 Phase 2 level-4 gap). This
+ * predicate lets the clients translate them into
+ * {@link ZeroByteSocketCloseError} (0 chunks, retryable) or
+ * {@link ConnectionInterruptedError} (>0 chunks, terminal).
+ *
+ * Detection is conservative: it matches on message substrings and the
+ * `code` property that Node attaches to system errors. A typed error
+ * from our own code (HttpError, MidStreamError, etc.) never matches —
+ * those carry their own name and message.
+ *
+ * @param error  Any caught value.
+ * @returns `true` when the error looks like a raw Node socket/network
+ *          close that should be reclassified.
+ */
+export function isSocketCloseError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  // Our own typed errors are already classified — never reclassify.
+  if (
+    error instanceof HttpError ||
+    error instanceof ConnectTimeoutError ||
+    error instanceof ZeroByteSocketCloseError ||
+    error instanceof ConnectionInterruptedError ||
+    error instanceof InactivityTimeoutError ||
+    error instanceof MaxDurationError ||
+    error instanceof MidStreamError
+  ) {
+    return false;
+  }
+  // Node system-error `code` (libuv): the socket layer closed abruptly.
+  const code = (error as { code?: unknown }).code;
+  if (
+    typeof code === 'string' &&
+    SOCKET_CLOSE_CODES.has(code)
+  ) {
+    return true;
+  }
+  const message = error.message ?? '';
+  // Message-substring detection for the Node HTTP client's own abort
+  // framing (no `code` attached). `aborted` is the literal Node emits
+  // from `socketCloseListener`; `socket hang up` is undici's framing.
+  return (
+    message === 'aborted' ||
+    message === 'aborted.' ||
+    message.startsWith('aborted ') ||
+    message.startsWith('socket hang up') ||
+    SOCKET_CLOSE_MESSAGE_RE.test(message)
+  );
+}
+
+/**
+ * libuv `code` values that indicate a socket-level close/reset. Sourced
+ * from the Node.js + libuv error catalogue (uv_errno_map).
+ */
+const SOCKET_CLOSE_CODES = new Set([
+  'ECONNRESET', // TCP connection reset by peer
+  'ECONNREFUSED', // connection refused (server down / port closed)
+  'EPIPE', // broken pipe (write after remote close)
+  'EHOSTUNREACH', // host unreachable (network layer)
+  'ENETUNREACH', // network unreachable
+  'ETIMEDOUT', // connect/operation timed out at the socket layer
+  'EAI_AGAIN', // DNS temporary failure
+]);
+
+/**
+ * Message-substring detection for socket-close framing Node attaches to
+ * the `message` (not `code`). Matches the libuv error description tail
+ * and the Node HTTP client abort framing. Anchored on the codes list so
+ * a coincidental `ECONNRESET` substring inside an unrelated message
+ * still needs the libuv framing (`read `, `write `, `connect `).
+ */
+const SOCKET_CLOSE_MESSAGE_RE =
+  /\b(read|write|connect) (ECONNRESET|ECONNREFUSED|EPIPE|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN)\b/;
+
+/**
  * Mid-stream silence — no chunk AND no `: keep-alive` SSE comment for
  * `requestInactivityTimeoutMs` after the first byte arrived. Terminal,
  * NOT retriable: POST `/chat/completions` is not idempotent, retrying
@@ -194,9 +310,14 @@ export function isRetriableHttpStatus(status: number): boolean {
  *   is per-attempt; if the caller's abort signal is already aborted, the
  *   caller's `retryOn` override should return false to avoid burning
  *   retries on an already-cancelled request.
+ * - raw Node socket-close errors (detected via {@link isSocketCloseError})
+ *   when caught at the connect phase (inside `withRetry`). Mid-stream
+ *   socket closes are reclassified to {@link ConnectionInterruptedError}
+ *   by the streaming clients BEFORE reaching retry, so they are terminal.
  *
  * Does NOT retry:
  * - {@link MidStreamError} — server-sent mid-stream error, terminal
+ * - {@link ConnectionInterruptedError} — mid-stream socket close, terminal
  * - {@link InactivityTimeoutError} — mid-stream silence, terminal
  * - {@link MaxDurationError} — total-duration cap, terminal
  */
@@ -206,6 +327,9 @@ export function defaultRetryOn(error: unknown): boolean {
   }
   if (error instanceof ZeroByteSocketCloseError) {
     return true;
+  }
+  if (error instanceof ConnectionInterruptedError) {
+    return false;
   }
   if (error instanceof InactivityTimeoutError) {
     return false;
@@ -224,6 +348,16 @@ export function defaultRetryOn(error: unknown): boolean {
       return true;
     }
     if (error instanceof TypeError) {
+      return true;
+    }
+    // Raw Node socket-close error (TLS socket closed, ECONNRESET, etc.)
+    // caught at the connect phase. Retryable: at the connect boundary no
+    // stream bytes were produced, so the non-idempotency argument does
+    // not apply. Mirrors `ZeroByteSocketCloseError` (ADR 0008 Phase 3).
+    // Mid-stream socket closes are reclassified to
+    // `ConnectionInterruptedError` by the streaming clients before they
+    // can reach this path.
+    if (isSocketCloseError(error)) {
       return true;
     }
   }
