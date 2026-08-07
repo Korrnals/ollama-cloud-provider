@@ -6,6 +6,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ## [Unreleased]
 
 ### Added
+- _(nothing yet)_
+
+## [0.9.2] - 2026-08-08
+
+### Added
 - **Models now appear in the VS Code Agents window model picker** when the extension is opted in via `extensions.supportAgentsWindow` — `toChatInformation` sets `isBYOK: true` on the `LanguageModelChatInformation` it returns. The Agents window picker only surfaces models whose `LanguageModelChatInformation` carries `isBYOK === true`; without it, Ollama Cloud models were invisible in the picker even when the extension was active. `isBYOK` is a proposed-only field passed through at runtime via type augmentation (no `enabledApiProposals` needed), mirroring the existing `isUserSelectable` / `statusIcon` augmentation.
 
 ### Fixed
