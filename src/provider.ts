@@ -47,7 +47,13 @@ import {
   shouldAutoSwitch,
   shouldRetryAfterSilence,
 } from './capabilityCache.js';
-import { HttpError, MidStreamError } from './retry.js';
+import {
+  HttpError,
+  MidStreamError,
+  ZeroByteSocketCloseError,
+  ConnectionInterruptedError,
+  isSocketCloseError,
+} from './retry.js';
 import {
   loadConnections,
   nativeBaseUrl,
@@ -147,9 +153,25 @@ function endpointExplicitUnavailableError(
  * not a raw stack trace. The raw error (with stack) is logged in
  * `runStream`'s `onError` handler before it reaches here.
  */
-function classifyStreamError(error: unknown): Error {
+export function classifyStreamError(error: unknown): Error {
   if (error instanceof MidStreamError) {
     return new Error(`Ollama Cloud: ${error.serverMessage}`);
+  }
+  if (error instanceof ZeroByteSocketCloseError) {
+    // ADR 0008 Phase 3 — server closed before any chunk. Retryable at
+    // the connect boundary; if it escaped retry (retries exhausted or
+    // maxRetries=0), surface a clean message naming the failure mode.
+    return vscode.LanguageModelError.Blocked(
+      'Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов).',
+    );
+  }
+  if (error instanceof ConnectionInterruptedError) {
+    // ADR 0008 Phase 2 level-4 — mid-stream socket close. Terminal
+    // (tokens already billed). Surface a clean message instead of the
+    // raw `aborted at TLSSocket.socketCloseListener` stack trace.
+    return vscode.LanguageModelError.Blocked(
+      'Ollama Cloud: соединение прервано в середине ответа. Сервер закрыл сокет после начала стрима — частичный ответ утерян.',
+    );
   }
   if (error instanceof HttpError) {
     // Surface the server's actual error message when present (extracted
@@ -196,6 +218,18 @@ function classifyStreamError(error: unknown): Error {
         return new Error(`Ollama Cloud: HTTP ${error.status} — ${error.message}`);
     }
   }
+  // ADR 0008 Phase 2 level-4 — unclassified socket/network error that
+  // escaped the streaming clients' reclassification (e.g. a raw Node
+  // socket close that bypassed the isSocketCloseError translation, or a
+  // network error from a different code path). Wrap with a generic
+  // "connection interrupted" message instead of surfacing the raw stack
+  // trace to the user. The raw error is logged with its stack by the
+  // caller (runStream onError handler) BEFORE reaching here.
+  if (isSocketCloseError(error)) {
+    return vscode.LanguageModelError.Blocked(
+      'Ollama Cloud: соединение прервано. Сервер или сеть закрыли соединение до завершения ответа.',
+    );
+  }
   return error instanceof Error ? error : new Error(String(error));
 }
 
@@ -236,6 +270,12 @@ type ModelPickerInformation = vscode.LanguageModelChatInformation & {
   detail?: string;
   tooltip?: string;
   configurationSchema?: ModelConfigurationSchema;
+  // PART B workaround — the Agents window model picker only surfaces
+  // models whose LanguageModelChatInformation carries `isBYOK === true`.
+  // This is a proposed-only field passed through at runtime via type
+  // augmentation (no `enabledApiProposals` needed), mirroring
+  // `isUserSelectable` / `statusIcon` above.
+  isBYOK?: boolean;
 };
 
 export class OllamaCloudChatProvider
@@ -1431,6 +1471,7 @@ function toChatInformation(
       toolCalling: model.capabilities.toolCalling,
     },
     isUserSelectable: true,
+    isBYOK: true,
     statusIcon: hasApiKey ? undefined : new vscode.ThemeIcon('warning'),
     ...(configurationSchema ? { configurationSchema } : {}),
   } as ModelPickerInformation;

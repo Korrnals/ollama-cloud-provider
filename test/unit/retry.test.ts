@@ -3,9 +3,11 @@ import * as vscode from 'vscode';
 import {
   HttpError,
   ZeroByteSocketCloseError,
+  ConnectionInterruptedError,
   defaultRetryOn,
   httpErrorFromResponse,
   isRetriableHttpStatus,
+  isSocketCloseError,
   withRetry,
 } from '../../src/retry.js';
 
@@ -155,5 +157,154 @@ describe('retry.withRetry — backoff', () => {
     assert.equal(isRetriableHttpStatus(500), true);
     assert.equal(isRetriableHttpStatus(429), true);
     assert.equal(isRetriableHttpStatus(404), false);
+  });
+});
+
+/**
+ * ADR 0008 Phase 2 level-4 — raw Node socket-close errors (TLS socket
+ * closed, ECONNRESET, "aborted at TLSSocket.socketCloseListener") must
+ * be detected and classified, not surfaced as raw stack traces.
+ */
+describe('retry — socket-close error detection (ADR 0008 Phase 2 level-4)', () => {
+  describe('isSocketCloseError', () => {
+    it('detects the literal "aborted" Node HTTP client message', () => {
+      const err = new Error('aborted');
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects "aborted at TLSSocket.socketCloseListener ..." framing', () => {
+      const err = new Error(
+        'aborted at TLSSocket.socketCloseListener (node:_http_client:553:19)',
+      );
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects "socket hang up" framing', () => {
+      assert.strictEqual(
+        isSocketCloseError(new Error('socket hang up')),
+        true,
+      );
+    });
+
+    it('detects libuv code ECONNRESET', () => {
+      const err = new Error('read ECONNRESET') as Error & {
+        code?: string;
+      };
+      err.code = 'ECONNRESET';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects "read ECONNRESET" message framing (no code)', () => {
+      assert.strictEqual(
+        isSocketCloseError(new Error('read ECONNRESET')),
+        true,
+      );
+    });
+
+    it('detects "connect ECONNREFUSED" message framing', () => {
+      assert.strictEqual(
+        isSocketCloseError(new Error('connect ECONNREFUSED 127.0.0.1:8080')),
+        true,
+      );
+    });
+
+    it('detects "write EPIPE" message framing', () => {
+      assert.strictEqual(isSocketCloseError(new Error('write EPIPE')), true);
+    });
+
+    it('does NOT match a typed error from our own code', () => {
+      assert.strictEqual(
+        isSocketCloseError(new HttpError(502, 'bad gateway')),
+        false,
+      );
+      assert.strictEqual(
+        isSocketCloseError(new ZeroByteSocketCloseError()),
+        false,
+      );
+      assert.strictEqual(
+        isSocketCloseError(new ConnectionInterruptedError(3)),
+        false,
+      );
+    });
+
+    it('does NOT match an unrelated plain Error', () => {
+      assert.strictEqual(
+        isSocketCloseError(new Error('something else went wrong')),
+        false,
+      );
+    });
+
+    it('does NOT match non-Error values', () => {
+      assert.strictEqual(isSocketCloseError(undefined), false);
+      assert.strictEqual(isSocketCloseError(null), false);
+      assert.strictEqual(isSocketCloseError('aborted'), false);
+      assert.strictEqual(isSocketCloseError({ message: 'aborted' }), false);
+    });
+
+    it('does NOT false-match a coincidental libuv code substring', () => {
+      // The regex requires the libuv framing verb (read/write/connect)
+      // before the code — a plain sentence containing ECONNRESET must
+      // NOT match unless it carries the framing.
+      assert.strictEqual(
+        isSocketCloseError(new Error('the docs mention ECONNRESET here')),
+        false,
+      );
+    });
+  });
+
+  describe('ConnectionInterruptedError', () => {
+    it('records the chunk count in its message and field', () => {
+      const err = new ConnectionInterruptedError(5);
+      assert.strictEqual(err.name, 'ConnectionInterruptedError');
+      assert.strictEqual(err.chunksReceived, 5);
+      assert.match(err.message, /connection interrupted after 5 chunk/);
+    });
+
+    it('throws RangeError when constructed with zero chunks (invalid state)', () => {
+      // ADR 0008 taxonomy — 0 chunks MUST be ZeroByteSocketCloseError,
+      // never ConnectionInterruptedError. The constructor enforces this
+      // invariant by rejecting the invalid state at construction time.
+      assert.throws(
+        () => new ConnectionInterruptedError(0),
+        RangeError,
+        'constructor must reject chunksReceived <= 0',
+      );
+    });
+
+    it('throws RangeError when constructed with negative chunks (invalid state)', () => {
+      assert.throws(
+        () => new ConnectionInterruptedError(-1),
+        RangeError,
+        'constructor must reject chunksReceived <= 0',
+      );
+    });
+  });
+
+  describe('defaultRetryOn — socket-close classification', () => {
+    it('retries a raw socket-close error (connect-phase equivalent)', () => {
+      assert.strictEqual(
+        defaultRetryOn(new Error('aborted')),
+        true,
+      );
+      const resetErr = new Error('read ECONNRESET') as Error & {
+        code?: string;
+      };
+      resetErr.code = 'ECONNRESET';
+      assert.strictEqual(defaultRetryOn(resetErr), true);
+    });
+
+    it('does NOT retry ConnectionInterruptedError (mid-stream, terminal)', () => {
+      assert.strictEqual(
+        defaultRetryOn(new ConnectionInterruptedError(3)),
+        false,
+      );
+    });
+
+    it('still retries ZeroByteSocketCloseError (0-byte close, connect-equiv)', () => {
+      assert.strictEqual(
+        defaultRetryOn(new ZeroByteSocketCloseError()),
+        true,
+      );
+    });
   });
 });
