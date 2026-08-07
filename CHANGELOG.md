@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Fixed
+- **Raw Node socket-close errors reclassified into typed errors (ADR 0008 Phase 2 level-4)** — a raw Node socket/network error (e.g. `aborted at TLSSocket.socketCloseListener`, `socket hang up`, `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `EHOSTUNREACH`, `ENETUNREACH`, `ETIMEDOUT`, `EAI_AGAIN`) that escaped the streaming clients' `AbortError` routing no longer surfaces to the user as a raw stack trace. New `isSocketCloseError(error)` predicate in `retry.ts` detects these; `ollamaClient.streamChat` and `responsesClient.streamResponse` reclassify them by chunks received (`ZeroByteSocketCloseError` at 0 chunks = retryable; new `ConnectionInterruptedError` at >0 chunks = terminal, non-idempotent per ADR 0005 "No mid-stream retry"); `provider.classifyStreamError` propagates a clean user-facing message instead of the stack trace.
+- **Mid-stream connection interrupt now classified as terminal** — a bare `AbortError` (no caller-tag) that arrives AFTER chunks were received is now surfaced as `ConnectionInterruptedError` (terminal — tokens already billed) instead of silently completing as `onDone`.
+
 ## [0.9.1] - 2026-08-05
 
 ### Fixed
