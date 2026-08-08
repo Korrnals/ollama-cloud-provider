@@ -28,6 +28,7 @@ export default [
       'semi': ['error', 'always'],
       'quotes': ['error', 'single', { avoidEscape: true }],
       'comma-dangle': ['error', 'always-multiline'],
+      'eol-last': ['error', 'always'],
     },
   },
 ];
