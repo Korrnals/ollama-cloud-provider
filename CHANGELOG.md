@@ -8,6 +8,20 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ### Added
 - _(nothing yet)_
 
+## [0.9.3] - 2026-08-08
+
+### Fixed
+- **4 runtime transitive vulnerabilities cleared via `npm audit fix`** — `undici` (high), `brace-expansion` (moderate), `fast-uri` (moderate), and `js-yaml` (moderate) bumped to fixed versions. No API or behaviour change; these are transitive dependencies reached only at runtime.
+
+### Changed
+- **`eol-last` ESLint rule enforced** — the rule now requires every file to end with a newline; 36 source and documentation files were corrected to comply. No logic change.
+
+### Added
+- **`isBYOK` stable-API feature-request draft** — `docs/open-issues/vscode-isbyok-stable-api.md` is a ready-to-file GitHub issue for `microsoft/vscode`, requesting promotion of the `isBYOK` field from the proposed `vscode.proposed.chatProvider.d.ts` to the stable `LanguageModelChatInformation` type. Root cause (`AgentHostByokLmHandler` filter) cited; filed as a draft pending owner decision on when/whether to file upstream.
+
+### Known issues
+- **3 dev-only vulnerabilities remain** — `mocha`, `diff`, and `serialize-javascript` have advisories, but they are test-time dependencies only and are excluded from the packaged VSIX. No runtime risk to extension users.
+
 ## [0.9.2] - 2026-08-08
 
 ### Added
