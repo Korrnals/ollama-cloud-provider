@@ -23,6 +23,10 @@ out/test/**
 dist/
 *.vsix
 *.tsbuildinfo
+# Old release signatures (sha256.txt, .asc, .sigstore.bundle) bloat the
+# VSIX (~9KB across v0.9.0–v0.9.3); release artefacts ship via GitHub
+# Releases, not inside the extension package.
+releases/**
 
 # Dev docs (keep README, CHANGELOG, LICENSE, SECURITY)
 DEVELOPMENT.md
