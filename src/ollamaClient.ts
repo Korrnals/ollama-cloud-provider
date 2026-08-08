@@ -1,4 +1,3 @@
-import * as vscode from 'vscode';
 import type { CancellationToken } from 'vscode';
 import {
   assertBaseUrlAllowed,
@@ -6,8 +5,7 @@ import {
 } from './configValidator.js';
 import type { ConnectionConfig } from './connections.js';
 import { nativeBaseUrl } from './connections.js';
-import { httpRequest, type HttpResponseLike } from './httpClient.js';
-import { logger, redactSensitive } from './logger.js';
+import { logger } from './logger.js';
 import type {
   OpenAICompatibleMessage,
   OpenAICompatibleTool,
@@ -17,50 +15,17 @@ import type {
   StreamCallbacks,
   UsageInfo,
 } from './protocolTypes.js';
+import { MidStreamError } from './retry.js';
 import {
-  ConnectTimeoutError,
-  ConnectionInterruptedError,
-  InactivityTimeoutError,
-  MaxDurationError,
-  MidStreamError,
-  ZeroByteSocketCloseError,
-  defaultRetryOn,
-  httpErrorFromResponse,
-  isSocketCloseError,
-  withRetry,
-} from './retry.js';
+  readStream,
+  type StreamLineContext,
+  type StreamFinalizer,
+} from './streamReader.js';
 
-// ADR 0005 — three timers replace the single end-to-end setTimeout.
-// Each guard mirrors the package.json schema maximum; below-minimum
-// values are accepted (package.json enforces the UI minimum, the
-// resolver only guards against garbage). See resolve* docstring.
-// v0.9.0 — connect default raised to 60s (1 min), inactivity default
-// raised to 300s (5 min) with a soft/grace extension (see
-// resetInactivity). The max stays at 600s (10 min).
-const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
-const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 60000;
-
-const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
-const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 300000;
-// v0.9.0 — soft threshold: when the inactivity timer first fires at this
-// duration, instead of killing the stream, we log a warning and extend
-// to the full inactivityTimeoutMs grace period. Only the SECOND fire
-// (hard kill) aborts. Must be <= REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS.
-const REQUEST_INACTIVITY_SOFT_THRESHOLD_MS = 120000;
-
-const REQUEST_MAX_DURATION_MAX_MS = 3600000;
-const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
-
-// Legacy single-timer clamp — kept for the deprecation alias. The
-// default is intentionally unused (new default is
-// REQUEST_MAX_DURATION_DEFAULT_MS); the alias only applies when the
-// user explicitly set requestTimeoutMs.
-const REQUEST_TIMEOUT_MAX_MS = 600000;
-// MEDIUM-2 — cap the SSE buffer at 1 MiB. A well-formed stream emits
-// newline-delimited chunks, so the buffer between line splits stays
-// small. A hostile/malformed stream with no newlines would grow it
-// without bound; this cap turns that into a bounded, reported error.
-const MAX_SSE_BUFFER_BYTES = 1048576;
+// ADR 0010 — the timer constants, MAX_SSE_BUFFER_BYTES, and resolve*
+// helpers that formerly lived here have moved to `streamReader.ts`.
+// This client no longer owns the streaming lifecycle; it delegates to
+// `readStream` and injects endpoint-specific parsing via callbacks.
 
 interface OpenAIStreamChunk {
   choices?: Array<{
@@ -250,494 +215,72 @@ export class OllamaClient {
     callbacks: StreamCallbacks,
     cancellationToken?: CancellationToken,
   ): Promise<void> {
-    // ADR 0005 — three timers replace the single end-to-end setTimeout.
-    //   connect      — wraps fetch only, retryable, 30s default
-    //   inactivity   — resets per chunk + per :keep-alive, NO retry, 90s
-    //   maxDuration  — never reset, NO retry, 30 min safety cap
-    // No mid-stream retry: POST /chat/completions is not idempotent.
-    const controller = new AbortController();
-    const connectTimeoutMs = resolveConnectTimeoutMs();
-    const inactivityTimeoutMs = resolveInactivityTimeoutMs();
-    const maxDurationMs = resolveMaxDurationMs();
+    // SEC-03 — enforce the per-connection / global baseUrl whitelist
+    // BEFORE any network call. This stays in the client (ADR 0010
+    // module boundary); the shared streamReader does NOT re-check.
+    this.assertBaseUrlAllowedOrThrow();
 
-    // Tagged abort reason — the catch block routes by this tag to emit
-    // the right user-facing message and to decide onDone vs onError.
-    type AbortReason =
-      | 'connect'
-      | 'inactivity'
-      | 'maxDuration'
-      | 'cancel'
-      | null;
-    let abortReason: AbortReason = null;
+    const { extraBody, ...baseRequest } = request;
+    const body = this.endpointFormat === 'native'
+      ? JSON.stringify(buildNativeRequestBody(baseRequest, extraBody))
+      : JSON.stringify({
+        ...baseRequest,
+        ...extraBody,
+        stream: true,
+        stream_options: { include_usage: true },
+      });
 
-    // Max-duration: one setTimeout at start, never reset, cleared in finally.
-    const maxDurationHandle = setTimeout(() => {
-      abortReason = 'maxDuration';
-      logger.error(
-        `Ollama Cloud: exceeded max stream duration (${maxDurationMs}ms)`,
-      );
-      controller.abort();
-    }, maxDurationMs);
-
-    // Inactivity: started after fetch resolves (first byte), reset per
-    // chunk + per :keep-alive. Declared here so the finally block can
-    // clear it from both the stream path and the early-throw path.
-    // v0.9.0 — soft/grace period: the FIRST fire at the soft threshold
-    // (120s) logs a warning and extends the timer to the full
-    // `inactivityTimeoutMs` grace period (300s default). Only the SECOND
-    // fire hard-kills the stream. This accommodates long reasoning
-    // models that go silent between the reasoning phase and token
-    // emission without being truly dead.
-    let inactivityHandle: ReturnType<typeof setTimeout> | undefined;
-    let inactivitySoftFired = false;
-    const resetInactivity = (): void => {
-      if (inactivityHandle !== undefined) {
-        clearTimeout(inactivityHandle);
-      }
-      inactivitySoftFired = false;
-      // Short-timeout path: when the configured inactivity timeout is
-      // at or below the soft threshold (tests, or users who explicitly
-      // want a short timeout), fire HARD directly at the configured
-      // duration. No soft extension — this is the pre-v0.9.0 behaviour
-      // for short timeouts and keeps a short test budget satisfied.
-      if (inactivityTimeoutMs <= REQUEST_INACTIVITY_SOFT_THRESHOLD_MS) {
-        inactivityHandle = setTimeout(() => {
-          abortReason = 'inactivity';
-          logger.error(
-            `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-          );
-          controller.abort();
-        }, inactivityTimeoutMs);
-        return;
-      }
-      // Long-timeout path: soft threshold + grace extension. The FIRST
-      // fire at the soft threshold logs a warning and extends the timer
-      // to the full `inactivityTimeoutMs` grace period (300s default).
-      // Only the SECOND fire hard-kills the stream. This accommodates
-      // long reasoning models that go silent between the reasoning
-      // phase and token emission without being truly dead.
-      inactivityHandle = setTimeout(() => {
-        if (!inactivitySoftFired) {
-          // Soft fire — extend to the full grace period.
-          inactivitySoftFired = true;
-          if (inactivityHandle !== undefined) {
-            clearTimeout(inactivityHandle);
-          }
-          logger.warn(
-            `Ollama Cloud: stream stalled for ${REQUEST_INACTIVITY_SOFT_THRESHOLD_MS}ms — extending to ${inactivityTimeoutMs}ms grace period`,
-          );
-          inactivityHandle = setTimeout(() => {
-            abortReason = 'inactivity';
-            logger.error(
-              `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-            );
-            controller.abort();
-          }, inactivityTimeoutMs);
-          return;
-        }
-        // Should not reach here — the soft-fire callback re-arms with a
-        // fresh timer; this branch is defensive.
-        abortReason = 'inactivity';
-        logger.error(
-          `Ollama Cloud: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-        );
-        controller.abort();
-      }, REQUEST_INACTIVITY_SOFT_THRESHOLD_MS);
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
     };
-    const clearInactivity = (): void => {
-      if (inactivityHandle !== undefined) {
-        clearTimeout(inactivityHandle);
-        inactivityHandle = undefined;
-      }
-    };
-
-    // Count of chunks received — used by the catch block to distinguish
-    // connect/first-token (0 chunks) from mid-stream (>0 chunks) for
-    // error messages. NOT used for retry decisions (no retry regardless).
-    let chunksReceived = 0;
-
-    // Combine the caller's CancellationToken with our timers. See the
-    // race note below — a cancel that arrived during async setup before
-    // streamChat was entered must be detected synchronously.
-    const cancelListener = cancellationToken?.onCancellationRequested(() => {
-      abortReason = 'cancel';
-      controller.abort();
-    });
-    if (cancellationToken?.isCancellationRequested) {
-      abortReason = 'cancel';
-      controller.abort();
+    if (this.apiKey) {
+      headers.Authorization = `Bearer ${this.apiKey}`;
     }
 
-    let done = false;
+    // Protocol state stays in the client closure (ADR 0010 condition #1
+    // — the module does NOT see endpoint-specific state). For compat
+    // mode, pendingToolCalls accumulates streamed tool-call deltas
+    // across chunks until [DONE] or stream end. For native mode, no
+    // accumulation is needed (tool_calls arrive as one full-event).
+    const pendingToolCalls = new Map<number, OpenAICompatibleToolCall>();
 
-    // ADR 0005 — per-attempt abort wiring. See the comment above
-    // `withRetry` for the full rationale. Declared in the function
-    // scope (not inside `try`) so the outer `finally` can detach the
-    // main→attempt listener once the stream is done.
-    let streamMainAbortListener: (() => void) | undefined;
-
-    try {
-      this.assertBaseUrlAllowedOrThrow();
-
-      const { extraBody, ...baseRequest } = request;
-      const body = this.endpointFormat === 'native'
-        ? JSON.stringify(buildNativeRequestBody(baseRequest, extraBody))
-        : JSON.stringify({
-          ...baseRequest,
-          ...extraBody,
-          stream: true,
-          stream_options: { include_usage: true },
-        });
-
-      // Issue 13 / ADR 0005 — retry the INITIAL CONNECTION only.
-      // `withRetry` wraps just the `fetch` + status check; the body
-      // reader loop is outside the wrapper. Connect-phase timeouts
-      // (ConnectTimeoutError) are retriable; stream errors are terminal.
-      const retryOn = (error: unknown): boolean => {
-        if (cancellationToken?.isCancellationRequested) {
-          return false;
-        }
-        // Do not retry on our own intentional aborts once a stream has
-        // started — but the connect-phase AbortError from the connect
-        // timer is wrapped as ConnectTimeoutError by the fetch wrapper
-        // below, so a raw AbortError here means caller-cancel or an
-        // ambiguous network abort: default to not retrying.
-        if (error instanceof Error && error.name === 'AbortError') {
-          return false;
-        }
-        return defaultRetryOn(error);
-      };
-
-      // ADR 0005 — connect timer uses a PER-ATTEMPT AbortController,
-      // NOT the main `controller`. Reusing the main controller was a
-      // bug: when the connect timer fired (30s), `controller.abort()`
-      // marked the signal as aborted permanently. `withRetry` retried,
-      // but `fetch(url, { signal: aborted })` failed instantly on
-      // every subsequent attempt — all retries wasted, user saw
-      // "connect timeout after 30000ms" even though retry should have
-      // attempted a fresh connection.
-      //
-      // Each retry attempt gets its own fresh `attemptController`. The
-      // main `controller` (cancel / maxDuration / inactivity) is wired
-      // to abort the attempt controller too, so a caller cancel or
-      // max-duration fire still short-circuits the in-flight fetch AND
-      // the stream reader loop. The wire must stay live for the entire
-      // stream phase (not just the connect phase) because the stream
-      // body is tied to `attemptController.signal` — that is how the
-      // inactivity / maxDuration / cancel aborts reach `reader.read()`.
-      // The connect timer fires only the per-attempt controller; retry
-      // gets a fresh signal on the next iteration.
-      //
-      // `streamMainAbortListener` (declared in the function scope
-      // above) holds the successful attempt's main→attempt wire so the
-      // outer `finally` can detach the listener once the stream is
-      // done. On a retried attempt the previous wire is detached
-      // before the next attempt installs its own.
-      const response = await withRetry(
-        async () => {
-          // Detach any previous attempt's main→attempt wire before
-          // installing a fresh one. On the first attempt there is no
-          // previous wire; on retries the prior attempt's controller
-          // is dead (its connect timer aborted it) but its listener
-          // is still attached to the main controller — remove it so
-          // we do not leak one listener per retry.
-          if (streamMainAbortListener) {
-            controller.signal.removeEventListener('abort', streamMainAbortListener);
-            streamMainAbortListener = undefined;
-          }
-
-          const attemptController = new AbortController();
-          const connectHandle = setTimeout(() => {
-            // Only tag as connect if no higher-priority reason fired.
-            // (cancel is set synchronously above; maxDuration is
-            // independent and may have fired first.)
-            if (abortReason === null) {
-              abortReason = 'connect';
-            }
-            attemptController.abort();
-          }, connectTimeoutMs);
-
-          // If the main controller already aborted (caller cancel or
-          // maxDuration fired before this attempt started), abort the
-          // attempt immediately so fetch rejects right away rather
-          // than hanging until the connect timer fires.
-          if (controller.signal.aborted) {
-            attemptController.abort();
-          }
-          // Propagate a mid-attempt main-controller abort (cancel or
-          // maxDuration firing while fetch is in flight) to the
-          // attempt controller so fetch rejects promptly. The same
-          // wire keeps the stream reader abortable after fetch
-          // resolves — see the comment above `withRetry`.
-          const mainAbortListener = (): void => {
-            attemptController.abort();
-          };
-          controller.signal.addEventListener('abort', mainAbortListener);
-          streamMainAbortListener = mainAbortListener;
-
-          try {
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-            };
-            if (this.apiKey) {
-              headers.Authorization = `Bearer ${this.apiKey}`;
-            }
-            const res = await httpRequest(this.chatUrl(), {
-              method: 'POST',
-              headers,
-              body,
-              signal: attemptController.signal,
-            });
-            if (!res.ok) {
-              const message = await extractErrorMessage(res);
-              throw await httpErrorFromResponse(res, message);
-            }
-            return res;
-          } catch (error) {
-            // If the connect timer fired (and ONLY the connect timer
-            // — not a cancel/maxDuration that also aborted the
-            // attempt controller via the main→attempt wire), surface
-            // a typed ConnectTimeoutError so defaultRetryOn can
-            // retry. When abortReason is 'cancel' or 'maxDuration',
-            // rethrow the raw AbortError unchanged — retryOn returns
-            // false for bare AbortError, so withRetry stops and the
-            // outer catch routes by abortReason.
-            if (
-              abortReason === 'connect' &&
-              error instanceof Error &&
-              error.name === 'AbortError'
-            ) {
-              throw new ConnectTimeoutError(connectTimeoutMs);
-            }
-            throw error;
-          } finally {
-            clearTimeout(connectHandle);
-            // Do NOT remove the listener here on a successful fetch —
-            // it must stay attached so the stream reader remains
-            // abortable. On a failed attempt (connect timeout /
-            // cancel / maxDuration) detach now; the next attempt (if
-            // any) installs a fresh wire at its top.
-            if (
-              streamMainAbortListener === mainAbortListener &&
-              abortReason !== null
-            ) {
-              controller.signal.removeEventListener('abort', mainAbortListener);
-              streamMainAbortListener = undefined;
-            }
-          }
-        },
-        { retryOn },
-      );
-
-      // fetch resolved — first byte of the response body is available.
-      // Start the inactivity timer (resets per chunk / keep-alive).
-      // Clear any connect-phase abort tag so a later inactivity fire
-      // is not misread as a connect timeout. The cast is needed because
-      // TS control-flow narrows `abortReason` after the cancel check
-      // above and does not account for closure reassignments from the
-      // timer callbacks.
-      if ((abortReason as AbortReason) === 'connect') {
-        abortReason = null;
+    // Condition #2 — the callback carries the terminal condition. The
+    // shared module does NOT hardcode [DONE] or done:true.
+    const processLineForFormat = (line: string, ctx: StreamLineContext): boolean => {
+      if (this.endpointFormat === 'native') {
+        return processNdjsonLine(line, callbacks);
       }
-      resetInactivity();
+      return processLine(line, pendingToolCalls, callbacks, ctx.resetInactivity);
+    };
 
-      if (!response.body) {
-        throw new Error('Ollama Cloud returned no response body.');
-      }
+    // Condition #1 — optional finalize for compat mode's flushToolCalls.
+    // Native mode has no accumulation, so no finalize. The finalize
+    // fires ONLY on natural stream-end without a terminal line from
+    // the callback (the callback owns [DONE] termination itself).
+    const finalize: StreamFinalizer | undefined =
+      this.endpointFormat === 'native'
+        ? undefined
+        : (cb: StreamCallbacks) => {
+          flushToolCalls(pendingToolCalls, cb);
+          cb.onDone();
+        };
 
-      const pendingToolCalls = new Map<number, OpenAICompatibleToolCall>();
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      // Phase 1 — native mode uses ndjson parsing (no pendingToolCalls
-      // accumulation: tool_calls arrive as one full-event with object
-      // arguments). Compat mode keeps the SSE + pendingToolCalls path.
-      const processLineForFormat = (line: string): boolean => {
-        if (this.endpointFormat === 'native') {
-          return processNdjsonLine(line, callbacks);
-        }
-        return processLine(line, pendingToolCalls, callbacks, resetInactivity);
-      };
-
-      while (true) {
-        if (cancellationToken?.isCancellationRequested) {
-          controller.abort();
-          break;
-        }
-
-        const chunk = await reader.read();
-        if (chunk.done) {
-          break;
-        }
-
-        // ADR 0005 — each chunk resets the inactivity timer. This is
-        // the core fix: a long-reasoning model that emits a chunk every
-        // ~0.5s keeps the stream alive indefinitely; only genuine
-        // silence (>inactivityTimeoutMs) fires.
-        chunksReceived += 1;
-        resetInactivity();
-
-        buffer += decoder.decode(chunk.value, { stream: true });
-        // MEDIUM-2 — unbounded stream buffer is a DoS vector. A malformed
-        // or hostile stream that never emits a newline would grow
-        // `buffer` without limit. Cap at 1 MiB; if exceeded, abort with
-        // an error rather than continuing to accumulate memory.
-        // (Phase 1: applies to BOTH SSE and ndjson — format-agnostic.)
-        if (buffer.length > MAX_SSE_BUFFER_BYTES) {
-          throw new Error(
-            `Ollama Cloud: stream buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a newline; aborting to prevent unbounded memory growth.`,
-          );
-        }
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const stop = processLineForFormat(line);
-          if (stop) {
-            done = true;
-            break;
-          }
-        }
-
-        if (done) {
-          break;
-        }
-      }
-
-      if (!done) {
-        buffer += decoder.decode();
-        if (buffer) {
-          for (const line of buffer.split(/\r?\n/)) {
-            const stop = processLineForFormat(line);
-            if (stop) {
-              done = true;
-              break;
-            }
-          }
-        }
-      }
-
-      if (!done) {
-        if (chunksReceived === 0) {
-          // ADR 0005 § No mid-stream retry (Revision 2026-08-03):
-          // 200 + headers + no body = server closed before any chunk.
-          // 0 chunks = 0 billed tokens. Surface as retryable error, NOT
-          // silent onDone — silent empty success masks provider outage.
-          // (Phase 1: format-agnostic — applies to SSE AND ndjson.)
-          callbacks.onError(new ZeroByteSocketCloseError());
-          return;
-        }
-        // Phase 1 — native mode emits tool_calls as a full-event (no
-        // accumulation), so there is nothing to flush. Compat mode
-        // flushes accumulated pending tool calls before onDone.
-        if (this.endpointFormat !== 'native') {
-          flushToolCalls(pendingToolCalls, callbacks);
-        }
-        callbacks.onDone();
-      }
-    } catch (error) {
-      // Route by abortReason. Connect → onError (retry already
-      // exhausted inside withRetry). Inactivity → onError (terminal,
-      // no retry). MaxDuration → onError (terminal). Cancel → onDone.
-      if (error instanceof Error && error.name === 'AbortError') {
-        if (abortReason === 'cancel') {
-          callbacks.onDone();
-          return;
-        }
-        if (abortReason === 'maxDuration') {
-          callbacks.onError(new MaxDurationError(maxDurationMs));
-          return;
-        }
-        if (abortReason === 'inactivity') {
-          callbacks.onError(
-            new InactivityTimeoutError(inactivityTimeoutMs, chunksReceived),
-          );
-          return;
-        }
-        if (abortReason === 'connect') {
-          // Connect abort that escaped withRetry (e.g. maxRetries=0
-          // and the wrapper rethrew before our ConnectTimeoutError
-          // translation, or a race where cancel arrived mid-fetch).
-          // Treat as connect timeout for the user-facing message.
-          callbacks.onError(new ConnectTimeoutError(connectTimeoutMs));
-          return;
-        }
-        // ADR 0005 § No mid-stream retry (Revision 2026-08-03) —
-        // bare socket close: AbortError with no abortReason tag AND
-        // zero chunks received means the connection dropped between
-        // the 200 + headers and the first body byte. This is the
-        // 0-byte socket close edge case. Surface as a typed error via
-        // `classifyStreamError` rather than the ambiguous silent
-        // `onDone`.
-        //
-        // LIMITATION: this catch is OUTSIDE the `withRetry` wrapper
-        // (which wraps only the initial `fetch` + status check). The
-        // reader loop runs after `withRetry` returned, so throwing
-        // `ZeroByteSocketCloseError` here does NOT trigger retry — it
-        // routes to `callbacks.onError`. Full retry would require
-        // restructuring `withRetry` to wrap `fetch + read-first-chunk`
-        // (move the reader loop's first iteration inside the wrapper).
-        // Deferred to a follow-up — surfacing as error already closes
-        // the «worse than double-billing» hole (silent empty success).
-        if (abortReason === null && chunksReceived === 0) {
-          callbacks.onError(new ZeroByteSocketCloseError());
-          return;
-        }
-        if (abortReason === null && chunksReceived > 0) {
-          // Bare socket close AFTER chunks were received — the
-          // connection dropped mid-stream. Terminal (no retry):
-          // tokens were already billed. Surface as a typed
-          // `ConnectionInterruptedError` so `classifyStreamError`
-          // shows a clean message instead of the raw AbortError.
-          callbacks.onError(
-            new ConnectionInterruptedError(chunksReceived),
-          );
-          return;
-        }
-        // Ambiguous AbortError with no tag and no chunks — caller-cancel
-        // is the safest default (matches v0.4.x behaviour for bare aborts).
-        callbacks.onDone();
-        return;
-      }
-      // Raw Node socket-close errors (TLS socket closed, ECONNRESET,
-      // "aborted at TLSSocket.socketCloseListener", "socket hang up",
-      // etc.) are emitted as plain `Error` (name='Error', NOT
-      // 'AbortError') and escape every AbortError branch above.
-      // Without this translation they reach the user as a raw stack
-      // trace — the ADR 0008 Phase 2 level-4 gap. Reclassify by chunks:
-      //   - 0 chunks  → ZeroByteSocketCloseError (retryable, connect-equiv)
-      //   - >0 chunks → ConnectionInterruptedError (terminal, mid-stream)
-      if (isSocketCloseError(error)) {
-        if (chunksReceived === 0) {
-          callbacks.onError(new ZeroByteSocketCloseError());
-        } else {
-          callbacks.onError(
-            new ConnectionInterruptedError(chunksReceived),
-          );
-        }
-        return;
-      }
-      // Non-abort errors (HttpError, whitelist throw, buffer overrun,
-      // ConnectTimeoutError that withRetry gave up on) — surface directly.
-      callbacks.onError(
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    } finally {
-      clearTimeout(maxDurationHandle);
-      clearInactivity();
-      cancelListener?.dispose();
-      // Detach any lingering main→attempt abort wire from the last
-      // `withRetry` attempt. On a clean stream the wire is still
-      // attached (it kept the reader abortable); on a failed stream
-      // it may already have been detached by the attempt's finally —
-      // removeEventListener is a no-op if the listener was not added,
-      // so calling it unconditionally is safe.
-      if (streamMainAbortListener) {
-        controller.signal.removeEventListener('abort', streamMainAbortListener);
-        streamMainAbortListener = undefined;
-      }
-    }
+    // ADR 0010 — delegate the invariant streaming lifecycle to the
+    // shared module. Three timers, withRetry connect wrapper, reader
+    // loop + buffer cap, chunksReceived, socket-close reclassification,
+    // AbortError routing, finally cleanup — all owned by readStream.
+    await readStream(
+      {
+        logTag: 'Ollama Cloud',
+        url: this.chatUrl(),
+        headers,
+        body,
+        cancellationToken,
+        processLine: processLineForFormat,
+        finalize,
+      },
+      callbacks,
+    );
   }
 }
 
@@ -999,132 +542,10 @@ function mapNativeUsage(chunk: NativeChatChunk): UsageInfo | undefined {
   return { inputTokens, outputTokens, totalTokens };
 }
 
-/**
- * ADR 0005 — reads, clamps, and resolves the three streaming timers.
- *
- * Each resolver guards against non-number / NaN / non-positive values
- * (returns the default). For positive numbers below the package.json
- * `minimum` or above `maximum`, the resolver logs a warning and
- * **clamps to the nearest bound** — EXCEPT when the value is below the
- * minimum, in which case it is used as-is. Rationale: package.json
- * enforces the policy range in the Settings UI; the resolver's job is
- * to guard against garbage (NaN, 0, negative), not to second-guess a
- * user or test that deliberately set a small value. Below-minimum
- * values are legitimate for tests and for power users with unusual
- * workloads; above-maximum values are clamped because they would
- * disable the timer's safety purpose.
- *
- * `resolveMaxDurationMs` also honours the deprecated
- * `ollamaCloud.requestTimeoutMs` alias: if `requestTimeoutMs` is set
- * but `requestMaxDurationMs` is NOT, the legacy value (clamped to its
- * own legacy range) is used as the max-duration cap, preserving
- * backward compatibility for v0.4.0-era configs. A deprecation
- * warning is logged once per process.
- */
-function resolveConnectTimeoutMs(): number {
-  const configured = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestConnectTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
-    return REQUEST_CONNECT_TIMEOUT_DEFAULT_MS;
-  }
-  if (configured > REQUEST_CONNECT_TIMEOUT_MAX_MS) {
-    logger.warn(
-      `ollamaCloud.requestConnectTimeoutMs=${configured} is above maximum ${REQUEST_CONNECT_TIMEOUT_MAX_MS}; clamping.`,
-    );
-    return REQUEST_CONNECT_TIMEOUT_MAX_MS;
-  }
-  return configured;
-}
-
-function resolveInactivityTimeoutMs(): number {
-  const configured = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestInactivityTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
-    return REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS;
-  }
-  if (configured > REQUEST_INACTIVITY_TIMEOUT_MAX_MS) {
-    logger.warn(
-      `ollamaCloud.requestInactivityTimeoutMs=${configured} is above maximum ${REQUEST_INACTIVITY_TIMEOUT_MAX_MS}; clamping.`,
-    );
-    return REQUEST_INACTIVITY_TIMEOUT_MAX_MS;
-  }
-  return configured;
-}
-
-let maxDurationDeprecationWarned = false;
-
-function resolveMaxDurationMs(): number {
-  const config = vscode.workspace.getConfiguration('ollamaCloud');
-  const configured = config.get<number>('requestMaxDurationMs');
-  if (typeof configured === 'number' && !Number.isNaN(configured) && configured > 0) {
-    if (configured > REQUEST_MAX_DURATION_MAX_MS) {
-      logger.warn(
-        `ollamaCloud.requestMaxDurationMs=${configured} is above maximum ${REQUEST_MAX_DURATION_MAX_MS}; clamping.`,
-      );
-      return REQUEST_MAX_DURATION_MAX_MS;
-    }
-    return configured;
-  }
-  // Deprecated alias: requestTimeoutMs → requestMaxDurationMs.
-  const legacy = config.get<number>('requestTimeoutMs');
-  if (typeof legacy === 'number' && !Number.isNaN(legacy) && legacy > 0) {
-    if (!maxDurationDeprecationWarned) {
-      logger.warn(
-        'ollamaCloud.requestTimeoutMs is deprecated; use ollamaCloud.requestMaxDurationMs. Mapping requestTimeoutMs → requestMaxDurationMs for backward compatibility.',
-      );
-      maxDurationDeprecationWarned = true;
-    }
-    return Math.min(legacy, REQUEST_TIMEOUT_MAX_MS);
-  }
-  return REQUEST_MAX_DURATION_DEFAULT_MS;
-}
-
-async function extractErrorMessage(response: HttpResponseLike): Promise<string> {
-  const body = await response.text();
-  try {
-    const parsed = JSON.parse(body) as {
-      error?: { message?: string };
-      message?: string;
-    };
-    // MEDIUM-1 — redact the parsed error message before it propagates
-    // to the user-facing `Error.message` (via `HttpError` →
-    // `callbacks.onError` → VS Code notification). A malicious proxy
-    // can reflect the caller's `Authorization: Bearer <key>` header in
-    // a JSON `error.message` string; without this redaction the key
-    // would surface in the VS Code error notification. `logger.warn`
-    // already redacts its own output, but the `Error.message` path is
-    // separate and was unfiltered.
-    return redactSensitive(
-      parsed.error?.message || parsed.message || `HTTP ${response.status}`,
-    );
-  } catch (error) {
-    // Issue 10 — full-response parse failure is UNEXPECTED. A non-JSON
-    // error body (e.g. an HTML error page from a proxy, a partial
-    // response from a dropped connection) can mask an attack or a
-    // misconfigured gateway. Surface it: log the redacted first 200
-    // chars and the parse error, then return a message that includes
-    // both, so the caller sees the real failure mode rather than a
-    // generic "HTTP 502".
-    const preview = body.slice(0, 200);
-    logger.warn(
-      'Ollama Cloud error response was not valid JSON. Surfacing raw body preview.',
-      preview,
-      error,
-    );
-    if (!body) {
-      return `HTTP ${response.status}`;
-    }
-    // MEDIUM-1 — the preview is raw response body and may carry a
-    // reflected secret (e.g. an HTML page echoing the Authorization
-    // header). Redact before the preview is embedded in the message
-    // that flows to the user-facing notification.
-    return redactSensitive(
-      `HTTP ${response.status} (non-JSON body, first 200 chars logged): ${preview}`,
-    );
-  }
-}
+// ADR 0010 — the timer resolvers (`resolveConnectTimeoutMs`,
+// `resolveInactivityTimeoutMs`, `resolveMaxDurationMs`) and
+// `extractErrorMessage` have moved to `streamReader.ts`. This client
+// no longer owns the streaming lifecycle.
 
 /**
  * Issue 10 — hardened safeJsonParse for tool-call arguments.
