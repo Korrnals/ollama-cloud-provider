@@ -8,7 +8,7 @@
 #   3. Compute SHA256                 (L1 — integrity, REQUIRED)
 #   4. Sigstore cosign sign-blob      (L2 — build provenance, OPTIONAL)
 #   5. GPG detached-sign checksums    (L3 — identity, REQUIRED)
-#   6. SBOM (syft if present, else minimal SPDX-JSON fallback)
+#   6. SBOM (Node.js generator primary; syft opt-in via SBOM_USE_SYFT=1)
 #   7. Create annotated git tag (no push yet)
 #   8. Generate release notes (gh or git log fallback)
 #   9. Push tag to origin

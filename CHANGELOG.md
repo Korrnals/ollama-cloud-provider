@@ -5,8 +5,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
-### Added
-- _(nothing yet)_
+### Changed
+- VSIX no longer bundles old release signatures (`sha256.txt`, `.asc`, `.sigstore.bundle` from v0.9.0–v0.9.3) — `releases/**` added to `.vscodeignore` (~9KB bloat removed)
+- SBOM generation switched to Node.js inline generator as primary (correctly lists npm dependencies from `package.json` + `package-lock.json`); `syft` is now opt-in via `SBOM_USE_SYFT=1` (it mis-identified the project as .NET and omitted npm deps)
 
 ## [0.9.3] - 2026-08-08
 
