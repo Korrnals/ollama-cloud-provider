@@ -25,7 +25,7 @@
  *   - Three timers (max-duration, inactivity soft+grace) — ADR 0005
  *   - `withRetry` connect wrapper + per-attempt AbortController
  *   - Reader loop + 1 MiB buffer cap
- *   - `chunksReceived` tracking + 0-chunk / >0-chunk boundary
+ *   - `chunksReceived` accounting + 0-chunk / >0-chunk boundary
  *   - Socket-close reclassification (ADR 0008)
  *   - AbortError routing by `abortReason`
  *   - `finally` cleanup + `resolve*` helpers + constants
