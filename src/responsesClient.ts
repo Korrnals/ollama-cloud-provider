@@ -1,14 +1,20 @@
 // ADR 0006 — `/v1/responses` streaming client.
 //
-// Mirrors `ollamaClient.ts` (the `/chat/completions` client) for the
-// `/v1/responses` endpoint. Same ADR 0005 three-timer architecture
-// (connect / inactivity / maxDuration), same per-attempt
-// AbortController fix (v0.5.3), same SEC-03 per-connection whitelist
-// gate. Differences from `/chat/completions`:
+// ADR 0010 — the invariant streaming lifecycle (three timers, the
+// `withRetry` connect wrapper, the reader loop + 1 MiB buffer cap,
+// `chunksReceived` tracking, socket-close reclassification,
+// AbortError routing, `finally` cleanup, and the `resolve*` helpers +
+// constants) now lives in `streamReader.ts`. This client no longer
+// owns that lifecycle; it delegates to `readStream` and injects
+// endpoint-specific parsing via callbacks (the two-line SSE parser).
+//
+// Endpoint-specific responsibilities kept in this client (ADR 0010
+// module boundary):
 //
 // - URL: `${openAiBaseUrl}/responses` (not `/chat/completions`).
 // - Request body: `{ model, input[], instructions?, tools?, stream:true }`
 //   (not `messages[]`). Built by `convertResponses.ts`.
+// - `assertBaseUrlAllowedOrThrow` (SEC-03 per-connection whitelist).
 // - Stream protocol: SSE `event:` + `data:` two-line pairs. The
 //   parser holds a `pendingEvent` string and dispatches on the event
 //   type when the `data:` line arrives. There is NO `data: [DONE]`
@@ -16,8 +22,7 @@
 // - Tool calls: a single `response.output_item.done` event with
 //   `item.type === 'function_call'` carries the full call (no
 //   delta-accumulation needed — the endpoint emits the complete
-//   arguments string in one event).
-import * as vscode from 'vscode';
+//   arguments string in one event). Hence NO `finalize` callback.
 import type { CancellationToken } from 'vscode';
 import {
   assertBaseUrlAllowed,
@@ -25,7 +30,6 @@ import {
 } from './configValidator.js';
 import type { ConnectionConfig } from './connections.js';
 import { openAiBaseUrl } from './connections.js';
-import { httpRequest, type HttpResponseLike } from './httpClient.js';
 import { logger, redactSensitive } from './logger.js';
 import type {
   ResponsesInputItem,
@@ -34,43 +38,16 @@ import type {
   StreamCallbacks,
   UsageInfo,
 } from './protocolTypes.js';
+import { MidStreamError } from './retry.js';
 import {
-  ConnectTimeoutError,
-  ConnectionInterruptedError,
-  InactivityTimeoutError,
-  MaxDurationError,
-  MidStreamError,
-  ZeroByteSocketCloseError,
-  defaultRetryOn,
-  httpErrorFromResponse,
-  isSocketCloseError,
-  withRetry,
-} from './retry.js';
+  readStream,
+  type StreamLineContext,
+} from './streamReader.js';
 
-// ADR 0005 — three timers. Same defaults/maxes as `ollamaClient.ts`;
-// the resolver helpers are duplicated here (not shared) because the
-// chat client owns its resolver closure and the responses client
-// must stay independent per ADR 0006 (no shared mutable state).
-// v0.9.0 — connect default raised to 60s (1 min), inactivity default
-// raised to 300s (5 min) with a soft/grace extension (see
-// resetInactivity). The max stays at 600s (10 min).
-const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
-const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 60000;
-
-const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
-const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 300000;
-// v0.9.0 — soft threshold: first fire extends to the full grace period
-// instead of hard-killing. See ollamaClient.ts for full rationale.
-const REQUEST_INACTIVITY_SOFT_THRESHOLD_MS = 120000;
-
-const REQUEST_MAX_DURATION_MAX_MS = 3600000;
-const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
-
-// MEDIUM-2 — cap the SSE buffer at 1 MiB. Same defence as
-// `ollamaClient.ts`: a hostile/malformed stream with no newlines
-// would grow the buffer without bound; this cap turns that into a
-// bounded, reported error.
-const MAX_SSE_BUFFER_BYTES = 1048576;
+// ADR 0010 — the timer constants, MAX_SSE_BUFFER_BYTES, and resolve*
+// helpers that formerly lived here have moved to `streamReader.ts`.
+// This client no longer owns the streaming lifecycle; it delegates to
+// `readStream` and injects endpoint-specific parsing via callbacks.
 
 export class ResponsesClient {
   /**
@@ -132,366 +109,73 @@ export class ResponsesClient {
     callbacks: StreamCallbacks,
     cancellationToken?: CancellationToken,
   ): Promise<void> {
-    // ADR 0005 — three timers. Identical structure to
-    // `ollamaClient.streamChat`; see that file for the full rationale.
-    const controller = new AbortController();
-    const connectTimeoutMs = resolveConnectTimeoutMs();
-    const inactivityTimeoutMs = resolveInactivityTimeoutMs();
-    const maxDurationMs = resolveMaxDurationMs();
+    // SEC-03 — enforce the per-connection / global baseUrl whitelist
+    // BEFORE any network call. This stays in the client (ADR 0010
+    // module boundary); the shared streamReader does NOT re-check.
+    // Mirrors `ollamaClient.streamChat` (Phase 2).
+    this.assertBaseUrlAllowedOrThrow();
 
-    type AbortReason =
-      | 'connect'
-      | 'inactivity'
-      | 'maxDuration'
-      | 'cancel'
-      | null;
-    let abortReason: AbortReason = null;
-
-    const maxDurationHandle = setTimeout(() => {
-      abortReason = 'maxDuration';
-      logger.error(
-        `Ollama Cloud (/v1/responses): exceeded max stream duration (${maxDurationMs}ms)`,
-      );
-      controller.abort();
-    }, maxDurationMs);
-
-    let inactivityHandle: ReturnType<typeof setTimeout> | undefined;
-    // v0.9.0 — soft/grace period (see ollamaClient.ts for rationale).
-    let inactivitySoftFired = false;
-    const resetInactivity = (): void => {
-      if (inactivityHandle !== undefined) {
-        clearTimeout(inactivityHandle);
-      }
-      inactivitySoftFired = false;
-      // Short-timeout path: when the configured inactivity timeout is
-      // at or below the soft threshold, fire HARD directly at the
-      // configured duration. No soft extension (see ollamaClient.ts).
-      if (inactivityTimeoutMs <= REQUEST_INACTIVITY_SOFT_THRESHOLD_MS) {
-        inactivityHandle = setTimeout(() => {
-          abortReason = 'inactivity';
-          logger.error(
-            `Ollama Cloud (/v1/responses): stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-          );
-          controller.abort();
-        }, inactivityTimeoutMs);
-        return;
-      }
-      // Long-timeout path: soft threshold + grace extension.
-      inactivityHandle = setTimeout(() => {
-        if (!inactivitySoftFired) {
-          inactivitySoftFired = true;
-          if (inactivityHandle !== undefined) {
-            clearTimeout(inactivityHandle);
-          }
-          logger.warn(
-            `Ollama Cloud (/v1/responses): stream stalled for ${REQUEST_INACTIVITY_SOFT_THRESHOLD_MS}ms — extending to ${inactivityTimeoutMs}ms grace period`,
-          );
-          inactivityHandle = setTimeout(() => {
-            abortReason = 'inactivity';
-            logger.error(
-              `Ollama Cloud (/v1/responses): stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-            );
-            controller.abort();
-          }, inactivityTimeoutMs);
-          return;
-        }
-        abortReason = 'inactivity';
-        logger.error(
-          `Ollama Cloud (/v1/responses): stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-        );
-        controller.abort();
-      }, REQUEST_INACTIVITY_SOFT_THRESHOLD_MS);
-    };
-    const clearInactivity = (): void => {
-      if (inactivityHandle !== undefined) {
-        clearTimeout(inactivityHandle);
-        inactivityHandle = undefined;
-      }
-    };
-
-    let chunksReceived = 0;
-
-    const cancelListener = cancellationToken?.onCancellationRequested(() => {
-      abortReason = 'cancel';
-      controller.abort();
+    const { extraBody, ...baseRequest } = request;
+    const body = JSON.stringify({
+      ...baseRequest,
+      ...extraBody,
+      stream: true,
     });
-    if (cancellationToken?.isCancellationRequested) {
-      abortReason = 'cancel';
-      controller.abort();
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.apiKey) {
+      headers.Authorization = `Bearer ${this.apiKey}`;
     }
 
-    let done = false;
-    let streamMainAbortListener: (() => void) | undefined;
+    // Protocol state stays in the client closure (ADR 0010 condition
+    // #1 — the module does NOT see endpoint-specific state). The
+    // two-line SSE protocol holds the event type in `pendingEvent`
+    // until the matching `data:` line arrives; resets to `null` after
+    // dispatch.
+    let pendingEvent: string | null = null;
 
-    try {
-      this.assertBaseUrlAllowedOrThrow();
-
-      const { extraBody, ...baseRequest } = request;
-      const body = JSON.stringify({
-        ...baseRequest,
-        ...extraBody,
-        stream: true,
-      });
-
-      // ADR 0005 — retry the INITIAL CONNECTION only. `withRetry`
-      // wraps just the `fetch` + status check; the body reader loop
-      // is outside the wrapper.
-      const retryOn = (error: unknown): boolean => {
-        if (cancellationToken?.isCancellationRequested) {
-          return false;
-        }
-        if (error instanceof Error && error.name === 'AbortError') {
-          return false;
-        }
-        return defaultRetryOn(error);
-      };
-
-      const response = await withRetry(
-        async () => {
-          if (streamMainAbortListener) {
-            controller.signal.removeEventListener('abort', streamMainAbortListener);
-            streamMainAbortListener = undefined;
-          }
-
-          const attemptController = new AbortController();
-          const connectHandle = setTimeout(() => {
-            if (abortReason === null) {
-              abortReason = 'connect';
-            }
-            attemptController.abort();
-          }, connectTimeoutMs);
-
-          if (controller.signal.aborted) {
-            attemptController.abort();
-          }
-          const mainAbortListener = (): void => {
-            attemptController.abort();
-          };
-          controller.signal.addEventListener('abort', mainAbortListener);
-          streamMainAbortListener = mainAbortListener;
-
-          try {
-            const headers: Record<string, string> = {
-              'Content-Type': 'application/json',
-            };
-            if (this.apiKey) {
-              headers.Authorization = `Bearer ${this.apiKey}`;
-            }
-            const res = await httpRequest(this.responsesUrl(), {
-              method: 'POST',
-              headers,
-              body,
-              signal: attemptController.signal,
-            });
-            if (!res.ok) {
-              const message = await extractErrorMessage(res);
-              throw await httpErrorFromResponse(res, message);
-            }
-            return res;
-          } catch (error) {
-            if (
-              abortReason === 'connect' &&
-              error instanceof Error &&
-              error.name === 'AbortError'
-            ) {
-              throw new ConnectTimeoutError(connectTimeoutMs);
-            }
-            throw error;
-          } finally {
-            clearTimeout(connectHandle);
-            if (
-              streamMainAbortListener === mainAbortListener &&
-              abortReason !== null
-            ) {
-              controller.signal.removeEventListener('abort', mainAbortListener);
-              streamMainAbortListener = undefined;
-            }
-          }
+    // Condition #2 — the callback carries the terminal condition. The
+    // shared module does NOT hardcode `response.completed`. The
+    // callback returns `true` when the stream is complete.
+    const processResponsesLineForStream = (
+      line: string,
+      ctx: StreamLineContext,
+    ): boolean => {
+      return processResponsesLine(
+        line,
+        callbacks,
+        ctx.resetInactivity,
+        (ev: string | null) => {
+          pendingEvent = ev;
         },
-        { retryOn },
+        () => pendingEvent,
       );
+    };
 
-      if ((abortReason as AbortReason) === 'connect') {
-        abortReason = null;
-      }
-      resetInactivity();
-
-      if (!response.body) {
-        throw new Error('Ollama Cloud (/v1/responses) returned no response body.');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      // Two-line protocol state: the event type is held until the
-      // matching `data:` line arrives. Resets to `null` after dispatch.
-      let pendingEvent: string | null = null;
-
-      while (true) {
-        if (cancellationToken?.isCancellationRequested) {
-          controller.abort();
-          break;
-        }
-
-        const chunk = await reader.read();
-        if (chunk.done) {
-          break;
-        }
-
-        chunksReceived += 1;
-        resetInactivity();
-
-        buffer += decoder.decode(chunk.value, { stream: true });
-        if (buffer.length > MAX_SSE_BUFFER_BYTES) {
-          throw new Error(
-            `Ollama Cloud (/v1/responses): SSE buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a newline; aborting to prevent unbounded memory growth.`,
-          );
-        }
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const stop = processResponsesLine(
-            line,
-            callbacks,
-            resetInactivity,
-            (ev: string | null) => {
-              pendingEvent = ev;
-            },
-            () => pendingEvent,
-          );
-          if (stop) {
-            done = true;
-            break;
-          }
-        }
-
-        if (done) {
-          break;
-        }
-      }
-
-      if (!done) {
-        buffer += decoder.decode();
-        if (buffer) {
-          for (const line of buffer.split(/\r?\n/)) {
-            const stop = processResponsesLine(
-              line,
-              callbacks,
-              resetInactivity,
-              (ev: string | null) => {
-                pendingEvent = ev;
-              },
-              () => pendingEvent,
-            );
-            if (stop) {
-              done = true;
-              break;
-            }
-          }
-        }
-      }
-
-      if (!done) {
-        if (chunksReceived === 0) {
-          // ADR 0005 § No mid-stream retry (Revision 2026-08-03):
-          // 200 + headers + no body = server closed before any chunk.
-          // 0 chunks = 0 billed tokens. Surface as error, NOT silent
-          // onDone — silent empty success masks provider outage.
-          callbacks.onError(new ZeroByteSocketCloseError());
-          return;
-        }
-        // Stream ended without `response.completed`. Treat as done —
-        // the server closed the connection cleanly. (Distinct from
-        // `/chat/completions`, where `[DONE]` is mandatory; the
-        // `/v1/responses` spec lets the server close after
-        // `response.completed`.)
-        callbacks.onDone();
-      }
-    } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        if (abortReason === 'cancel') {
-          callbacks.onDone();
-          return;
-        }
-        if (abortReason === 'maxDuration') {
-          callbacks.onError(new MaxDurationError(maxDurationMs));
-          return;
-        }
-        if (abortReason === 'inactivity') {
-          callbacks.onError(
-            new InactivityTimeoutError(inactivityTimeoutMs, chunksReceived),
-          );
-          return;
-        }
-        if (abortReason === 'connect') {
-          callbacks.onError(new ConnectTimeoutError(connectTimeoutMs));
-          return;
-        }
-        // ADR 0005 § No mid-stream retry (Revision 2026-08-03) —
-        // bare socket close: AbortError with no abortReason tag AND
-        // zero chunks received means the connection dropped between
-        // the 200 + headers and the first body byte. This is the
-        // 0-byte socket close edge case. Surface as a typed error
-        // rather than the ambiguous silent `onDone`.
-        //
-        // LIMITATION: this catch is OUTSIDE the `withRetry` wrapper
-        // (which wraps only the initial `fetch` + status check). The
-        // reader loop runs after `withRetry` returned, so throwing
-        // `ZeroByteSocketCloseError` here does NOT trigger retry — it
-        // routes to `callbacks.onError`. Full retry would require
-        // restructuring `withRetry` to wrap `fetch + read-first-chunk`
-        // (move the reader loop's first iteration inside the wrapper).
-        // Deferred to a follow-up — surfacing as error already closes
-        // the «worse than double-billing» hole (silent empty success).
-        if (abortReason === null && chunksReceived === 0) {
-          callbacks.onError(new ZeroByteSocketCloseError());
-          return;
-        }
-        if (abortReason === null && chunksReceived > 0) {
-          // Bare socket close AFTER chunks were received — the
-          // connection dropped mid-stream. Terminal (no retry):
-          // tokens were already billed. Surface as a typed
-          // `ConnectionInterruptedError` so `classifyStreamError`
-          // shows a clean message instead of the raw AbortError.
-          callbacks.onError(
-            new ConnectionInterruptedError(chunksReceived),
-          );
-          return;
-        }
-        callbacks.onDone();
-        return;
-      }
-      // Raw Node socket-close errors (TLS socket closed, ECONNRESET,
-      // "aborted at TLSSocket.socketCloseListener", "socket hang up",
-      // etc.) are emitted as plain `Error` (name='Error', NOT
-      // 'AbortError') and escape every AbortError branch above.
-      // Without this translation they reach the user as a raw stack
-      // trace — the ADR 0008 Phase 2 level-4 gap. Reclassify by chunks:
-      //   - 0 chunks  → ZeroByteSocketCloseError (retryable, connect-equiv)
-      //   - >0 chunks → ConnectionInterruptedError (terminal, mid-stream)
-      if (isSocketCloseError(error)) {
-        if (chunksReceived === 0) {
-          callbacks.onError(new ZeroByteSocketCloseError());
-        } else {
-          callbacks.onError(
-            new ConnectionInterruptedError(chunksReceived),
-          );
-        }
-        return;
-      }
-      callbacks.onError(
-        error instanceof Error ? error : new Error(String(error)),
-      );
-    } finally {
-      clearTimeout(maxDurationHandle);
-      clearInactivity();
-      cancelListener?.dispose();
-      if (streamMainAbortListener) {
-        controller.signal.removeEventListener('abort', streamMainAbortListener);
-        streamMainAbortListener = undefined;
-      }
-    }
+    // ADR 0010 — delegate the invariant streaming lifecycle to the
+    // shared module. Three timers, the `withRetry` connect wrapper,
+    // the reader loop + 1 MiB buffer cap, `chunksReceived` tracking,
+    // socket-close reclassification, AbortError routing, and `finally`
+    // cleanup are all owned by `readStream`.
+    //
+    // NO `finalize` callback: the `/v1/responses` endpoint emits each
+    // `function_call` complete in one `response.output_item.done`
+    // event (no delta-accumulation), so there is nothing to flush on a
+    // clean stream end. A clean end without `response.completed` routes
+    // to `callbacks.onDone()` directly inside `readStream`.
+    await readStream(
+      {
+        logTag: 'Ollama Cloud (/v1/responses)',
+        url: this.responsesUrl(),
+        headers,
+        body,
+        cancellationToken,
+        processLine: processResponsesLineForStream,
+      },
+      callbacks,
+    );
   }
 }
 
@@ -697,94 +381,4 @@ function mapResponsesUsage(
     return undefined;
   }
   return { inputTokens, outputTokens, totalTokens };
-}
-
-async function extractErrorMessage(response: HttpResponseLike): Promise<string> {
-  const body = await response.text();
-  try {
-    const parsed = JSON.parse(body) as {
-      error?: { message?: string };
-      message?: string;
-    };
-    return redactSensitive(
-      parsed.error?.message || parsed.message || `HTTP ${response.status}`,
-    );
-  } catch (error) {
-    const preview = body.slice(0, 200);
-    logger.warn(
-      'Ollama Cloud (/v1/responses) error response was not valid JSON.',
-      preview,
-      error,
-    );
-    if (!body) {
-      return `HTTP ${response.status}`;
-    }
-    return redactSensitive(
-      `HTTP ${response.status} (non-JSON body, first 200 chars logged): ${preview}`,
-    );
-  }
-}
-
-// ADR 0005 — timer resolvers. Duplicated from `ollamaClient.ts`
-// intentionally: the two clients are independent per ADR 0006 (no
-// shared mutable state, no shared deprecation-warning flag). The
-// resolver logic is identical; if it drifts, a future refactor can
-// extract it to a shared module.
-function resolveConnectTimeoutMs(): number {
-  const configured = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestConnectTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
-    return REQUEST_CONNECT_TIMEOUT_DEFAULT_MS;
-  }
-  if (configured > REQUEST_CONNECT_TIMEOUT_MAX_MS) {
-    logger.warn(
-      `ollamaCloud.requestConnectTimeoutMs=${configured} is above maximum ${REQUEST_CONNECT_TIMEOUT_MAX_MS}; clamping.`,
-    );
-    return REQUEST_CONNECT_TIMEOUT_MAX_MS;
-  }
-  return configured;
-}
-
-function resolveInactivityTimeoutMs(): number {
-  const configured = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestInactivityTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
-    return REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS;
-  }
-  if (configured > REQUEST_INACTIVITY_TIMEOUT_MAX_MS) {
-    logger.warn(
-      `ollamaCloud.requestInactivityTimeoutMs=${configured} is above maximum ${REQUEST_INACTIVITY_TIMEOUT_MAX_MS}; clamping.`,
-    );
-    return REQUEST_INACTIVITY_TIMEOUT_MAX_MS;
-  }
-  return configured;
-}
-
-let maxDurationDeprecationWarned = false;
-
-function resolveMaxDurationMs(): number {
-  const config = vscode.workspace.getConfiguration('ollamaCloud');
-  const configured = config.get<number>('requestMaxDurationMs');
-  if (typeof configured === 'number' && !Number.isNaN(configured) && configured > 0) {
-    if (configured > REQUEST_MAX_DURATION_MAX_MS) {
-      logger.warn(
-        `ollamaCloud.requestMaxDurationMs=${configured} is above maximum ${REQUEST_MAX_DURATION_MAX_MS}; clamping.`,
-      );
-      return REQUEST_MAX_DURATION_MAX_MS;
-    }
-    return configured;
-  }
-  const legacy = config.get<number>('requestTimeoutMs');
-  if (typeof legacy === 'number' && !Number.isNaN(legacy) && legacy > 0) {
-    if (!maxDurationDeprecationWarned) {
-      logger.warn(
-        'ollamaCloud.requestTimeoutMs is deprecated; use ollamaCloud.requestMaxDurationMs.',
-      );
-      maxDurationDeprecationWarned = true;
-    }
-    return Math.min(legacy, 600000);
-  }
-  return REQUEST_MAX_DURATION_DEFAULT_MS;
 }
