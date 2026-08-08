@@ -59,6 +59,25 @@ Extend `classifyStreamError` in `ollamaClient.ts` to extract the server's `{"err
 
 The user now sees the server's message ("out of quota", "card declined", "model not found") instead of a raw stack trace.
 
+#### v0.9.2 revision — `ConnectionInterruptedError` + `isSocketCloseError()`
+
+The original Phase 2 left a gap in priority level 4. Level 4 promised "wrap with a generic 'connection interrupted' message instead of surfacing the raw stack trace" — but a raw Node socket-close `Error` (e.g. `aborted at TLSSocket.socketCloseListener (node:_http_client:...)`, `socket hang up`, `read ECONNRESET`, `connect ECONNREFUSED`) arrived at the streaming clients' outer `catch` as a plain `Error` (name = `'Error'`, **not** `'AbortError'`). Because every `error.name === 'AbortError'` branch in `ollamaClient.streamChat` and `responsesClient.streamResponse` checks the error *name*, these generic socket Errors fell through every branch and surfaced to the user as a raw stack trace. Level 4's wrapping never engaged — the classifier had no typed error to match.
+
+The v0.9.2 fix closes this gap in two parts:
+
+1. **`isSocketCloseError(error)` predicate (`retry.ts`)** — detects raw Node socket/network errors that escaped the `AbortError` routing. It matches conservatively on two signals: the libuv `code` property (`ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `EHOSTUNREACH`, `ENETUNREACH`, `ETIMEDOUT`, `EAI_AGAIN`) and message substrings (`aborted`, `socket hang up`, `read/write/connect` + a code). Our own typed errors (`HttpError`, `MidStreamError`, `ZeroByteSocketCloseError`, etc.) are excluded — they carry their own name and are already classified.
+
+2. **`ConnectionInterruptedError` class (`retry.ts`)** — a new terminal error for mid-stream socket close. When the clients' outer `catch` detects `isSocketCloseError(error)`, they branch on chunks received and reclassify:
+
+   | Chunks received | Reclassified to | Retryable |
+   |---|---|---|
+   | `0` | `ZeroByteSocketCloseError` (connect-phase equivalent) | yes — no tokens billed |
+   | `> 0` | `ConnectionInterruptedError` (mid-stream) | no — tokens already billed, request not idempotent |
+
+`ConnectionInterruptedError` enforces `chunksReceived > 0` at construction (throws `RangeError` otherwise), making the boundary self-documenting. `classifyStreamError` (`provider.ts`) then matches the typed name and surfaces a clean user-facing message ("connection interrupted after N chunk(s)") instead of the raw stack.
+
+**ADR 0005 preserved.** `ConnectionInterruptedError` is terminal and NOT retriable — it carries the "No mid-stream retry" invariant from ADR 0005. Only `ZeroByteSocketCloseError` (0 chunks) is retryable, matching the existing Phase 3 boundary.
+
 ### Phase 3 — `ZeroByteSocketCloseError` + ADR 0005 revision (accepted)
 
 Introduce `ZeroByteSocketCloseError` in `retry.ts` for the case where the socket closes with zero bytes received (TLS abort / connection reset before any chunk). This is distinct from `InactivityTimeoutError` (no chunks for 90 s) and from `MidStreamError` (server sent an error chunk):

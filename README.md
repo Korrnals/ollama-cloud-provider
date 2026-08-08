@@ -28,6 +28,7 @@ The extension is built for reliability and safety: API keys live in OS-backed se
 - [Endpoint routing](#endpoint-routing)
 - [Context filtering](#context-filtering)
 - [Vision fallback](#vision-fallback)
+- [VS Code Agents window](#vs-code-agents-window)
 - [License](#license)
 
 ## 🚀 Quick start
@@ -47,7 +48,7 @@ The default endpoint (`auto`, which resolves to `native` `/api/chat` for cloud) 
 - **Native `/api/chat` for cloud, OpenAI-compat for local** — cloud uses Ollama's native API by default (first-class `think`, object `tool_calls`, full-event streaming, Ollama metrics). Local uses `/chat/completions` (OpenAI-compat, SSE).
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
 - **Context filtering (token savings)** — optional pre-processing that drops duplicate messages, empty content parts, and redundant tool definitions, and compacts the system prompt — reducing token cost without touching semantic content. Tool-call integrity is guaranteed; vision content is never filtered. Three levels (`off` / `safe` / `aggressive`), `off` by default. See [Context filtering](#context-filtering).
-- **Structured error surfacing** — server-sent mid-stream errors (`{"error":"..."}`) are caught as `MidStreamError` and shown with the real server message instead of a raw `aborted at TLSSocket.socketCloseListener` stack. HTTP 402/403/429/5xx are classified into human-readable `LanguageModelError` messages (including the server's actual reason, e.g. "this model uses extra usage only"). Zero-byte socket close (HTTP 200 + headers + no body) is surfaced as a retryable error instead of a silent empty success. See ADR 0008.
+- **Structured error surfacing** — server-sent mid-stream errors (`{"error":"..."}`) are caught as `MidStreamError` and shown with the real server message. HTTP 402/403/429/5xx are classified into human-readable `LanguageModelError` messages (including the server's actual reason, e.g. "this model uses extra usage only"). Raw Node socket-close errors (the `aborted at TLSSocket.socketCloseListener` / `socket hang up` / `ECONNRESET` family) are reclassified by `isSocketCloseError()` into `ConnectionInterruptedError` (mid-stream, terminal) or `ZeroByteSocketCloseError` (connect-phase, retryable) — shown as a clean message instead of a raw stack (v0.9.2, see ADR 0008).
 - **Proxy-aware networking** — a native HTTP client bypasses VS Code's `global.fetch()` interception, fixing connect-timeout issues under `chat.agent.sandbox.enabled: "on"`. Respects the `http.proxy` VS Code setting.
 - **Tool calling** — fully supported on `/v1/responses` (top-level `function_call` / `function_call_output` items) and on native `/api/chat` (object tool args). Handled natively by VS Code, with no shell execution from the extension.
 - **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
@@ -316,6 +317,28 @@ To enable:
 2. Run `Ollama Cloud: Set Vision Fallback Model` to pick a vision-capable model from the catalog.
 3. Optionally run `Ollama Cloud: Set Vision Fallback Connection` if the vision model lives on a different connection.
 4. Send an image to a non-vision model — the extension swaps to the vision model for that turn and notifies.
+
+## 🤖 VS Code Agents window
+
+Starting from **v0.9.2**, Ollama Cloud models also appear in the **VS Code Agents window** (Preview) model picker, not only in Copilot Chat.
+
+The extension is not loaded in the Agents window by default. Two settings must be enabled in your `settings.json`:
+
+```jsonc
+// settings.json
+"extensions.supportAgentsWindow": { "Korrnals.ollama-cloud-provider": true },
+"chat.agentHost.byokModels.enabled": true
+```
+
+After changing these settings, **restart the Agent Host process** (`Developer: Restart Agent Host` from the Command Palette) — not just Reload Window — so the model metadata is re-read.
+
+> **Default profile required.** The extension must be installed in the default VS Code profile. Extensions installed only in a custom profile are not visible to the Agent Host.
+
+Only models with **tool-calling capability** are eligible for the Agents window picker. Check a model's capabilities via `Ollama Cloud: Show Logs` or the health-check output.
+
+### How it works
+
+The extension sets `isBYOK: true` in the `LanguageModelChatInformation` metadata it returns to VS Code. The Agents window picker only surfaces models where `isBYOK === true`. `isBYOK` is a proposed-API field that flows through at runtime via type augmentation — the same mechanism the extension already uses for `isUserSelectable` and `statusIcon`. No `enabledApiProposals` change is needed.
 
 ## 📄 License
 
