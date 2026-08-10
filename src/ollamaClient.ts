@@ -269,6 +269,9 @@ export class OllamaClient {
     // shared module. Three timers, withRetry connect wrapper, reader
     // loop + buffer cap, chunksReceived, socket-close reclassification,
     // AbortError routing, finally cleanup — all owned by readStream.
+    // Sidecar probe (ArchCom 0011): probe the server when inactivity fires.
+    const probeUrl = this.chatUrl().replace(/\/chat\/completions$/, '');
+    const probeHeaders: Record<string, string> = { ...headers };
     await readStream(
       {
         logTag: 'Ollama Cloud',
@@ -276,6 +279,8 @@ export class OllamaClient {
         headers,
         body,
         cancellationToken,
+        probeUrl,
+        probeHeaders,
         processLine: processLineForFormat,
         finalize,
       },
