@@ -88,16 +88,16 @@ import {
 const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
 const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 60000;
 
-const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
-const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 300000;
+const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 1800000;
+const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 900000;
 // v0.9.0 — soft threshold: when the inactivity timer first fires at this
 // duration, instead of killing the stream, we log a warning and extend
 // to the full inactivityTimeoutMs grace period. Only the SECOND fire
 // (hard kill) aborts. Must be <= REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS.
-const REQUEST_INACTIVITY_SOFT_THRESHOLD_MS = 120000;
+const REQUEST_INACTIVITY_SOFT_THRESHOLD_MS = 300000;
 
 const REQUEST_MAX_DURATION_MAX_MS = 3600000;
-const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
+const REQUEST_MAX_DURATION_DEFAULT_MS = 3600000;
 
 // Legacy single-timer clamp — kept for the deprecation alias. The
 // default is intentionally unused (new default is
