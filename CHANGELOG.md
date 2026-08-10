@@ -6,6 +6,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ## [Unreleased]
 
 ### Changed
+- _(nothing yet)_
+
+## [0.10.0] - 2026-08-10
+
+### Changed
+- Extracted shared streaming lifecycle into `src/streamReader.ts` — `ollamaClient.ts` and `responsesClient.ts` now call `readStream(options, callbacks)` with endpoint-specific parsing via callback injection, eliminating ~600 lines of duplicated code (ADR 0010). Behavior-preserving: 507 tests pass (+13 new contract tests), 9/9 CI gates green. Preserves ADR 0005 (no mid-stream retry) and ADR 0008 (error taxonomy)
 - VSIX no longer bundles old release signatures (`sha256.txt`, `.asc`, `.sigstore.bundle` from v0.9.0–v0.9.3) — `releases/**` added to `.vscodeignore` (~9KB bloat removed)
 - SBOM generation switched to Node.js inline generator as primary (correctly lists npm dependencies from `package.json` + `package-lock.json`); `syft` is now opt-in via `SBOM_USE_SYFT=1` (it mis-identified the project as .NET and omitted npm deps)
 
