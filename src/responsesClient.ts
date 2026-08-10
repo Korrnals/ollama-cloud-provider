@@ -172,6 +172,9 @@ export class ResponsesClient {
         headers,
         body,
         cancellationToken,
+        // Sidecar probe (ArchCom 0011): probe the server when inactivity fires.
+        probeUrl: this.responsesUrl().replace(/\/responses$/, ''),
+        probeHeaders: { ...headers },
         processLine: processResponsesLineForStream,
       },
       callbacks,

@@ -168,8 +168,16 @@ export interface StreamReaderOptions {
   /** Serialized request body. */
   body: string;
   /** Optional caller cancellation token (VS Code CancellationToken). */
-  cancellationToken?: CancellationToken;
-  /** Line-processing callback — the endpoint-specific parser. */
+  cancellationToken?: CancellationToken;    /**
+     * Base URL for sidecar health-check probe (ArchCom 0011). When set,
+     * the inactivity soft-threshold fires a `GET {probeUrl}/v1/models`
+     * request instead of blindly extending grace. Probe success →
+     * extend grace 5 min (max 3 extensions). Probe fail (N=2
+     * consecutive) → kill. 429 → neutral (extend grace).
+     */
+    probeUrl?: string;
+    /** Auth headers for the sidecar probe (same as streaming request). */
+    probeHeaders?: Record<string, string>;  /** Line-processing callback — the endpoint-specific parser. */
   processLine: StreamLineProcessor;
   /** Optional finalizer for clean stream-end (compat flushToolCalls). */
   finalize?: StreamFinalizer;
