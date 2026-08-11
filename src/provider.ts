@@ -11,7 +11,7 @@ import {
 } from './convert.js';
 import { validateConfiguration } from './configValidator.js';
 import { runHealthCheckCommand } from './healthCheck.js';
-import { logger } from './logger.js';
+import { logger, redactSensitive } from './logger.js';
 import {
   getModelConfigurationSchema,
   resolveModelRequestConfiguration,
@@ -33,12 +33,14 @@ import {
 } from './convertResponses.js';
 import {
   clearCapabilityCache,
+  getCapabilityCacheSnapshot,
   isChatKnownUnavailable,
   isNativeChatKnownUnavailable,
   isResponsesKnownUnavailable,
   mark404,
   markChatAvailable,
   markChatUnavailable,
+  markModel404,
   markNativeChatAvailable,
   markNativeChatUnavailable,
   markResponsesAvailable,
@@ -195,12 +197,24 @@ export function classifyStreamError(error: unknown): Error {
             ? `Ollama Cloud: ${serverMsg}`
             : 'Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером.',
         );
-      case 429:
+      case 429: {
+        // ArchCom 0011c (PA finding — 429 Retry-After): surface the
+        // server-provided Retry-After delay (parsed from the header by
+        // httpErrorFromResponse into retryAfterMs) to the user so they
+        // know how long to wait. Falls back to the generic message when
+        // the server omitted the header (retryAfterMs undefined).
+        const retryAfterSeconds =
+          typeof error.retryAfterMs === 'number'
+            ? Math.ceil(error.retryAfterMs / 1000)
+            : undefined;
         return vscode.LanguageModelError.Blocked(
           serverMsg
             ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
+            : retryAfterSeconds !== undefined
+              ? `Ollama Cloud: Rate limit exceeded (HTTP 429) — повторите через ~${retryAfterSeconds} сек.`
+              : 'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
         );
+      }
       case 404:
         return vscode.LanguageModelError.NotFound(
           serverMsg
@@ -285,7 +299,14 @@ export class OllamaCloudChatProvider
   private readonly modelCatalog: ModelCatalog;
   private readonly onDidChangeLanguageModelChatInformationEmitter =
     new vscode.EventEmitter<void>();
-  private charsPerToken = 4;
+  /**
+   * ArchCom 0011c Fix 3 — per-model chars-per-token EMA. Different
+   * models have different token densities (a CJK-heavy model vs an
+   * English code model), so a single global EMA drifts when switching
+   * models. Keyed by `apiModel`; defaults to 4 when no data yet.
+   */
+  private readonly charsPerTokenEMA = new Map<string, number>();
+  private static readonly CHARS_PER_TOKEN_DEFAULT = 4;
   private lastCatalogSync = 0;
   private static readonly CATALOG_SYNC_COOLDOWN = 30_000;
 
@@ -320,6 +341,11 @@ export class OllamaCloudChatProvider
             event.affectsConfiguration('ollamaCloud.connections') ||
             event.affectsConfiguration('ollamaCloud.allowedBaseUrls')
           ) {
+            // ArchCom 0011c (PA finding #2): clear capability cache
+            // when connections change. Without this, a baseUrl change
+            // (e.g. cloud → VPS) leaves stale 404 cache entries that
+            // misroute requests until VS Code restart.
+            clearCapabilityCache();
             void this.syncModelCatalog();
           }
           this.onDidChangeLanguageModelChatInformationEmitter.fire();
@@ -409,7 +435,18 @@ export class OllamaCloudChatProvider
       );
       this.onDidChangeLanguageModelChatInformationEmitter.fire();
     } catch (error) {
+      // ArchCom 0011c (PA finding #1): surface catalog sync failures
+      // to the user — silent failure means stale model list with no
+      // signal. The user picks a retired model and gets a confusing 404.
       logger.error('Failed to sync model list.', error);
+      void vscode.window.showWarningMessage(
+        'Ollama Cloud: failed to sync model list. The model picker may show outdated models. Check your connection and API key. See Output → Ollama Cloud for details.',
+        'Open Logs',
+      ).then((action) => {
+        if (action === 'Open Logs') {
+          logger.show();
+        }
+      });
     }
   }
 
@@ -706,6 +743,18 @@ export class OllamaCloudChatProvider
       const isLocal = endpointConnection?.type === 'local';
       const connectionId = endpointConnection?.id ?? 'cloud';
 
+      // ArchCom 0011c Fix 2 — retired-model tracking. Guard so a single
+      // user request that 404s on multiple endpoints (e.g. responses →
+      // chat fallback) only increments the per-model counter once. The
+      // counter retires a model after 3 404s on DISTINCT requests.
+      let model404AlreadyMarked = false;
+      const markModel404Once = (): void => {
+        if (!model404AlreadyMarked) {
+          markModel404(connectionId, model.apiModel ?? model.id);
+          model404AlreadyMarked = true;
+        }
+      };
+
       // Resolve the effective primary endpoint AND whether the choice is
       // explicit. Explicit = per-connection `'responses'`/`'chat'` (always
       // an override) OR a global `preferredEndpoint` the user actually
@@ -956,6 +1005,9 @@ export class OllamaCloudChatProvider
           if (error instanceof HttpError && error.status === 404) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
+            // Fix 2 — track per-model 404s so a retired model is hidden
+            // from the picker after 3 distinct-request 404s.
+            markModel404Once();
             // Issue #40 — explicit choice: do NOT silently fall back.
             // Surface an actionable error so the user knows their
             // explicit endpoint is unsupported by this connection.
@@ -1042,6 +1094,8 @@ export class OllamaCloudChatProvider
             // Do NOT mark unavailable on first 404 — that would switch
             // immediately, bypassing the 3×404 threshold. Instead:
             // increment counter, only mark unavailable when threshold hit.
+            // Fix 2 — also track per-model 404s (retired-model hiding).
+            markModel404Once();
             if (isPreferredEndpointExplicit) {
               logger.info(
                 `Explicit /api/chat (native) 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
@@ -1118,6 +1172,9 @@ export class OllamaCloudChatProvider
           if (error instanceof HttpError && error.status === 404) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
+            // Fix 2 — track per-model 404s so a retired model is hidden
+            // from the picker after 3 distinct-request 404s.
+            markModel404Once();
             // Issue #40 — explicit choice: do NOT silently fall back.
             // Surface an actionable error so the user knows their
             // explicit endpoint is unsupported by this connection.
@@ -1170,6 +1227,9 @@ export class OllamaCloudChatProvider
           if (error instanceof HttpError && error.status === 404) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markChatUnavailable(connectionId);
+            // Fix 2 — track per-model 404s so a retired model is hidden
+            // from the picker after 3 distinct-request 404s.
+            markModel404Once();
             // Issue #40 — explicit choice: do NOT silently fall back.
             if (isPreferredEndpointExplicit) {
               logger.info(
@@ -1233,6 +1293,9 @@ export class OllamaCloudChatProvider
           if (error instanceof HttpError && error.status === 404) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
+            // Fix 2 — track per-model 404s so a retired model is hidden
+            // from the picker after 3 distinct-request 404s.
+            markModel404Once();
             logger.info(
               `/v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
             );
@@ -1276,16 +1339,96 @@ export class OllamaCloudChatProvider
     _token: vscode.CancellationToken,
   ): Promise<number> {
     const rawText = getMessageText(text);
-    return Math.max(1, Math.ceil(rawText.length / this.charsPerToken));
+    // Fix 3 — resolve the model-specific charsPerToken. Falls back to the
+    // default when the model is unknown or has no observed usage yet.
+    const model = this.modelCatalog.get(_modelInfo.id);
+    const apiModel = model?.apiModel ?? _modelInfo.id;
+    const charsPerToken =
+      this.charsPerTokenEMA.get(apiModel) ??
+      OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
+    return Math.max(1, Math.ceil(rawText.length / charsPerToken));
   }
 
-  private updateTokenEstimate(requestChars: number, usage: UsageInfo): void {
+  private updateTokenEstimate(
+    requestChars: number,
+    usage: UsageInfo,
+    apiModel: string,
+  ): void {
     if (!requestChars || !usage.inputTokens) {
       return;
     }
 
     const observed = requestChars / usage.inputTokens;
-    this.charsPerToken = this.charsPerToken * 0.7 + observed * 0.3;
+    // Fix 3 — EMA is tracked PER MODEL so switching models does not
+    // contaminate one model's density estimate with another's.
+    const prev =
+      this.charsPerTokenEMA.get(apiModel) ??
+      OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
+    this.charsPerTokenEMA.set(apiModel, prev * 0.7 + observed * 0.3);
+  }
+
+  /**
+   * ArchCom 0011c Fix 5 — collects a diagnostic snapshot for bug
+   * reports. Gathers extension version, connection count, model count,
+   * capability cache state, and recent logger errors into a markdown
+   * document opened in a new editor tab. All output is run through
+   * {@link redactSensitive} as defence-in-depth.
+   */
+  async collectDiagnostics(): Promise<void> {
+    const extensionVersion =
+      vscode.extensions.getExtension('Korrnals.ollama-cloud-provider')?.packageJSON
+        ?.version ?? 'unknown';
+    const connections = loadConnections();
+    const models = this.modelCatalog.list();
+    const cacheSnapshot = getCapabilityCacheSnapshot();
+    const recentErrors = logger.getRecentErrors();
+
+    const connectionLines = connections.length > 0
+      ? connections.map((c) => `- \`${c.id}\` (${c.type}${c.enabled ? '' : ', disabled'})`).join('\n')
+      : '- none';
+    const cacheLines = cacheSnapshot.connections.length > 0
+      ? cacheSnapshot.connections.map(
+          (c) =>
+            `- \`${c.connectionId}\`: responses=${c.responsesAvailable}, chat=${c.chatAvailable}, native=${c.nativeChatAvailable}${c.expired ? ' (expired)' : ''}`,
+        ).join('\n')
+      : '- empty';
+    const retiredLines = cacheSnapshot.retiredModels.length > 0
+      ? cacheSnapshot.retiredModels.map((m) => `- \`${m}\``).join('\n')
+      : '- none';
+    const errorLines = recentErrors.length > 0
+      ? recentErrors.map((line) => redactSensitive(line)).join('\n')
+      : '- none';
+
+    const markdown = redactSensitive(`# Ollama Cloud — Diagnostics
+
+Generated: ${new Date().toISOString()}
+
+## Extension
+- Version: \`${extensionVersion}\`
+- VS Code: \`${vscode.version}\`
+
+## Connections (${connections.length})
+${connectionLines}
+
+## Models (${models.length})
+${models.map((m) => `- \`${m.id}\` (connection: \`${m.connectionId}\`)`).join('\n') || '- none'}
+
+## Capability cache
+${cacheLines}
+
+### Retired models
+${retiredLines}
+
+## Recent errors/warnings (last ${recentErrors.length})
+${errorLines}
+`);
+
+    const doc = await vscode.workspace.openTextDocument({
+      content: markdown,
+      language: 'markdown',
+    });
+    await vscode.window.showTextDocument(doc);
+    logger.info('Diagnostics collected and opened in a new editor tab.');
   }
 
   /**
@@ -1385,8 +1528,12 @@ export class OllamaCloudChatProvider
           // state AT REQUEST TIME. Updating first then logging the
           // already-shifted EMA is self-referential bias that dampens
           // the delta for the first few requests of a session.
-          const preUpdateCharsPerToken = this.charsPerToken;
-          this.updateTokenEstimate(requestChars, usage);
+          // Fix 3 — the EMA is now per-model; read this model's value.
+          const apiModel = model.apiModel ?? model.id;
+          const preUpdateCharsPerToken =
+            this.charsPerTokenEMA.get(apiModel) ??
+            OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
+          this.updateTokenEstimate(requestChars, usage, apiModel);
           // Issue #41 — Strand 3.2: log estimated tokens alongside
           // server-reported usage so the audit can compare "what we
           // sent" vs "what the server counted". Log the delta when it

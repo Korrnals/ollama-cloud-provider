@@ -48,7 +48,7 @@ Spike (2026-08-03, qwen3.5:397b, curl): native `/api/chat` streaming emits `mess
 - Committee protocol: `~/.gcw/architectural-committee/2026-08-03-ollama-cloud-provider-endpoint-routing.md`
 - Committee contract: `~/.gcw/architectural-committee/2026-08-03-ollama-cloud-provider-endpoint-routing-contract.md`
 - Spike result (mnemos): `1c8b86f3` — native streaming tool_calls = full-event + object args
-- ADR 0005 — three-timer (format-agnostic, not violated)
+- ADR 0005 — three-timer (format-agnostic, not violated; inactivity timer disabled in v0.11.0 — see ADR 0005 revision history)
 - ADR 0006 — responses primary (revised by this ADR)
 - ADR 0008 — stream error handling (MidStreamError/ZeroByteSocketCloseError apply to native path)
 - Ollama Cloud docs: https://docs.ollama.com/cloud

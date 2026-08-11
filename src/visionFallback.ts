@@ -257,15 +257,16 @@ export async function executePassThrough(
     );
   }
 
-  // Routing disclosure notification (constraint 8). Never silent.
-  // Data-residency disclosure when the vision connection differs
-  // from the primary.
+  // Routing disclosure (constraint 8). Never silent — but organic.
+  // ArchCom 0011b: replaced popup notification with an inline
+  // thinking-part annotation that flows naturally in the chat
+  // stream. The user sees it in context, not as a separate popup.
   const viaSuffix =
     visionConnection && visionConnection.id !== params.primaryModel.connectionId
       ? ` (via ${visionConnection.label})`
       : '';
-  const notification = `Vision fallback: answered by ${visionModel.name} (primary ${params.primaryModel.name} could not handle image)${viaSuffix}`;
-  void vscode.window.showInformationMessage(notification);
+  const routingNote = `🖼️ Processing image via ${visionModel.name}${viaSuffix}`;
+  params.progress.report(new vscode.LanguageModelTextPart(routingNote + '\n\n'));
 
   // Log — model names + image hash ONLY. NO image data URL (security).
   const imageHash = computeImageHash(params.messages);

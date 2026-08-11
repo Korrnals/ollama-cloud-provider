@@ -1,7 +1,31 @@
-# 0005. Streaming Timeout Architecture — connect / inactivity / max-duration
+# 0005. Streaming Timeout Architecture — connect / max-duration (+ inactivity, disabled 2026-08-11)
 
 **Date:** 2026-07-27
 **Status:** Accepted
+
+## Revision history — 2026-08-11 (ArchCom 0011b/0011c)
+
+The **inactivity timer (Decision §2) is permanently disabled as of v0.11.0.**
+`resetInactivity` is a no-op; the max-duration cap (30 min) remains the only
+active safety net besides the connect timer. Dead-connection detection moved
+to the OS level via TCP keepalive (`socket.setKeepAlive(true, 30000)` in
+`httpClient.ts`).
+
+- **`requestInactivityTimeoutMs`** — removed from the `package.json` schema.
+  The legacy alias is still honoured at runtime for migrated users, so
+  existing configs continue to work without edits.
+- **`requestTimeoutMs`** — removed from the schema, superseded by the
+  connect/max-duration split (legacy alias honoured at runtime).
+- **`InactivityTimeoutError`** — class retained in `retry.ts` for backward
+  compatibility but no longer produced at runtime.
+- **Decision §1 (connect) and §3 (max-duration) remain active and unchanged.**
+
+Rationale: the inactivity timer was a false-positive machine that killed
+working streams during legitimate LLM reasoning pauses (crashed subagents,
+froze terminals). The deliberation is recorded in ADR 0011 (stream-alive
+detection) and the ArchCom 0011b/0011c session. The original three-timer
+text below is preserved as the historical record; it is superseded by this
+revision for the inactivity timer only.
 
 ## Deciders
 

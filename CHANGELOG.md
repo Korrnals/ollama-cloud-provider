@@ -8,6 +8,50 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ### Changed
 - _(nothing yet)_
 
+## [0.11.0] - 2026-08-11
+
+A reliability and security overhaul driven by Architectural Committee findings 0011b (timer architecture) and 0011c (broad quality review). Two rounds of code review passed clean (0 P0, 0 P1). 511 tests pass.
+
+### Added
+- **Captive-portal / non-SSE response detection (ArchCom 0011c)** — when bytes arrive but none parse as valid stream events (e.g. an HTML captive-portal page, CDN error page, or proxy interception served at HTTP 200), the stream reader now fires `onError` with a descriptive message instead of silently completing as an empty success. A new `markParsed()` callback lets endpoint parsers signal that a meaningful chunk was processed; `parsedChunks` is tracked separately from raw bytes received.
+- **TCP keepalive for dead-connection detection (ArchCom 0011b)** — `setKeepAlive(true, 30000)` on the HTTP socket provides OS-level dead-connection detection, replacing the removed inactivity timer.
+- **Capability cache TTL (ArchCom 0011c Fix 1)** — capability-cache entries auto-expire after 5 min, so a model that was 404'd and later restored upstream is re-probed instead of being treated as permanently unavailable.
+- **Retired-model hiding (ArchCom 0011c Fix 2)** — a model that returns 404 on 3 distinct requests is marked retired and filtered out of the model picker. Newly-added connections are never filtered. The capability cache is cleared on connection changes so stale 404 entries do not survive a switch (e.g. cloud → VPS).
+- **HTTP 429 Retry-After surfacing** — rate-limit errors now include the server-provided `Retry-After` delay (when present) so the user knows how long to wait, instead of a generic rate-limit message.
+- **Per-model chars-per-token EMA (ArchCom 0011c Fix 3)** — token estimation now uses a per-model EMA instead of a single global value, so switching between model families (e.g. vision vs English-code) no longer drifts the estimate.
+- **Inline vision-fallback annotation (ArchCom 0011b)** — the vision-fallback modal popup is replaced with an inline `LanguageModelTextPart` progress annotation ("🖼️ Processing image via <model>") that flows naturally in the chat thread before the vision-model stream begins.
+- **`ollamaCloud.debug` logging channel** — debug entries land in a discoverable "Ollama Cloud (Debug)" output channel; the panel auto-shows when debug mode is enabled mid-session. Noisy per-chunk drop notices demoted from INFO to DEBUG.
+
+### Changed
+- **Inactivity timer permanently disabled (ArchCom 0011b/0011c)** — the inactivity timer was a false-positive machine that killed working streams during LLM reasoning pauses (crashed subagents, froze terminals). `resetInactivity` is now a no-op; the max-duration cap (30 min) remains as the only safety net. The dead-code constants and `resolveInactivityTimeoutMs()` are retained for backward-compat.
+- **First-chunk probe moved inside the retry wrapper (Fix 6)** — a post-connect 0-byte socket close is now detected inside `withRetry` (by probing the first chunk) and classified as a retryable connect-phase error, instead of surfacing only after the retry window closes. Safe per ADR 0005 (0 chunks = 0 billed tokens, so retry does not double-bill).
+- **Socket-leak fix (ArchCom 0011c SSE finding #2)** — on non-abort errors (mid-stream error, buffer overrun, whitelist throw), the response body reader is now cancelled via `controller.abort()` instead of lingering up to the max-duration cap.
+- **`gate-npm-audit.sh` promoted to a real gate** — the local CI npm-audit step is no longer an advisory stub.
+
+### Fixed
+- **"Validate Configuration" perpetually reported FAILURE** — the command checked two settings (`requestTimeoutMs`, `requestInactivityTimeoutMs`) that were removed from the schema; the checks are deleted and the validation count drops from 8 to 6.
+
+### Removed
+- **`requestInactivityTimeoutMs` setting** — removed from the `package.json` schema (the timer is disabled). The legacy alias is still honoured at runtime for migrated users, so existing configs continue to work without edits.
+- **`requestTimeoutMs` setting** — removed from the schema, superseded by the connect/max-duration split.
+- **`probeUrl` / `probeHeaders` options** — removed from `StreamReaderOptions` and both call sites (the sidecar health-check probe never shipped).
+
+### Notes
+- **Breaking-change justification (MINOR during 0.x)** — two settings were removed from the schema and the inactivity timer was architecturally disabled. The runtime still honours the legacy aliases, so existing user configs continue to work without edits. The `StreamReaderOptions` API-surface change affects only internal callers (no published extension API).
+
+## [0.10.1] - 2026-08-10
+A diagnostics-focused patch release adding a debug mode for stream-event tracing. Cut to investigate the recurring `ConnectionInterruptedError` (server-side socket close vs client-side abort).
+
+### Added
+- **`ollamaCloud.debug` setting** — new boolean setting (default `false`) for stream diagnostics. When enabled, `Logger.debug()` outputs to the Ollama Cloud output channel with per-chunk stream events (line processing, timer config, probe calls).
+- **Socket-close diagnostic logging** — the stream reader catch block now distinguishes error paths: client abort (`AbortError` with reason), server-side socket close (0-chunk retryable vs partial-response terminal loss), logging `chunksReceived` + error name/message so the root cause is visible without a reproducer replay.
+
+### Fixed
+- **`AbortReason` type corruption (TS1109)** — the type had duplicate members after an edit corruption; restored with correct members (`connect | inactivity | maxDuration | cancel`). `Logger.debug()`, `setDebugMode()`, and `scope:application` on the setting were restored in the same fix.
+
+### Notes
+- **SemVer PATCH (0.10.0 → 0.10.1)** — additive diagnostics only, no behavior change for users with debug disabled. The diagnostic output this release added directly informed the inactivity-timer removal and captive-portal detection shipped in [0.11.0].
+
 ## [0.10.0] - 2026-08-10
 
 ### Changed

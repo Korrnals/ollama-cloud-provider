@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 
 const OUTPUT_CHANNEL_NAME = 'Ollama Cloud';
+const OUTPUT_CHANNEL_NAME_DEBUG = 'Ollama Cloud (Debug)';
 
 /**
  * Redacts sensitive material from any string before it reaches the
@@ -59,16 +60,38 @@ export function redactSensitive(input: string): string {
 }
 
 class Logger {
-  private readonly channel =
+  private channel =
     vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
   private debugMode = false;
+  /**
+   * ArchCom 0011c Fix 5 — ring buffer of the most recent warn/error
+   * entries. Capped at 100 so the diagnostics snapshot stays bounded.
+   * Entries are the already-redacted, formatted log lines.
+   */
+  private readonly recentErrors: string[] = [];
+  private static readonly RECENT_ERRORS_CAP = 100;
 
   setDebugMode(enabled: boolean): void {
+    // ArchCom 0011c Fix 5b — when debug mode is toggled, recreate the
+    // output channel under the discoverable "Ollama Cloud (Debug)" name
+    // (or revert to the standard name). The old channel is disposed to
+    // avoid a stale panel lingering in the Output dropdown.
+    const desiredName = enabled
+      ? OUTPUT_CHANNEL_NAME_DEBUG
+      : OUTPUT_CHANNEL_NAME;
+    if (this.channel.name !== desiredName) {
+      // Preserve recent errors across the swap — they belong to the
+      // session, not the channel instance.
+      this.channel.dispose();
+      this.channel = vscode.window.createOutputChannel(desiredName);
+    }
     this.debugMode = enabled;
-  }
-
-  isDebugMode(): boolean {
-    return this.debugMode;
+    if (enabled) {
+      // Auto-show the panel (pinned, not focused) so the user does not
+      // have to hunt for it in the Output dropdown when they enable
+      // debug logging.
+      this.channel.show(true);
+    }
   }
 
   debug(message: string): void {
@@ -82,11 +105,32 @@ class Logger {
   }
 
   warn(message: string, ...details: unknown[]): void {
-    this.channel.appendLine(this.format('WARN', message, details));
+    const formatted = this.format('WARN', message, details);
+    this.channel.appendLine(formatted);
+    this.pushRecentError(formatted);
   }
 
   error(message: string, ...details: unknown[]): void {
-    this.channel.appendLine(this.format('ERROR', message, details));
+    const formatted = this.format('ERROR', message, details);
+    this.channel.appendLine(formatted);
+    this.pushRecentError(formatted);
+  }
+
+  /**
+   * Returns the most recent warn/error log lines (oldest-first), capped
+   * at 100 entries. Used by the `ollamaCloud.collectDiagnostics`
+   * command to attach recent errors to a bug-report snapshot. Values are
+   * already redacted via {@link redactSensitive}.
+   */
+  getRecentErrors(): string[] {
+    return [...this.recentErrors];
+  }
+
+  private pushRecentError(formatted: string): void {
+    this.recentErrors.push(formatted);
+    if (this.recentErrors.length > Logger.RECENT_ERRORS_CAP) {
+      this.recentErrors.shift();
+    }
   }
 
   show(): void {

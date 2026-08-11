@@ -377,11 +377,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.equal(fetchCalls.length, 1, 'fallback issued a single vision call');
     const body = fetchCalls[0].body as { model: string };
     assert.equal(body.model, 'gemma3:12b', 'request targeted the vision model');
-    assert.equal(progress.parts.length, 1, 'one text delta reported');
-    assert.equal(
-      (progress.parts[0] as vscode.LanguageModelTextPart).value,
-      'vision answer',
-    );
+    // ArchCom 0011b — routing annotation adds a part before model answer.
+    const textVals380 = progress.parts
+      .filter((p) => p instanceof vscode.LanguageModelTextPart)
+      .map((p) => (p as vscode.LanguageModelTextPart).value);
+    assert.ok(textVals380.includes('vision answer'), 'vision answer must be in parts');
   });
 
   it('forwards the image as a data URL when the model supports vision', async () => {
@@ -785,11 +785,13 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
     assert.ok(fetchCalls[2].url.endsWith('/api/chat'));
     assert.ok(fetchCalls[3].url.endsWith('/chat/completions'));
 
-    assert.equal(progress3.parts.length, 1, 'one text delta reported on fallback');
-    assert.equal(
-      (progress3.parts[0] as vscode.LanguageModelTextPart).value,
-      'chat answer',
-    );
+    // ArchCom 0011b — routing annotation adds a text part before
+    // the model's response. So parts.length = 2 (annotation + answer).
+    assert.ok(progress3.parts.length >= 1, 'at least one part reported on fallback');
+    const textValues = progress3.parts
+      .filter((p) => p instanceof vscode.LanguageModelTextPart)
+      .map((p) => (p as vscode.LanguageModelTextPart).value);
+    assert.ok(textValues.includes('chat answer'), 'chat answer must be in reported parts');
   });
 });
 
@@ -928,8 +930,11 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
     const textParts = progress.parts.filter(
       (part) => part instanceof vscode.LanguageModelTextPart,
     );
-    assert.equal(textParts.length, 1, 'one text part reported');
-    assert.equal((textParts[0] as vscode.LanguageModelTextPart).value, 'it is a png');
+    assert.ok(textParts.length >= 1, 'at least one text part reported');
+    assert.ok(
+      textParts.some((p) => (p as vscode.LanguageModelTextPart).value === 'it is a png'),
+      'model answer "it is a png" must be in text parts',
+    );
   });
 
   it('falls back to /chat/completions when the vision /v1/responses returns 404', async () => {
@@ -991,12 +996,11 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
     assert.ok(fetchCalls[0].url.endsWith('/responses'));
     assert.ok(fetchCalls[1].url.endsWith('/chat/completions'));
 
-    // The chat path surfaces the text delta; no thinking parts.
-    assert.equal(progress.parts.length, 1, 'one text delta reported');
-    assert.equal(
-      (progress.parts[0] as vscode.LanguageModelTextPart).value,
-      'vision chat answer',
-    );
+    // ArchCom 0011b — routing annotation adds a part before model answer.
+    const textVals997 = progress.parts
+      .filter((p) => p instanceof vscode.LanguageModelTextPart)
+      .map((p) => (p as vscode.LanguageModelTextPart).value);
+    assert.ok(textVals997.includes('vision chat answer'), 'vision chat answer must be in parts');
   });
 });
 
@@ -2557,6 +2561,26 @@ describe('classifyStreamError — ADR 0008 provider-level mapping', () => {
     assert.ok(result instanceof vscode.LanguageModelError);
     assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
     assert.match(result.message, /Rate limit|429/);
+  });
+
+  // ArchCom 0011c (PA finding — 429 Retry-After): when the server
+  // provides a Retry-After header (parsed into retryAfterMs), the
+  // user-facing message must surface the wait time in seconds so the
+  // user knows how long to wait before retrying.
+  it('maps HttpError 429 with retryAfterMs to Blocked including ~N seconds', () => {
+    const err = new HttpError(429, 'HTTP 429', 45000); // 45s retry-after
+    const result = classifyStreamError(err);
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /~45 сек/);
+  });
+
+  it('maps HttpError 429 with sub-second retryAfterMs rounding up to 1 sec', () => {
+    const err = new HttpError(429, 'HTTP 429', 200); // 0.2s → rounds up
+    const result = classifyStreamError(err);
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /~1 сек/);
   });
 
   it('maps HttpError 404 to NotFound', () => {

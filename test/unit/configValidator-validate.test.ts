@@ -50,11 +50,16 @@ function makeAuthManager(): AuthManager {
 
 describe('configValidator.validateConfiguration', () => {
   beforeEach(() => {
-    // Fresh, all-valid baseline.
+    // Fresh, all-valid baseline. requestTimeoutMs / requestInactivityTimeoutMs
+    // are NOT set — both settings were removed from package.json (ArchCom 0011c
+    // disabled the inactivity timer; the legacy single-timer alias retired
+    // with the three-timer ADR 0005 migration). Only the two live timers are
+    // configured.
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
-      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestMaxDurationMs: 1800000,
       maxRetries: 3,
     });
     delete process.env.OLLAMA_API_KEY;
@@ -82,7 +87,8 @@ describe('configValidator.validateConfiguration', () => {
     setConfig({
       baseUrl: 'https://evil.example.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
-      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestMaxDurationMs: 1800000,
       maxRetries: 3,
     });
     // Also set an API key to prove reachability is STILL skipped
@@ -101,27 +107,32 @@ describe('configValidator.validateConfiguration', () => {
     );
   });
 
-  it('fails when requestTimeoutMs is out of range', async () => {
+  it('fails when requestConnectTimeoutMs is out of range', async () => {
+    // requestTimeoutMs (legacy single-timer alias) is no longer validated —
+    // the setting was removed from package.json. The live connect timer is
+    // requestConnectTimeoutMs; an out-of-range value must FAIL the check.
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
-      requestTimeoutMs: 1000, // below 5000
+      requestConnectTimeoutMs: 1000, // below 5000 min
+      requestMaxDurationMs: 1800000,
       maxRetries: 3,
     });
     const auth = makeAuthManager();
     const result = await validateConfiguration(auth);
     assert.equal(result.ok, false);
-    const timeoutCheck = result.checks.find(
-      (c) => c.name === 'requestTimeoutMs valid',
+    const connectCheck = result.checks.find(
+      (c) => c.name === 'requestConnectTimeoutMs valid',
     );
-    assert.equal(timeoutCheck!.passed, false);
+    assert.equal(connectCheck!.passed, false);
   });
 
   it('fails when maxRetries is negative', async () => {
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
-      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestMaxDurationMs: 1800000,
       maxRetries: -1,
     });
     const auth = makeAuthManager();
@@ -131,23 +142,23 @@ describe('configValidator.validateConfiguration', () => {
     assert.equal(retriesCheck!.passed, false);
   });
 
-  it('fails the suite on missing API key but reports reachability as skipped (8 checks emitted)', async () => {
+  it('fails the suite on missing API key but reports reachability as skipped (6 checks emitted)', async () => {
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
-      requestTimeoutMs: 120000,
       maxRetries: 3,
       requestConnectTimeoutMs: 30000,
-      requestInactivityTimeoutMs: 90000,
       requestMaxDurationMs: 1800000,
     });
     const auth = makeAuthManager();
     const result = await validateConfiguration(auth);
     // Missing API key fails the "API key set" check, so the suite
-    // is not ok — but all 8 checks are still emitted (5 original +
-    // 3 ADR 0005 streaming-timer checks).
+    // is not ok — but all 6 checks are still emitted: baseUrl, API key,
+    // reachable, connect timer, max-duration timer, maxRetries. The
+    // legacy requestTimeoutMs and the disabled requestInactivityTimeoutMs
+    // are NOT validated (both removed from package.json).
     assert.equal(result.ok, false);
-    assert.equal(result.checks.length, 8);
+    assert.equal(result.checks.length, 6);
     const reachCheck = result.checks.find((c) => c.name === 'baseUrl reachable');
     assert.ok(reachCheck, 'reachable check missing');
     assert.ok(

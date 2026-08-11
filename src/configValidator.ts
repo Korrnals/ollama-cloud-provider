@@ -23,12 +23,8 @@ import { logger } from './logger.js';
  */
 
 const DEFAULT_ALLOWED_BASE_URLS: readonly string[] = ['https://ollama.com/v1'];
-const REQUEST_TIMEOUT_MIN_MS = 5000;
-const REQUEST_TIMEOUT_MAX_MS = 600000;
 const REQUEST_CONNECT_TIMEOUT_MIN_MS = 5000;
 const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
-const REQUEST_INACTIVITY_TIMEOUT_MIN_MS = 10000;
-const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
 const REQUEST_MAX_DURATION_MIN_MS = 60000;
 const REQUEST_MAX_DURATION_MAX_MS = 3600000;
 const MAX_RETRIES_MAX = 10;
@@ -56,12 +52,18 @@ export interface ValidationResult {
  * Checks:
  *   1. baseUrl whitelisted
  *   2. API key set (SecretStorage or fallback config/env)
- *   3. baseUrl reachable (fetch /v1/models — reuses the health check
- *      logic by reading `ollamaCloud.requestTimeoutMs` to bound the
- *      reachability probe; a fast probe is preferred but the full
- *      timeout is the upper bound)
- *   4. requestTimeoutMs valid (between 5000 and 600000)
- *   5. maxRetries valid (>= 0 when the key exists)
+ *   3. baseUrl reachable (fetch /v1/models — bounded by
+ *      VALIDATE_REACHABILITY_TIMEOUT_MS, NOT the request timers)
+ *   4. requestConnectTimeoutMs valid (between 5000 and 120000)
+ *   5. requestMaxDurationMs valid (between 60000 and 3600000)
+ *   6. maxRetries valid (>= 0 when the key exists)
+ *
+ * Note: `requestTimeoutMs` (legacy single-timer) and
+ * `requestInactivityTimeoutMs` (ArchCom 0011c — disabled) are NOT
+ * validated here. Both settings were removed from `package.json`;
+ * validating them would read `undefined` from config and FAIL every
+ * run. The connect + max-duration timers (the two that remain) are
+ * validated in checks 4–5.
  *
  * The reachability check requires an API key — if the key is missing,
  * the reachability check is marked as skipped (not failed) because a
@@ -141,23 +143,11 @@ export async function validateConfiguration(
     message: reachableMessage,
   });
 
-  // Check 4 — requestTimeoutMs valid (legacy / deprecated alias).
-  const timeoutMs = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestTimeoutMs');
-  const timeoutValid =
-    typeof timeoutMs === 'number' &&
-    timeoutMs >= REQUEST_TIMEOUT_MIN_MS &&
-    timeoutMs <= REQUEST_TIMEOUT_MAX_MS;
-  checks.push({
-    name: 'requestTimeoutMs valid',
-    passed: timeoutValid,
-    message: timeoutValid
-      ? `requestTimeoutMs=${timeoutMs}`
-      : `requestTimeoutMs=${timeoutMs} is outside [${REQUEST_TIMEOUT_MIN_MS}, ${REQUEST_TIMEOUT_MAX_MS}]`,
-  });
-
-  // ADR 0005 — Check 4a/4b/4c: the three streaming timers.
+  // ADR 0005 — Check 4/5: the two live streaming timers. The legacy
+  // `requestTimeoutMs` (single-timer alias) and the disabled
+  // `requestInactivityTimeoutMs` (ArchCom 0011c) are NOT validated —
+  // both settings were removed from package.json, so reading them
+  // would always return `undefined` and FAIL every validation run.
   const config = vscode.workspace.getConfiguration('ollamaCloud');
   const connectMs = config.get<number>('requestConnectTimeoutMs');
   const connectValid =
@@ -170,19 +160,6 @@ export async function validateConfiguration(
     message: connectValid
       ? `requestConnectTimeoutMs=${connectMs}`
       : `requestConnectTimeoutMs=${connectMs} is outside [${REQUEST_CONNECT_TIMEOUT_MIN_MS}, ${REQUEST_CONNECT_TIMEOUT_MAX_MS}]`,
-  });
-
-  const inactivityMs = config.get<number>('requestInactivityTimeoutMs');
-  const inactivityValid =
-    typeof inactivityMs === 'number' &&
-    inactivityMs >= REQUEST_INACTIVITY_TIMEOUT_MIN_MS &&
-    inactivityMs <= REQUEST_INACTIVITY_TIMEOUT_MAX_MS;
-  checks.push({
-    name: 'requestInactivityTimeoutMs valid',
-    passed: inactivityValid,
-    message: inactivityValid
-      ? `requestInactivityTimeoutMs=${inactivityMs}`
-      : `requestInactivityTimeoutMs=${inactivityMs} is outside [${REQUEST_INACTIVITY_TIMEOUT_MIN_MS}, ${REQUEST_INACTIVITY_TIMEOUT_MAX_MS}]`,
   });
 
   const maxDurationMs = config.get<number>('requestMaxDurationMs');
@@ -274,10 +251,15 @@ export function getAllowedBaseUrls(): string[] {
  * Asserts that `baseUrl` is in the `ollamaCloud.allowedBaseUrls` whitelist.
  * Throws an Error if it is not — never silently falls back.
  *
- * Call this at every HTTP request boundary, immediately before `fetch`.
+ * Call this at every HTTP request boundary, immediately before `fetch`. The
+ * function is synchronous — a string comparison against the whitelist.
  * Config is re-read on every call so a `onDidChangeConfiguration` listener
  * is not required for correctness (but callers may add one to invalidate
  * caches). The read is cheap — VS Code config is in-process.
+ *
+ * SSRF IP blocklist (169.254.x.x metadata guard) is deferred to a follow-up
+ * release. The whitelist check is the primary SSRF defence — a host not on
+ * the whitelist never receives the API key.
  *
  * @throws Error when baseUrl is not whitelisted.
  */

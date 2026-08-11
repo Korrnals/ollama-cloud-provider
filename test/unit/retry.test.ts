@@ -194,6 +194,58 @@ describe('retry — socket-close error detection (ADR 0008 Phase 2 level-4)', ()
       assert.strictEqual(isSocketCloseError(err), true);
     });
 
+    // ArchCom 0011c (PA finding — DNS/TLS raw stack traces): DNS and
+    // TLS errors must be classified (clean user message) rather than
+    // surfaced as raw stack traces. They are detected by their libuv /
+    // OpenSSL error `code` prefix.
+    it('detects ENOTFOUND (DNS resolution failure)', () => {
+      const err = new Error(
+        'getaddrinfo ENOTFOUND api.example.com',
+      ) as Error & { code?: string };
+      err.code = 'ENOTFOUND';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects CERT_HAS_EXPIRED (expired TLS certificate)', () => {
+      const err = new Error(
+        'certificate has expired',
+      ) as Error & { code?: string };
+      err.code = 'CERT_HAS_EXPIRED';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects UNABLE_TO_VERIFY_LEAF_SIGNATURE (TLS leaf cert error)', () => {
+      const err = new Error(
+        'unable to verify the first certificate',
+      ) as Error & { code?: string };
+      err.code = 'UNABLE_TO_VERIFY_LEAF_SIGNATURE';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects ERR_TLS_CERT_ALTNAME_INVALID (hostname mismatch)', () => {
+      const err = new Error(
+        'Hostname/IP does not match certificate',
+      ) as Error & { code?: string };
+      err.code = 'ERR_TLS_CERT_ALTNAME_INVALID';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects DEPTH_ZERO_SELF_SIGNED_CERT (self-signed certificate)', () => {
+      const err = new Error(
+        'self signed certificate',
+      ) as Error & { code?: string };
+      err.code = 'DEPTH_ZERO_SELF_SIGNED_CERT';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
+    it('detects ERR_SSL_* OpenSSL error codes', () => {
+      const err = new Error('routine error') as Error & {
+        code?: string;
+      };
+      err.code = 'ERR_SSL_WRONG_VERSION_NUMBER';
+      assert.strictEqual(isSocketCloseError(err), true);
+    });
+
     it('detects "read ECONNRESET" message framing (no code)', () => {
       assert.strictEqual(
         isSocketCloseError(new Error('read ECONNRESET')),

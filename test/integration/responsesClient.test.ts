@@ -3,6 +3,12 @@ import * as vscode from 'vscode';
 import { ResponsesClient } from '../../src/responsesClient.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 
+/** Typed view of a stubbed global.fetch — carries restore metadata. */
+type FetchStub = typeof fetch & {
+  __isStub?: boolean;
+  __original?: typeof fetch;
+};
+
 const BASE_URL = 'https://ollama.com/v1';
 
 function setConfig(values: Record<string, unknown>): void {
@@ -94,7 +100,7 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
   });
 
   afterEach(() => {
-    const stub = global.fetch as any;
+    const stub = global.fetch as FetchStub;
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 
@@ -238,7 +244,8 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
     global.fetch = originalFetch;
   });
 
-  it('fires onError when the stream stalls (inactivity timeout, no events)', async function () {
+  // ArchCom 0011c — inactivity timer permanently disabled; re-enable only if timer is restored (see ADR 0005 / 0011c)
+  it.skip('fires onError when the stream stalls (inactivity timeout, no events)', async function () {
     this.timeout(5000);
 
     setConfig({
@@ -413,7 +420,7 @@ describe('responsesClient.streamResponses — ADR 0008 socket-close classificati
   });
 
   afterEach(() => {
-    const stub = global.fetch as any;
+    const stub = global.fetch as FetchStub;
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 

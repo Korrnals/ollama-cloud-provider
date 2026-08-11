@@ -4,7 +4,30 @@
 - **Date:** 2026-08-10
 - **Deciders:** Tech Lead (chair), Product Architect, Senior Security Engineer, Senior System Engineer
 - **Supersedes:** —
-- **Superseded by:** —
+- **Superseded by:** partial — the "TCP keepalive rejected" verdict (Decision; Alternatives row 1) was superseded by ArchCom 0011b (2026-08-11), which shipped TCP keepalive. The Layer-3 config-mode decision stands. See "Revision — 2026-08-11" below.
+
+## Revision — 2026-08-11 (ArchCom 0011b)
+
+One day after this ADR was accepted, ArchCom 0011b **overturned the
+"TCP keepalive rejected" verdict** and shipped TCP keepalive
+(`socket.setKeepAlive(true, 30000)`) as OS-level dead-connection detection
+in v0.11.0, while permanently disabling the inactivity timer (ADR 0005
+revision history). The committee's revised position: keepalive is not a
+*primary application-progress signal* (the original rejection rationale
+holds — a deadlocked Ollama keeps the socket alive), but it is a correct
+*secondary OS-level dead-connection detector* when paired with the
+max-duration safety cap. The inactivity timer it replaced was a worse
+false-positive source than the ambiguity keepalive leaves unresolved.
+
+- **Decision — Layer 1 (TCP keepalive):** shipped in v0.11.0 (no longer deferred).
+- **Decision — Layer 3 (configurable timeout mode):** moot — the inactivity
+  timer it would configure is permanently disabled.
+- **Alternatives row 1 ("TCP keepalive as primary signal — Rejected"):**
+  superseded. Keepalive shipped as a secondary signal, not a primary one.
+- **Open questions 1 and 2:** closed operationally by the timer removal.
+
+The original text below is preserved as the historical record of the
+2026-08-10 deliberation; the keepalive verdict is superseded by this revision.
 
 ## Context
 

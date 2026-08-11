@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-cloud-provider-icon.png",
@@ -87,6 +87,11 @@
         "command": "ollamaCloud.switchEndpoint",
         "title": "Ollama Cloud: Switch Endpoint",
         "category": "Ollama Cloud"
+      },
+      {
+        "command": "ollamaCloud.collectDiagnostics",
+        "title": "Ollama Cloud: Collect Diagnostics",
+        "category": "Ollama Cloud"
       }
     ],
     "configuration": {
@@ -115,28 +120,12 @@
           "description": "Whitelist of permitted base URLs. The extension refuses to send requests to any baseUrl not in this list.",
           "scope": "application"
         },
-        "ollamaCloud.requestTimeoutMs": {
-          "type": "integer",
-          "default": 120000,
-          "minimum": 5000,
-          "maximum": 600000,
-          "description": "Deprecated — use ollamaCloud.requestMaxDurationMs. Alias for backward compat; mapped to requestMaxDurationMs when requestMaxDurationMs is unset.",
-          "scope": "application"
-        },
         "ollamaCloud.requestConnectTimeoutMs": {
           "type": "integer",
           "default": 60000,
           "minimum": 5000,
           "maximum": 120000,
           "markdownDescription": "**Advanced** — Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
-          "scope": "application"
-        },
-        "ollamaCloud.requestInactivityTimeoutMs": {
-          "type": "integer",
-          "default": 300000,
-          "minimum": 10000,
-          "maximum": 600000,
-          "markdownDescription": "⚠️ **Max silence = 120s + this value** (420s at the default). The soft warning fires at 120s and extends the timer to this value — the name reflects the grace ceiling, NOT the total silence budget. See [ADR 0005](docs/adr/0005-streaming-timeout-architecture.md).\n\n**Advanced** — Inactivity timeout in milliseconds — grace period ceiling applied AFTER the soft warning fires. Reset on every stream chunk and :keep-alive SSE comment. Soft warning fires at 120s (logs + extends the timer to this value). Hard kill fires after the full grace period elapses with no new chunks — so total max silence before kill = 120s + this value (420s at the 300s default). Only applies when this value > 120s; at or below 120s the timer fires hard directly (short-timeout path). NO retry (mid-stream retry = double billing). Detects dead connections vs slow reasoning. ADR 0005.",
           "scope": "application"
         },
         "ollamaCloud.requestMaxDurationMs": {
@@ -255,7 +244,7 @@
         "ollamaCloud.visionFallback.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable Vision Fallback Pass-through (ADR 0004). When the primary model cannot handle an image, route the turn to a vision-capable model. Opt-in, default off. See `ollamaCloud.visionFallback.model` and `ollamaCloud.visionFallback.connection`.",
+          "description": "Enable Vision Fallback Pass-through (ADR 0004). When the primary model cannot handle an image, route the turn to a vision-capable model. Opt-in — enables transparent image processing via a vision model when the primary is text-only. An inline annotation (🖼️) shows when routing fires. See `ollamaCloud.visionFallback.model` and `ollamaCloud.visionFallback.connection`.",
           "scope": "application"
         },
         "ollamaCloud.visionFallback.model": {
@@ -329,6 +318,7 @@
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "20.19.30",
+    "@types/sinon": "^22.0.0",
     "@types/vscode": "^1.118.0",
     "@typescript-eslint/eslint-plugin": "8.53.0",
     "@typescript-eslint/parser": "8.53.0",
@@ -338,6 +328,7 @@
     "globals": "17.0.0",
     "mocha": "^11.7.6",
     "sharp": "^0.35.3",
+    "sinon": "^22.1.0",
     "typescript": "5.9.3"
   }
 }

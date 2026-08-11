@@ -32,7 +32,7 @@ This extension handles an Ollama Cloud API key and forwards prompts/responses to
 | API key sent to untrusted host | `allowedBaseUrls` whitelist — extension refuses non-whitelisted hosts |
 | API key in logs | Logger redaction — `Bearer`/`api_key` masked before `JSON.stringify` |
 | Malformed response exploitation | `safeJsonParse` surfaces errors, does not silently swallow |
-| Supply chain compromise | CI-built VSIX + Sigstore keyless signing + GPG + SHA256 + SBOM |
+| Supply chain compromise | CI-built VSIX + cosign keypair signing + GPG + SHA256 + SBOM |
 | Auto-update risk | Documented install-from-release path with checksum verification |
 
 ### What this extension does NOT do
@@ -49,15 +49,15 @@ This extension handles an Ollama Cloud API key and forwards prompts/responses to
 Every release VSIX is signed with:
 
 1. **SHA256 checksum** — integrity verification.
-2. **Sigstore keyless signing** — build provenance (which commit, which CI run built this VSIX).
+2. **Cosign keypair signing** — release provenance (which maintainer, which key signed this VSIX). Switched from opt-in keyless mode to always-on keypair mode in v0.9.0 (`cosign.key` / `cosign.pub`, no browser flow).
 3. **GPG signature** — identity (the release was signed by the maintainer's GPG key).
 
 See [ADR-0002](docs/adr/0002-signing-strategy.md) for the full rationale.
 
 ### Public verification key (`cosign.pub`)
 
-The repo root ships `cosign.pub` — the **public** half of the keyless
-signing keypair. It is committed (not gitignored) so downstream
+The repo root ships `cosign.pub` — the **public** half of the signing
+keypair (keypair mode since v0.9.0; not keyless). It is committed (not gitignored) so downstream
 consumers can verify `.sigstore.bundle` artifacts without an
 out-of-band channel:
 
