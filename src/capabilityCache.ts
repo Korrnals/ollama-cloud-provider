@@ -28,6 +28,44 @@ interface CapabilityEntry {
 const cache = new Map<string, CapabilityEntry>();
 
 /**
+ * ArchCom 0011c Fix 1 — capability cache TTL. A model that was 404'd
+ * early in a session would otherwise stay marked unavailable until VS
+ * Code restart, even after the upstream recovered. 5 min (300000 ms)
+ * matches the auto-recovery silence window (RETURN_TO_NATIVE_SILENCE_MS)
+ * so a stale unavailable memo is allowed to re-probe on the same cadence
+ * the auto-recovery path uses.
+ */
+const CAPABILITY_TTL_MS = 300_000;
+
+/**
+ * Returns true when the capability entry for `connectionId` is older
+ * than the TTL — i.e. its unavailable/available verdict should be
+ * treated as stale and the caller should re-probe. Returns true for
+ * connections with no entry (caller re-probes from scratch) so the
+ * helper can gate both the "known unavailable" and "known available"
+ * checks uniformly.
+ */
+export function hasExpired(connectionId: string): boolean {
+  const entry = cache.get(connectionId);
+  if (entry === undefined) {
+    return true;
+  }
+  return Date.now() - entry.checkedAt > CAPABILITY_TTL_MS;
+}
+
+/**
+ * Returns true when `entry` (already fetched) is older than the TTL.
+ * Internal helper so callers that already hold the entry avoid a second
+ * `cache.get` round-trip.
+ */
+function isEntryStale(entry: CapabilityEntry | undefined): boolean {
+  if (entry === undefined) {
+    return true;
+  }
+  return Date.now() - entry.checkedAt > CAPABILITY_TTL_MS;
+}
+
+/**
  * Returns true when the connection is KNOWN to NOT support
  * /v1/responses (a prior 404 was memoized). Returns false when the
  * capability has not been probed yet OR when a prior probe succeeded.
@@ -37,6 +75,13 @@ const cache = new Map<string, CapabilityEntry>();
  */
 export function isResponsesKnownUnavailable(connectionId: string): boolean {
   const entry = cache.get(connectionId);
+  // Fix 1 — a stale unavailable verdict re-probes rather than sticking
+  // for the whole session. Treat as NOT known-unavailable once the TTL
+  // elapsed so the caller retries /v1/responses instead of being locked
+  // onto the fallback endpoint forever.
+  if (isEntryStale(entry)) {
+    return false;
+  }
   return entry?.responsesAvailable === false;
 }
 
@@ -48,6 +93,10 @@ export function isResponsesKnownUnavailable(connectionId: string): boolean {
  */
 export function isResponsesKnownAvailable(connectionId: string): boolean {
   const entry = cache.get(connectionId);
+  // Fix 1 — a stale available verdict is not trusted either: re-probe.
+  if (isEntryStale(entry)) {
+    return false;
+  }
   return entry?.responsesAvailable === true;
 }
 
@@ -59,6 +108,9 @@ export function isResponsesKnownAvailable(connectionId: string): boolean {
  */
 export function isChatKnownUnavailable(connectionId: string): boolean {
   const entry = cache.get(connectionId);
+  if (isEntryStale(entry)) {
+    return false;
+  }
   return entry?.chatAvailable === false;
 }
 
@@ -104,6 +156,9 @@ export function markResponsesAvailable(connectionId: string): void {
  */
 export function isNativeChatKnownUnavailable(connectionId: string): boolean {
   const entry = cache.get(connectionId);
+  if (isEntryStale(entry)) {
+    return false;
+  }
   return entry?.nativeChatAvailable === false;
 }
 
@@ -183,7 +238,100 @@ export function markChatAvailable(connectionId: string): void {
 export function clearCapabilityCache(): void {
   cache.clear();
   endpoint404Cache.clear();
+  retiredModelCache.clear();
   logger.info('Capability cache: cleared all entries');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// ArchCom 0011c Fix 2 — retired-model tracking.
+//
+// When Ollama Cloud retires a model, it stays in the picker and 404s on
+// every request. Track per-model 404s; once a model 404s N times (on
+// distinct requests, NOT retries — the provider only calls this from its
+// outer 404 catch, never from retry.ts) it is marked "known retired" and
+// filtered out of the model catalog picker.
+// ─────────────────────────────────────────────────────────────────────
+
+const retiredModelCache = new Map<string, number>();
+const RETIRED_MODEL_THRESHOLD = 3;
+
+function retiredModelKey(connectionId: string, apiModel: string): string {
+  return `${connectionId}:${apiModel}`;
+}
+
+/**
+ * Increment the per-model 404 counter. Once the counter reaches
+ * {@link RETIRED_MODEL_THRESHOLD} (3) on distinct requests, the model is
+ * considered retired and {@link isModelKnownRetired} returns true so the
+ * model catalog can filter it out of the picker.
+ *
+ * Called from `provider.ts` only on an outer HttpError 404 whose message
+ * references the model — never from retry.ts, so retry storms do not
+ * inflate the counter.
+ */
+export function markModel404(connectionId: string, apiModel: string): void {
+  const key = retiredModelKey(connectionId, apiModel);
+  const next = (retiredModelCache.get(key) ?? 0) + 1;
+  retiredModelCache.set(key, next);
+  if (next >= RETIRED_MODEL_THRESHOLD) {
+    logger.info(
+      `Capability cache: model "${apiModel}" marked retired for connection "${connectionId}" after ${next} 404(s)`,
+    );
+  } else {
+    logger.info(
+      `Capability cache: model "${apiModel}" 404 #${next} for connection "${connectionId}" (retires at ${RETIRED_MODEL_THRESHOLD})`,
+    );
+  }
+}
+
+/**
+ * Returns true when the model has 404'd {@link RETIRED_MODEL_THRESHOLD}
+ * times on this connection and should be hidden from the picker.
+ */
+export function isModelKnownRetired(connectionId: string, apiModel: string): boolean {
+  return (retiredModelCache.get(retiredModelKey(connectionId, apiModel)) ?? 0) >= RETIRED_MODEL_THRESHOLD;
+}
+
+/**
+ * ArchCom 0011c Fix 5 — diagnostics snapshot. Returns a redacted,
+ * serialisable summary of the capability cache state for the
+ * `ollamaCloud.collectDiagnostics` command. No secrets are stored in
+ * this cache (only connection ids + endpoint availability booleans +
+ * counts), so no additional redaction is required.
+ */
+export interface CapabilityCacheSnapshot {
+  /** Per-connection endpoint availability (true = available). */
+  connections: Array<{
+    connectionId: string;
+    responsesAvailable: boolean | 'unknown';
+    chatAvailable: boolean | 'unknown';
+    nativeChatAvailable: boolean | 'unknown';
+    expired: boolean;
+  }>;
+  /** Models marked retired (hidden from the picker). */
+  retiredModels: string[];
+}
+
+export function getCapabilityCacheSnapshot(): CapabilityCacheSnapshot {
+  const connections: CapabilityCacheSnapshot['connections'] = [];
+  const seenConnections = new Set<string>();
+  for (const [connectionId, entry] of cache) {
+    seenConnections.add(connectionId);
+    connections.push({
+      connectionId,
+      responsesAvailable: entry.responsesAvailable,
+      chatAvailable: entry.chatAvailable,
+      nativeChatAvailable: entry.nativeChatAvailable,
+      expired: Date.now() - entry.checkedAt > CAPABILITY_TTL_MS,
+    });
+  }
+  const retiredModels: string[] = [];
+  for (const [key] of retiredModelCache) {
+    if ((retiredModelCache.get(key) ?? 0) >= RETIRED_MODEL_THRESHOLD) {
+      retiredModels.push(key);
+    }
+  }
+  return { connections, retiredModels };
 }
 
 // ─────────────────────────────────────────────────────────────────────
