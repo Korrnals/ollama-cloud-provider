@@ -247,10 +247,18 @@ export class OllamaClient {
     // Condition #2 — the callback carries the terminal condition. The
     // shared module does NOT hardcode [DONE] or done:true.
     const processLineForFormat = (line: string, ctx: StreamLineContext): boolean => {
-      if (this.endpointFormat === 'native') {
-        return processNdjsonLine(line, callbacks);
+      const result = this.endpointFormat === 'native'
+        ? processNdjsonLine(line, callbacks)
+        : processLine(line, pendingToolCalls, callbacks, ctx.resetInactivity);
+      // ArchCom 0011c: mark as parsed when the line was meaningful
+      // (not empty, not a comment, not skipped). Both processLine and
+      // processNdjsonLine return false for non-meaningful lines and
+      // process them for meaningful ones — so we check if the line
+      // had content and wasn't a bare newline/comment.
+      if (line.trim() && !line.startsWith(':')) {
+        ctx.markParsed();
       }
-      return processLine(line, pendingToolCalls, callbacks, ctx.resetInactivity);
+      return result;
     };
 
     // Condition #1 — optional finalize for compat mode's flushToolCalls.
@@ -269,9 +277,6 @@ export class OllamaClient {
     // shared module. Three timers, withRetry connect wrapper, reader
     // loop + buffer cap, chunksReceived, socket-close reclassification,
     // AbortError routing, finally cleanup — all owned by readStream.
-    // Sidecar probe (ArchCom 0011): probe the server when inactivity fires.
-    const probeUrl = this.chatUrl().replace(/\/chat\/completions$/, '');
-    const probeHeaders: Record<string, string> = { ...headers };
     await readStream(
       {
         logTag: 'Ollama Cloud',
@@ -279,8 +284,6 @@ export class OllamaClient {
         headers,
         body,
         cancellationToken,
-        probeUrl,
-        probeHeaders,
         processLine: processLineForFormat,
         finalize,
       },

@@ -53,6 +53,7 @@
 
 import * as http from 'node:http';
 import * as https from 'node:https';
+import * as net from 'node:net';
 import { Readable } from 'node:stream';
 import type { Readable as NodeReadable } from 'node:stream';
 import * as vscode from 'vscode';
@@ -346,11 +347,35 @@ function wireRequestLifecycle(
       return;
     }
     settled = true;
+    // v0.11.0 Task 2 — debug: surface error.code (libuv errno) so
+    // ECONNRESET vs EPIPE vs EHOSTUNREACH can be distinguished when
+    // ollamaCloud.debug is on. The warn below already logs the full
+    // error object; this adds the code as a discrete field.
+    const errCode = (error as { code?: unknown }).code;
+    if (typeof errCode === 'string') {
+      logger.debug(`httpClient: request failed with code=${errCode}`);
+    }
     logger.warn(`httpClient: request to ${new URL(url).hostname} failed`, error);
     reject(error);
   };
 
   req.on('error', fail);
+
+  // ArchCom 0011b — enable TCP keepalive (SO_KEEPALIVE) on the
+  // underlying socket. Our httpClient uses native node:http/node:https
+  // (NOT undici/global.fetch), so undici's default `connect.keepAlive:
+  // true` does NOT apply. Without this, the OS sends no keepalive
+  // probes, and infrastructure proxies (nginx, load balancers, CDN)
+  // close idle connections after 60-120s — producing the
+  // ConnectionInterruptedError that crashed subagents.
+  //
+  // 30s initial delay: probes start after 30s of idle, which keeps
+  // the connection alive in NAT/proxy connection tables without
+  // excessive traffic. The OS handles dead-server detection — no
+  // application-layer inactivity timer needed.
+  req.on('socket', (socket: net.Socket & { encrypted?: boolean }) => {
+    socket.setKeepAlive(true, 30000);
+  });
 
   const signal = options.signal;
   if (signal) {
@@ -423,7 +448,6 @@ function buildResponse(
     const decoder = new TextDecoder();
     let result = '';
     const reader = body.getReader();
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
