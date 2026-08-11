@@ -53,8 +53,8 @@ The default endpoint (`auto`, which resolves to `native` `/api/chat` for cloud) 
 - **Tool calling** — fully supported on `/v1/responses` (top-level `function_call` / `function_call_output` items) and on native `/api/chat` (object tool args). Handled natively by VS Code, with no shell execution from the extension.
 - **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
 - **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
-- **Retry and streaming timeouts** — exponential backoff for transient failures, plus a soft/grace inactivity timer that accommodates long-reasoning streams while still killing dead connections.
-- **Soft/grace streaming timers (ADR 0005)** — three timers protect against dead connections without killing legitimate long-reasoning streams: **connect** 60 s (retried via `maxRetries`), **inactivity** soft warning at 120 s → grace ceiling 300 s (reset on every chunk; total max silence = 120 s + 300 s = **420 s** before kill), **max-duration** safety cap 30 min (never reset, prevents forgotten-tab token leaks).
+- **Retry and streaming timeouts** — exponential backoff for transient failures, plus OS-level TCP keepalive for dead-connection detection and a max-duration safety cap.
+- **Streaming protection (ADR 0005)** — two layers protect against dead connections without killing legitimate long-reasoning streams: **connect** 60 s (retried via `maxRetries`), and a **max-duration** safety cap of 30 min (never reset, prevents forgotten-tab token leaks). Dead connections are detected at the OS level via TCP keepalive (`setKeepAlive(true, 30000)`) rather than by an inactivity timer — the previous inactivity timer was a false-positive machine that killed working streams during LLM reasoning pauses, and is now permanently disabled (v0.11.0, ArchCom 0011b/0011c).
 - **Manual endpoint override** — `Ollama Cloud: Switch Endpoint` opens a picker to override the endpoint (`auto` / `native` / `chat` / `responses`) at any time, without editing `settings.json`.
 - **Health check** — probe the endpoint and discover models before chatting.
 - **Configuration validation** — catch misconfiguration (missing key, URL not whitelisted) before it breaks a chat.
@@ -139,7 +139,6 @@ Three ways to configure — pick one.
   "ollamaCloud.allowedBaseUrls": ["https://ollama.com/v1"],
   "ollamaCloud.preferredEndpoint": "auto",
   "ollamaCloud.requestConnectTimeoutMs": 60000,
-  "ollamaCloud.requestInactivityTimeoutMs": 300000,
   "ollamaCloud.requestMaxDurationMs": 1800000,
   "ollamaCloud.maxRetries": 3,
   "ollamaCloud.connections": [
@@ -171,9 +170,7 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.allowedBaseUrls` | `["https://ollama.com/v1"]` | Whitelist of permitted base URLs. |
 | `ollamaCloud.preferredEndpoint` | `"auto"` | Primary endpoint for cloud/remote. Enum: `"auto"` (default — resolves to `native` (`/api/chat`) for cloud, `chat` (`/chat/completions`) for local; auto-select with 3×404 auto-recovery — switches after 3 consecutive 404s in 5 min, returns to native after 5 min silence), `"native"` (`/api/chat` — ndjson, first-class `think`, object tool args), `"responses"` (`/v1/responses` — structured reasoning, typed events), `"chat"` (`/chat/completions` — classic OpenAI-compatible). Local Ollama always uses `/chat/completions`. Per-connection `preferredEndpoint` overrides this. See [Endpoint routing](#endpoint-routing). |
 | `ollamaCloud.requestConnectTimeoutMs` | `60000` | Max time for the initial connection (60 s). Retried via `maxRetries` on timeout. ADR 0005. |
-| `ollamaCloud.requestInactivityTimeoutMs` | `300000` | Grace ceiling applied **after** the 120 s soft warning (300 s default). Reset on every chunk. Total max silence before kill = 120 s + this value (**420 s** at default). No retry (mid-stream retry = double billing). ADR 0005. |
-| `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (30 min, safety cap). Never reset. No retry. |
-| `ollamaCloud.requestTimeoutMs` | `120000` | **Deprecated** — use `requestMaxDurationMs`. Alias for backward compat. |
+| `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (30 min, safety cap). Never reset. No retry. Dead connections are detected via TCP keepalive, not an inactivity timer (v0.11.0). |
 | `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx, connect timeout). |
 | `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. Each connection can override the global `ollamaCloud.contextFilter.level` via a per-connection `contextFilter.level` (`off`/`safe`/`aggressive` override; `auto` inherits). |
 | `ollamaCloud.visionModels` | `[]` | Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection `visionModels` override this list. |
