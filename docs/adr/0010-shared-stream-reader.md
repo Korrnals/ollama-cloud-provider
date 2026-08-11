@@ -3,6 +3,15 @@
 **Date:** 2026-08-08
 **Status:** Accepted (conditional — 8 conditions, all mandatory; see §"Conditions")
 
+> **Note — 2026-08-11 (v0.11.0).** The inactivity timer referenced throughout
+> this ADR (Decision §"Three-timer architecture"; ADR 0005 §2; ADR 0011) was
+> permanently disabled in v0.11.0 (ArchCom 0011b/0011c). `resetInactivity`
+> remains in the `StreamLineContext` interface for backward compatibility but
+> is a no-op; `InactivityTimeoutError` is retained in `retry.ts` but
+> unreachable at runtime. The extraction itself is unchanged — only one of
+> the three timers it extracts is now dead code. See ADR 0005 revision
+> history and ADR 0011 revision.
+
 ## Deciders
 
 - `@GCW: Tech Lead` (chair, engineering owner)

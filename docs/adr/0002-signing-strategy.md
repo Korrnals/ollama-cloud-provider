@@ -21,7 +21,7 @@ CI computes `sha256sum` of the built VSIX and publishes it in the GitHub Release
 
 **What it proves:** The VSIX file has not been modified since release.
 
-### Layer 2 — Build provenance: Sigstore keyless signing
+### Layer 2 — Release provenance: cosign signing (keypair mode since v0.9.0; keyless before)
 
 CI signs the VSIX (and checksums) with [Sigstore](https://www.sigstore.dev/) `cosign sign-blob --yes`, using GitHub OIDC as the identity. No long-lived signing key — the signing certificate is ephemeral, issued per-CI-run, bound to the GitHub repository and commit.
 
@@ -52,6 +52,32 @@ gpg --verify sha256.txt.sig sha256.txt
 GitHub Actions release workflow is disabled due to billing lock (see `.github/workflows/release.yml`). Signing is performed locally via `scripts/local-ci/run-release-local.sh` until billing is resolved.
 
 The three-layer signing strategy (SHA256 + Sigstore keyless + GPG) is **unchanged** — only the execution environment moved from GitHub Actions to local. The Sigstore keyless identity in local mode is the maintainer's OIDC identity (not the GitHub Actions run identity); the verification command in Layer 2 must be adjusted to match the local signing identity when verifying locally-built VSIX artifacts.
+
+## Revision — 2026-08-04 (v0.9.0): keyless → keypair
+
+Layer 2 switched from opt-in **keyless** mode (interactive OAuth, ephemeral
+per-run certificate bound to GitHub OIDC) to always-on **keypair** mode
+(`cosign.key` / `cosign.pub`, no browser flow). Rationale: keyless mode
+triggered an OAuth browser flow that broke local releases; keypair mode
+runs unattended. `cosign.pub` (the public verification key) is committed to
+the repo root so consumers can verify `.sigstore.bundle` artefacts without
+an out-of-band channel; `cosign.key` stays gitignored.
+
+The verification command for v0.9.0+ releases uses the key, not the
+keyless certificate chain:
+
+```bash
+cosign verify-blob \
+  --bundle releases/*.sigstore.bundle \
+  --key cosign.pub \
+  ollama-cloud-provider-*.vsix
+```
+
+The original keyless verification command in Layer 2 below is preserved as
+the historical record; it applies only to pre-v0.9.0 releases. The "No
+long-lived signing keys in CI" positive consequence is amended: there is
+now one long-lived signing keypair (`cosign.key`), protected by gitignore
++ maintainer-only access; the GPG key remains the identity layer.
 
 ## Rejected alternatives
 

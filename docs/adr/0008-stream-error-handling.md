@@ -3,6 +3,15 @@
 **Date:** 2026-08-03
 **Status:** Accepted
 
+> **Note — 2026-08-11 (v0.11.0).** The `InactivityTimeoutError` row in the
+> error-class table (Phase 3) describes the pre-0.11.0 state. In v0.11.0 the
+> inactivity timer was permanently disabled (ArchCom 0011b/0011c);
+> `InactivityTimeoutError` is retained in `retry.ts` for backward
+> compatibility but is no longer produced at runtime. The other five error
+> classes (`ConnectTimeoutError`, `MidStreamError`,
+> `ZeroByteSocketCloseError`, `ConnectionInterruptedError`,
+> `MaxDurationError`) are unchanged.
+
 ## Deciders
 
 - `@GCW: Tech Lead` (chair, engineering owner)
