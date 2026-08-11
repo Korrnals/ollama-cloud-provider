@@ -61,6 +61,21 @@ export function redactSensitive(input: string): string {
 class Logger {
   private readonly channel =
     vscode.window.createOutputChannel(OUTPUT_CHANNEL_NAME);
+  private debugMode = false;
+
+  setDebugMode(enabled: boolean): void {
+    this.debugMode = enabled;
+  }
+
+  isDebugMode(): boolean {
+    return this.debugMode;
+  }
+
+  debug(message: string): void {
+    if (this.debugMode) {
+      this.channel.appendLine(this.format('DEBUG', message, []));
+    }
+  }
 
   info(message: string, ...details: unknown[]): void {
     this.channel.appendLine(this.format('INFO', message, details));

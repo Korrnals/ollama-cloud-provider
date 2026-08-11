@@ -209,9 +209,13 @@ export async function readStream(
   const inactivityTimeoutMs = resolveInactivityTimeoutMs();
   const maxDurationMs = resolveMaxDurationMs();
 
-    logger.debug(
-      `${logTag}: readStream START — connect=${connectTimeoutMs}ms, inactivity=${inactivityTimeoutMs}ms, maxDuration=${maxDurationMs}ms, probeUrl=${options.probeUrl ?? 'none'}`,
-    );
+  logger.debug(
+    `${logTag}: readStream START — connect=${connectTimeoutMs}ms, inactivity=${inactivityTimeoutMs}ms, maxDuration=${maxDurationMs}ms, probeUrl=${options.probeUrl ?? 'none'}`,
+  );
+
+  // Tagged abort reason — the catch block routes by this tag to emit
+  // the right user-facing message and to decide onDone vs onError.
+  type AbortReason =
     | 'connect'
     | 'inactivity'
     | 'maxDuration'

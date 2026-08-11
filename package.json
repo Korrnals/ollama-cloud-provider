@@ -307,7 +307,8 @@
         "ollamaCloud.debug": {
           "type": "boolean",
           "default": false,
-          "description": "Enable debug logging for stream diagnostics. Logs all stream events, timer fires, probe calls, and socket state to the Ollama Cloud output channel."
+          "description": "Enable debug logging for stream diagnostics. Logs all stream events, timer fires, probe calls, and socket state to the Ollama Cloud output channel.",
+          "scope": "application"
         }
       }
     }

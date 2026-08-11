@@ -92,7 +92,12 @@ export function registerApiKeyPrompt(
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  logger.info('Activating Ollama Cloud extension.');
+  // Enable debug logging if `ollamaCloud.debug` is set.
+  const debugEnabled = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<boolean>('debug', false);
+  logger.setDebugMode(debugEnabled);
+  logger.info(`Activating Ollama Cloud extension (debug=${debugEnabled}).`);
 
   try {
     const provider = new OllamaCloudChatProvider(context);
