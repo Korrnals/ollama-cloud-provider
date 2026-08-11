@@ -238,7 +238,8 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
     global.fetch = originalFetch;
   });
 
-  it('fires onError when the stream stalls (inactivity timeout, no events)', async function () {
+  // ArchCom 0011c — inactivity timer permanently disabled; re-enable only if timer is restored (see ADR 0005 / 0011c)
+  it.skip('fires onError when the stream stalls (inactivity timeout, no events)', async function () {
     this.timeout(5000);
 
     setConfig({
