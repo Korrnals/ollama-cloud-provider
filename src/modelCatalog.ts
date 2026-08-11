@@ -1,5 +1,8 @@
 import { AuthManager } from './auth.js';
-import { assertBaseUrlAllowed, assertBaseUrlAllowedForConnection } from './configValidator.js';
+import {
+  assertBaseUrlAllowed,
+  assertBaseUrlAllowedForConnection,
+} from './configValidator.js';
 import {
   connectionOriginLabel,
   type ConnectionConfig,
@@ -10,6 +13,7 @@ import {
 import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
+import { isModelKnownRetired } from './capabilityCache.js';
 
 const MODELS_ENDPOINT_SUFFIX = '/models';
 const TAGS_ENDPOINT_SUFFIX = '/api/tags';
@@ -469,7 +473,15 @@ export class ModelCatalog {
   constructor(private readonly authManager: AuthManager) {}
 
   list(): readonly ModelDefinition[] {
-    return this.models;
+    // ArchCom 0011c Fix 2 — hide retired models from the picker. A model
+    // that 404'd 3+ times on its connection (tracked in capabilityCache)
+    // is considered retired upstream and is filtered out so the user does
+    // not keep selecting it and hitting 404s. KNOWN_MODELS (the snapshot)
+    // are never retired — they have no live 404 history — so the filter
+    // is a no-op until a model actually 404s at runtime.
+    return this.models.filter(
+      (m) => !isModelKnownRetired(m.connectionId, m.apiModel),
+    );
   }
 
   get(id: string): ModelDefinition | undefined {
