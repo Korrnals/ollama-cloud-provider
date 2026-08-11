@@ -141,7 +141,9 @@ export function convertToResponsesInput(
       // assistant turn with no text AND no tool calls is dropped.
       // Same signal as `convert.ts` — surface it so silent content
       // loss is visible.
-      logger.info(
+      // v0.11.0 Task 1 — DEBUG for parity with convert.ts (fires per
+      // empty message in every multi-turn conversation).
+      logger.debug(
         `convertResponses: dropped empty assistant message (role=assistant, parts=${message.content.length})`,
       );
     }
@@ -325,7 +327,9 @@ export function convertOpenAIMessagesToResponsesInput(
     if (contentParts.length > 0) {
       input.push({ type: 'message', role, content: contentParts });
     } else if (role === 'assistant' && (message.tool_calls === undefined || message.tool_calls.length === 0)) {
-      logger.info(
+      // v0.11.0 Task 1 — DEBUG for parity with the pre-filter drop
+      // above (same signal, fires per filtered message).
+      logger.debug(
         'convertResponses: dropped empty assistant message after context filter',
       );
     }

@@ -90,7 +90,9 @@ export function convertMessagesToOpenAI(
         // turns would break the OpenAI `messages[]` shape), but it is
         // also a signal worth surfacing — a chat client that emits
         // empty assistant turns may be losing reasoning content.
-        logger.info(
+        // v0.11.0 Task 1 — DEBUG, not INFO: this fires once per empty
+        // message in every multi-turn conversation and drowns the log.
+        logger.debug(
           `convert: dropped empty assistant message (role=assistant, parts=${message.content.length})`,
         );
       }
@@ -113,7 +115,9 @@ export function convertMessagesToOpenAI(
       // signal worth surfacing — a chat client emitting empty user
       // turns is likely a bug. Tool messages are exempt: they are
       // emitted above from `toolResults` regardless of `text`.
-      logger.info(
+      // v0.11.0 Task 1 — DEBUG, not INFO: see note above (fires per
+      // empty message in every multi-turn conversation).
+      logger.debug(
         `convert: dropped empty ${role} message (parts=${message.content.length})`,
       );
     }
@@ -315,7 +319,8 @@ export function convertMessagesToNative(
         result.push(entry);
       } else {
         // Mirror the compat converter: drop empty assistant turns.
-        logger.info(
+        // v0.11.0 Task 1 — DEBUG for parity with the compat converter.
+        logger.debug(
           `convertNative: dropped empty assistant message (role=assistant, parts=${message.content.length})`,
         );
       }
@@ -328,7 +333,8 @@ export function convertMessagesToNative(
       // but keep a user message that has images even with empty text —
       // native accepts `content: ""` + `images: [...]`.
       if (!text && images.length === 0) {
-        logger.info(
+        // v0.11.0 Task 1 — DEBUG for parity with the compat converter.
+        logger.debug(
           `convertNative: dropped empty ${role} message (parts=${message.content.length})`,
         );
         continue;
