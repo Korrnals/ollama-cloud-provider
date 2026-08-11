@@ -27,6 +27,7 @@ import * as vscode from 'vscode';
 import {
   readStream,
   type StreamReaderOptions,
+  type StreamLineContext,
 } from '../../src/streamReader.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 import {
@@ -128,7 +129,14 @@ function makeBaseOptions(
     url: STREAM_URL,
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ stream: true }),
-    processLine: () => false,
+    processLine: (_line: string, ctx: StreamLineContext) => {
+      // ArchCom 0011c: mark parsed so empty-response detection
+      // doesn't fire for well-formed test streams.
+      if (_line.trim()) {
+        ctx.markParsed();
+      }
+      return false;
+    },
     ...overrides,
   };
 }
@@ -189,6 +197,61 @@ describe('streamReader.readStream — module contract', () => {
   });
 
   // -------------------------------------------------------------------------
+  // ArchCom 0011c (SSE finding #1) — captive-portal / non-SSE body
+  // detection. Bytes arrive (chunksReceived > 0) but NONE parse as
+  // meaningful stream events (parsedChunks stays 0). Likely an HTML
+  // captive portal, CDN error page, or proxy interception served at
+  // HTTP 200. The module must surface onError — NOT a silent empty
+  // success (onDone).
+  // -------------------------------------------------------------------------
+
+  it('surfaces onError (not onDone) when bytes arrive but none parse as stream events (captive-portal detection)', async () => {
+    // Raw HTML — as if a captive portal / proxy served an error page
+    // at HTTP 200 instead of a real SSE stream.
+    const htmlBody = '<html><body>error</body></html>\n';
+    const body = streamFromChunks([encode(htmlBody)]);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    await readStream(
+      makeBaseOptions({
+        // processLine that ONLY marks real SSE data lines as parsed.
+        // An HTML line is not a valid stream event → markParsed is
+        // NOT called → parsedChunks stays 0 → onError must fire.
+        processLine: (line: string, ctx: StreamLineContext) => {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            ctx.markParsed();
+          }
+          return false;
+        },
+      }),
+      recorder,
+    );
+
+    // Bytes arrived but none were valid SSE → onError, NOT onDone.
+    assert.equal(
+      recorder.errors.length,
+      1,
+      'onError must fire when no chunk parses as a stream event',
+    );
+    assert.match(
+      recorder.errors[0]!.message,
+      /none were valid stream events/,
+      'error message must explain the captive-portal / non-SSE cause',
+    );
+    assert.equal(
+      recorder.doneCount,
+      0,
+      'onDone must NOT fire — silent empty success is forbidden',
+    );
+
+    global.fetch = originalFetch;
+  });
+
+  // -------------------------------------------------------------------------
   // Timer fire ordering — soft (120s) → grace (300s) → hard inactivity.
   // We use a short inactivity that is ABOVE the soft threshold to test
   // the soft path. But the default soft threshold is 120000ms — too long
@@ -196,7 +259,8 @@ describe('streamReader.readStream — module contract', () => {
   // which fires hard directly.
   // -------------------------------------------------------------------------
 
-  it('fires hard inactivity directly when timeout ≤ soft threshold (short-timeout path)', async function () {
+  // ArchCom 0011c — inactivity timer permanently disabled; re-enable only if timer is restored (see ADR 0005 / 0011c)
+  it.skip('fires hard inactivity directly when timeout ≤ soft threshold (short-timeout path)', async function () {
     this.timeout(5000);
 
     // inactivityTimeoutMs = 1000 ≤ 120000 soft threshold → hard path.

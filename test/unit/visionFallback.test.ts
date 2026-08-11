@@ -242,7 +242,7 @@ describe('visionFallback.executePassThrough', () => {
     return new TextEncoder().encode(s);
   }
 
-  it('fires the routing disclosure notification before streaming', async () => {
+  it('fires the routing disclosure annotation before streaming', async () => {
     const { AuthManager } = await import('../../src/auth.js');
     const ctx = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
     const authManager = new AuthManager(ctx);
@@ -279,13 +279,15 @@ describe('visionFallback.executePassThrough', () => {
       connections,
     });
 
+    // ArchCom 0011b — routing disclosure is now an inline annotation
+    // via progress.report (not a popup). Check the progress reports
+    // contain the routing note.
+    const allText = progress.parts
+      .map((p) => (p instanceof vscode.LanguageModelTextPart ? p.value : ''))
+      .join('');
     assert.ok(
-      infoMessages.some((m) => m.startsWith('Vision fallback: answered by')),
-      `expected a routing disclosure notification, got: ${JSON.stringify(infoMessages)}`,
-    );
-    assert.ok(
-      infoMessages.some((m) => m.includes('could not handle image')),
-      'notification must mention the primary could not handle the image',
+      allText.includes('🖼️') && allText.includes('gemma3'),
+      `expected a routing disclosure annotation in progress, got: ${JSON.stringify(allText)}`,
     );
   });
 

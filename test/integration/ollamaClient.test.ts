@@ -109,7 +109,8 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 
-  it('fires onError when the stream stalls (inactivity timeout, no chunks)', async function () {
+  // ArchCom 0011c — inactivity timer permanently disabled; re-enable only if timer is restored (see ADR 0005 / 0011c)
+  it.skip('fires onError when the stream stalls (inactivity timeout, no chunks)', async function () {
     // ADR 0005 — a hung connection (fetch resolves, no chunks) is
     // detected by the inactivity timer. We set inactivity to 1000ms;
     // the resolver accepts below-minimum values (package.json enforces
@@ -437,7 +438,8 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
     global.fetch = originalFetch;
   });
 
-  it('mid-stream stall (chunk, then long gap) aborts without retry', async function () {
+  // ArchCom 0011c — inactivity timer permanently disabled; re-enable only if timer is restored (see ADR 0005 / 0011c)
+  it.skip('mid-stream stall (chunk, then long gap) aborts without retry', async function () {
     // Emit 1 chunk, then 90s gap (inactivity=1000ms test). Assert
     // onError with "stalled" and NO retry (fetch called once).
     this.timeout(5000);
@@ -486,7 +488,8 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
     global.fetch = originalFetch;
   });
 
-  it('first-token timeout (fetch resolves, 0 chunks) → onError', async function () {
+  // ArchCom 0011c — inactivity timer permanently disabled; re-enable only if timer is restored (see ADR 0005 / 0011c)
+  it.skip('first-token timeout (fetch resolves, 0 chunks) → onError', async function () {
     // fetch resolves, stream never emits, inactivity=500ms fires.
     this.timeout(5000);
 
