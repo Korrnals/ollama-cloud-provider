@@ -99,6 +99,24 @@ export function activate(context: vscode.ExtensionContext): void {
   logger.setDebugMode(debugEnabled);
   logger.info(`Activating Ollama Cloud extension (debug=${debugEnabled}).`);
 
+  // Auto-show the Output panel when the user enables debug logging
+  // mid-session. `setDebugMode(true)` already calls `channel.show()`,
+  // but a config-change listener ensures the panel is surfaced even
+  // if the toggle happens via settings.json edit (no command palette).
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('ollamaCloud.debug')) {
+        const nowEnabled = vscode.workspace
+          .getConfiguration('ollamaCloud')
+          .get<boolean>('debug', false);
+        logger.setDebugMode(nowEnabled);
+        if (nowEnabled) {
+          logger.show();
+        }
+      }
+    }),
+  );
+
   try {
     const provider = new OllamaCloudChatProvider(context);
 
@@ -132,6 +150,9 @@ export function activate(context: vscode.ExtensionContext): void {
       ),
       vscode.commands.registerCommand('ollamaCloud.switchEndpoint', () =>
         provider.switchEndpoint(),
+      ),
+      vscode.commands.registerCommand('ollamaCloud.collectDiagnostics', () =>
+        provider.collectDiagnostics(),
       ),
       vscode.lm.registerLanguageModelChatProvider('ollama-cloud', provider),
     );
