@@ -3,6 +3,17 @@ import * as vscode from 'vscode';
 import { OllamaClient } from '../../src/ollamaClient.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 
+/** Typed view of a stubbed global.fetch — carries restore metadata. */
+type FetchStub = typeof fetch & {
+  __isStub?: boolean;
+  __original?: typeof fetch;
+};
+
+/** ReadableStream controller with test-only interval metadata. */
+type TestableStreamController = ReadableStreamDefaultController<Uint8Array> & {
+  _testInterval?: ReturnType<typeof setInterval>;
+};
+
 const BASE_URL = 'https://ollama.com/v1';
 
 function setConfig(values: Record<string, unknown>): void {
@@ -105,7 +116,7 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
   });
 
   afterEach(() => {
-    const stub = global.fetch as any;
+    const stub = global.fetch as FetchStub;
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 
@@ -330,7 +341,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
   });
 
   afterEach(() => {
-    const stub = global.fetch as any;
+    const stub = global.fetch as FetchStub;
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 
@@ -555,7 +566,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
           );
         }, 50);
         // Clean up after the test aborts the stream.
-        (controller as any)._testInterval = interval;
+        (controller as TestableStreamController)._testInterval = interval;
       },
     });
 
@@ -576,8 +587,9 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
     assert.match(recorder.errors[0]!.message, /max stream duration/);
     assert.equal(recorder.doneCount, 0);
 
-    if ((streamController as any)?._testInterval) {
-      clearInterval((streamController as any)._testInterval);
+    if (streamController) {
+      const interval = (streamController as TestableStreamController)._testInterval;
+      if (interval) clearInterval(interval);
     }
     global.fetch = originalFetch;
   });
@@ -696,7 +708,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
             encode('data: {"choices":[{"delta":{"content":"x"}}]}\n'),
           );
         }, 50);
-        (controller as any)._testInterval = interval;
+        (controller as TestableStreamController)._testInterval = interval;
       },
     });
 
@@ -720,8 +732,9 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       'legacy requestTimeoutMs maps to maxDuration error',
     );
 
-    if ((streamController as any)?._testInterval) {
-      clearInterval((streamController as any)._testInterval);
+    if (streamController) {
+      const interval = (streamController as TestableStreamController)._testInterval;
+      if (interval) clearInterval(interval);
     }
     global.fetch = originalFetch;
   });
@@ -832,7 +845,7 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
   });
 
   afterEach(() => {
-    const stub = global.fetch as any;
+    const stub = global.fetch as FetchStub;
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
   });
 

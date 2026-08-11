@@ -331,7 +331,11 @@ describe('modelConfiguration.getModelConfigurationSchema', () => {
     const model = makeModel('deepseek', 'deepseek-v4-pro');
     const schema = getModelConfigurationSchema(model);
     assert.ok(schema);
-    assert.ok('reasoningEffort' in schema!.properties, 'deepseek-v4 schema has reasoningEffort'); assert.equal((schema!.properties as any).reasoningEffort.enum[0], 'none');
+    assert.ok('reasoningEffort' in schema!.properties, 'deepseek-v4 schema has reasoningEffort'); assert.equal(
+        (schema!.properties as { reasoningEffort: { enum: readonly string[] } })
+          .reasoningEffort.enum[0],
+        'none',
+      );
   });
 
   it('returns boolean thinking schema for deepseek v3.1', () => {

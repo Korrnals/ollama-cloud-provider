@@ -3,6 +3,12 @@ import * as vscode from 'vscode';
 import { AuthManager } from '../../src/auth.js';
 import { performHealthCheck } from '../../src/healthCheck.js';
 
+/** Typed view of a stubbed global.fetch — carries restore metadata. */
+type FetchStub = typeof fetch & {
+  __isStub?: boolean;
+  __original?: typeof fetch;
+};
+
 const API_KEY_SECRET = 'ollamaCloud.apiKey';
 const BASE_URL = 'https://ollama.com/v1';
 
@@ -59,7 +65,7 @@ describe('healthCheck.performHealthCheck — gates', () => {
   });
 
   afterEach(() => {
-    const stub = global.fetch as any;
+    const stub = global.fetch as FetchStub;
     if (stub.__isStub) global.fetch = stub.__original ?? global.fetch;
   });
 

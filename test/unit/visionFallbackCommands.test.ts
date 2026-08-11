@@ -5,6 +5,7 @@ import {
   pickVisionFallbackConnection,
 } from '../../src/visionFallbackCommands.js';
 import type { ModelDefinition } from '../../src/modelCatalog.js';
+import type { OllamaCloudChatProvider } from '../../src/provider.js';
 
 /**
  * Unit tests for the Vision Fallback command handlers (ADR 0004).
@@ -136,14 +137,14 @@ describe('pickVisionFallbackModel — QuickPick command handler', () => {
   it('writes the selected model id to visionFallback.model (Global target)', async () => {
     const visionModel = makeModel('ollama-cloud/gemma3:12b', 'gemma3:12b', true);
     const provider = makeProvider([visionModel]);
-    vscode.window.showQuickPick = (async (items: any) => {
+    vscode.window.showQuickPick = (async (items: readonly vscode.QuickPickItem[]) => {
       // First item carries the model id — return it.
-      return (items as ReadonlyArray<unknown>)[0];
+      return items[0];
     }) as unknown as typeof vscode.window.showQuickPick;
 
     const spy = spyConfigUpdates();
     try {
-      await pickVisionFallbackModel(provider as any);
+      await pickVisionFallbackModel(provider as OllamaCloudChatProvider);
     } finally {
       spy.restore();
     }
@@ -170,7 +171,7 @@ describe('pickVisionFallbackModel — QuickPick command handler', () => {
 
     const spy = spyConfigUpdates();
     try {
-      await pickVisionFallbackModel(provider as any);
+      await pickVisionFallbackModel(provider as OllamaCloudChatProvider);
     } finally {
       spy.restore();
     }
@@ -191,7 +192,7 @@ describe('pickVisionFallbackModel — QuickPick command handler', () => {
 
     const spy = spyConfigUpdates();
     try {
-      await pickVisionFallbackModel(provider as any);
+      await pickVisionFallbackModel(provider as OllamaCloudChatProvider);
     } finally {
       spy.restore();
     }
@@ -237,9 +238,10 @@ describe('pickVisionFallbackConnection — QuickPick command handler', () => {
   it('writes the selected connection id to visionFallback.connection (Global target)', async () => {
     // The synthesised cloud connection appears alongside any explicit
     // connections. We pick the first non-"Clear" item.
-    vscode.window.showQuickPick = (async (items: any) => {
-      const list = items as ReadonlyArray<{ connectionId: string }>;
-      return list.find((item) => item.connectionId !== '') ?? null;
+    vscode.window.showQuickPick = (async (
+      items: readonly (vscode.QuickPickItem & { connectionId: string })[],
+    ) => {
+      return items.find((item) => item.connectionId !== '') ?? null;
     }) as unknown as typeof vscode.window.showQuickPick;
 
     const spy = spyConfigUpdates();
@@ -266,9 +268,10 @@ describe('pickVisionFallbackConnection — QuickPick command handler', () => {
   });
 
   it('writes an empty string when the user selects the "Clear" option', async () => {
-    vscode.window.showQuickPick = (async (items: any) => {
-      const list = items as ReadonlyArray<{ connectionId: string }>;
-      return list.find((item) => item.connectionId === '') ?? null;
+    vscode.window.showQuickPick = (async (
+      items: readonly (vscode.QuickPickItem & { connectionId: string })[],
+    ) => {
+      return items.find((item) => item.connectionId === '') ?? null;
     }) as unknown as typeof vscode.window.showQuickPick;
 
     const spy = spyConfigUpdates();
