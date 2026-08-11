@@ -143,7 +143,7 @@ export class ResponsesClient {
       line: string,
       ctx: StreamLineContext,
     ): boolean => {
-      return processResponsesLine(
+      const result = processResponsesLine(
         line,
         callbacks,
         ctx.resetInactivity,
@@ -152,6 +152,11 @@ export class ResponsesClient {
         },
         () => pendingEvent,
       );
+      // ArchCom 0011c: mark as parsed for meaningful lines.
+      if (line.trim() && !line.startsWith(':')) {
+        ctx.markParsed();
+      }
+      return result;
     };
 
     // ADR 0010 — delegate the invariant streaming lifecycle to the
@@ -172,9 +177,6 @@ export class ResponsesClient {
         headers,
         body,
         cancellationToken,
-        // Sidecar probe (ArchCom 0011): probe the server when inactivity fires.
-        probeUrl: this.responsesUrl().replace(/\/responses$/, ''),
-        probeHeaders: { ...headers },
         processLine: processResponsesLineForStream,
       },
       callbacks,

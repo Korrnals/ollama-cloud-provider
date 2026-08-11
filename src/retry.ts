@@ -172,11 +172,33 @@ export function isSocketCloseError(error: unknown): boolean {
   }
   // Node system-error `code` (libuv): the socket layer closed abruptly.
   const code = (error as { code?: unknown }).code;
-  if (
-    typeof code === 'string' &&
-    SOCKET_CLOSE_CODES.has(code)
-  ) {
-    return true;
+  if (typeof code === 'string') {
+    if (SOCKET_CLOSE_CODES.has(code)) {
+      return true;
+    }
+    // ArchCom 0011c (PA finding — DNS/TLS raw stack traces): DNS
+    // failure (ENOTFOUND) and TLS errors are network-layer failures
+    // that should be classified (clean user message via
+    // classifyStreamError's isSocketCloseError branch) rather than
+    // surfaced as raw stack traces. They are PERMANENT — not retried
+    // (defaultRetryOn only retries isSocketCloseError at the connect
+    // phase for transient codes; ENOTFOUND/TLS classified here still
+    // reach retry, but typically only at connect where retry is safe).
+    // TLS error codes: DNS (ENOTFOUND) is already covered by
+    // SOCKET_CLOSE_CODES above. The remaining TLS errors come in
+    // several prefixes from Node's `tls` and OpenSSL layers; some
+    // OpenSSL cert-verification reason codes (e.g.
+    // UNABLE_TO_VERIFY_LEAF_SIGNATURE) share no common prefix, so they
+    // are listed explicitly.
+    if (
+      code.startsWith('CERT_') ||
+      code.startsWith('ERR_TLS_') ||
+      code.startsWith('ERR_SSL_') ||
+      code.startsWith('DEPTH_ZERO_') ||
+      TLS_CERT_VERIFY_CODES.has(code)
+    ) {
+      return true;
+    }
   }
   const message = error.message ?? '';
   // Message-substring detection for the Node HTTP client's own abort
@@ -203,6 +225,27 @@ const SOCKET_CLOSE_CODES = new Set([
   'ENETUNREACH', // network unreachable
   'ETIMEDOUT', // connect/operation timed out at the socket layer
   'EAI_AGAIN', // DNS temporary failure
+  // ArchCom 0011c (PA finding — DNS raw stack traces): ENOTFOUND is a
+  // DNS resolution failure (hostname does not resolve). Permanent, not
+  // transient — but it IS a network-layer error that should reach the
+  // isSocketCloseError branch in classifyStreamError for a clean user
+  // message instead of a raw stack trace.
+  'ENOTFOUND',
+]);
+
+/**
+ * OpenSSL TLS certificate-verification reason codes that share no
+ * common prefix with the `CERT_*` / `ERR_TLS_*` / `ERR_SSL_*` /
+ * `DEPTH_ZERO_*` families. ArchCom 0011c — these surface as raw stack
+ * traces to the user unless classified here. Sourced from Node's `tls`
+ * layer (which surfaces the OpenSSL verify result as the error `code`).
+ */
+const TLS_CERT_VERIFY_CODES = new Set([
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE', // incomplete cert chain / untrusted intermediate
+  'UNABLE_TO_GET_ISSUER_CERT', // issuer cert not found
+  'CERT_SIGNATURE_FAILURE', // invalid cert signature
+  'CRL_HAS_EXPIRED', // certificate revocation list expired
+  'CRL_SIGNATURE_FAILURE', // CRL signature invalid
 ]);
 
 /**

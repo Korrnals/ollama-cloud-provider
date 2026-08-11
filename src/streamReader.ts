@@ -88,13 +88,12 @@ import {
 const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
 const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 60000;
 
+// ArchCom 0011c — inactivity timer disabled permanently.
+// Constants retained for resolveInactivityTimeoutMs() backward-compat
+// (the setting was removed from package.json but resolveInactivityMs
+// still returns a value; the timer itself never fires).
 const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
 const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 300000;
-// v0.9.0 — soft threshold: when the inactivity timer first fires at this
-// duration, instead of killing the stream, we log a warning and extend
-// to the full inactivityTimeoutMs grace period. Only the SECOND fire
-// (hard kill) aborts. Must be <= REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS.
-const REQUEST_INACTIVITY_SOFT_THRESHOLD_MS = 120000;
 
 const REQUEST_MAX_DURATION_MAX_MS = 3600000;
 const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
@@ -117,12 +116,16 @@ const MAX_SSE_BUFFER_BYTES = 1048576;
 
 /**
  * Context passed to the line-processing callback on each line. Provides
- * the `resetInactivity` function so keep-alive comments (`: keep-alive`)
- * can reset the inactivity timer — the callback decides whether a line
- * is a keep-alive, the module owns the timer.
+ * the `resetInactivity` function (no-op since ArchCom 0011c) and
+ * `markParsed` for the empty-response detection: the callback calls
+ * `markParsed()` when it successfully parses a meaningful chunk (data
+ * line, event, etc.), so the module can distinguish "bytes arrived but
+ * none were valid" (e.g. HTML captive portal at 200) from a real
+ * successful stream.
  */
 export interface StreamLineContext {
   resetInactivity: () => void;
+  markParsed: () => void;
 }
 
 /**
@@ -168,16 +171,8 @@ export interface StreamReaderOptions {
   /** Serialized request body. */
   body: string;
   /** Optional caller cancellation token (VS Code CancellationToken). */
-  cancellationToken?: CancellationToken;    /**
-     * Base URL for sidecar health-check probe (ArchCom 0011). When set,
-     * the inactivity soft-threshold fires a `GET {probeUrl}/v1/models`
-     * request instead of blindly extending grace. Probe success →
-     * extend grace 5 min (max 3 extensions). Probe fail (N=2
-     * consecutive) → kill. 429 → neutral (extend grace).
-     */
-    probeUrl?: string;
-    /** Auth headers for the sidecar probe (same as streaming request). */
-    probeHeaders?: Record<string, string>;  /** Line-processing callback — the endpoint-specific parser. */
+  cancellationToken?: CancellationToken;
+  /** Line-processing callback — the endpoint-specific parser. */
   processLine: StreamLineProcessor;
   /** Optional finalizer for clean stream-end (compat flushToolCalls). */
   finalize?: StreamFinalizer;
@@ -210,7 +205,7 @@ export async function readStream(
   const maxDurationMs = resolveMaxDurationMs();
 
   logger.debug(
-    `${logTag}: readStream START — connect=${connectTimeoutMs}ms, inactivity=${inactivityTimeoutMs}ms, maxDuration=${maxDurationMs}ms, probeUrl=${options.probeUrl ?? 'none'}`,
+    `${logTag}: readStream START — connect=${connectTimeoutMs}ms, inactivity=${inactivityTimeoutMs}ms, maxDuration=${maxDurationMs}ms`,
   );
 
   // Tagged abort reason — the catch block routes by this tag to emit
@@ -242,58 +237,32 @@ export async function readStream(
   // models that go silent between the reasoning phase and token
   // emission without being truly dead.
   let inactivityHandle: ReturnType<typeof setTimeout> | undefined;
-  let inactivitySoftFired = false;
+  // ArchCom 0011c — inactivity timer DISABLED permanently.
+  //
+  // Evidence (ArchCom 0011b + 0011c):
+  //   - Inactivity timer killed working streams during LLM reasoning
+  //     pauses — false-positive machine, crashed subagents, froze
+  //     terminals. Empirical fact, not theory.
+  //   - Researcher confirmed: Continue and Cline do NOT use
+  //     inactivity timers — they trust user AbortController + server
+  //     close + OS TCP keepalive.
+  //   - TCP keepalive added in httpClient.ts (setKeepAlive(true, 30000))
+  //     provides OS-level dead connection detection.
+  //   - SSE noted keepalive doesn't pierce nginx proxy_read_timeout,
+  //     but that risk is unproven for Ollama Cloud; if it manifests,
+  //     we'll see ConnectionInterruptedError and add a targeted fix.
+  //
+  // resetInactivity is a no-op: timer never starts, abortReason
+  // 'inactivity' never fires. Max-duration (30min) remains as the
+  // only safety cap.
+  //
+  // The inactivity soft/grace/short-timeout machinery is DISABLED via
+  // no-op — NOT deleted. The dead code (resetInactivity, clearInactivity,
+  // inactivityHandle, the REQUEST_INACTIVITY_TIMEOUT_* constants, and
+  // resolveInactivityTimeoutMs) is RETAINED for v0.12.0 re-evaluation.
+  // Do NOT re-enable without revisiting ArchCom 0011c first.
   const resetInactivity = (): void => {
-    if (inactivityHandle !== undefined) {
-      clearTimeout(inactivityHandle);
-    }
-    inactivitySoftFired = false;
-    // Short-timeout path: when the configured inactivity timeout is
-    // at or below the soft threshold (tests, or users who explicitly
-    // want a short timeout), fire HARD directly at the configured
-    // duration. No soft extension — this is the pre-v0.9.0 behaviour
-    // for short timeouts and keeps a short test budget satisfied.
-    if (inactivityTimeoutMs <= REQUEST_INACTIVITY_SOFT_THRESHOLD_MS) {
-      inactivityHandle = setTimeout(() => {
-        abortReason = 'inactivity';
-        logger.error(
-          `${logTag}: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-        );
-        controller.abort();
-      }, inactivityTimeoutMs);
-      return;
-    }
-    // Long-timeout path: soft threshold + grace extension. The FIRST
-    // fire at the soft threshold logs a warning and extends the timer
-    // to the full `inactivityTimeoutMs` grace period (300s default).
-    // Only the SECOND fire hard-kills the stream.
-    inactivityHandle = setTimeout(() => {
-      if (!inactivitySoftFired) {
-        // Soft fire — extend to the full grace period.
-        inactivitySoftFired = true;
-        if (inactivityHandle !== undefined) {
-          clearTimeout(inactivityHandle);
-        }
-        logger.warn(
-          `${logTag}: stream stalled for ${REQUEST_INACTIVITY_SOFT_THRESHOLD_MS}ms — extending to ${inactivityTimeoutMs}ms grace period`,
-        );
-        inactivityHandle = setTimeout(() => {
-          abortReason = 'inactivity';
-          logger.error(
-            `${logTag}: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-          );
-          controller.abort();
-        }, inactivityTimeoutMs);
-        return;
-      }
-      // Should not reach here — the soft-fire callback re-arms with a
-      // fresh timer; this branch is defensive.
-      abortReason = 'inactivity';
-      logger.error(
-        `${logTag}: stream stalled for ${inactivityTimeoutMs}ms after ${chunksReceived} chunk(s)`,
-      );
-      controller.abort();
-    }, REQUEST_INACTIVITY_SOFT_THRESHOLD_MS);
+    // No-op — inactivity timer disabled (ArchCom 0011c).
   };
   const clearInactivity = (): void => {
     if (inactivityHandle !== undefined) {
@@ -307,6 +276,11 @@ export async function readStream(
   // connect/first-token (0 chunks) from mid-stream (>0 chunks) for
   // error messages. NOT used for retry decisions (no retry regardless).
   let chunksReceived = 0;
+  // ArchCom 0011c (SSE finding #1): track parsed (meaningful) chunks
+  // separately from raw bytes received. If bytes arrive but none parse
+  // (e.g. HTML captive portal at 200), parsedChunks stays 0 → we surface
+  // an error instead of a silent empty success.
+  let parsedChunks = 0;
 
   // Combine the caller's CancellationToken with our timers. See the
   // race note below — a cancel that arrived during async setup before
@@ -329,7 +303,10 @@ export async function readStream(
 
   // StreamLineContext passed to processLine — exposes resetInactivity
   // so keep-alive comments reset the inactivity timer.
-  const lineCtx: StreamLineContext = { resetInactivity };
+  const lineCtx: StreamLineContext = {
+    resetInactivity,
+    markParsed: () => { parsedChunks += 1; },
+  };
 
   try {
     // Issue 13 / ADR 0005 — retry the INITIAL CONNECTION only.
@@ -403,7 +380,48 @@ export async function readStream(
             const message = await extractErrorMessage(res);
             throw await httpErrorFromResponse(res, message);
           }
-          return res;
+          // ArchCom 0011c Fix 6 — probe the FIRST chunk inside the retry
+          // wrapper. ZeroByteSocketCloseError was classified retryable in
+          // retry.ts but never actually retried, because the 0-byte close
+          // only surfaces AFTER withRetry returns (once the body reader
+          // loop runs). Moving one read inside the wrapper turns the
+          // post-connect 0-byte close into a connect-phase error that
+          // `defaultRetryOn` retries. Safe per ADR 0005: 0 chunks = 0
+          // billed tokens, so retry does not double-bill.
+          if (!res.body) {
+            throw new Error(`${logTag} returned no response body.`);
+          }
+          const probeReader = res.body.getReader();
+          try {
+            const first = await probeReader.read();
+            if (first.done) {
+              // 200 + headers + immediate EOF = server closed before any
+              // chunk. Retryable: 0 chunks = 0 billed tokens.
+              throw new ZeroByteSocketCloseError();
+            }
+            // Data arrived — release the lock so the outer loop can
+            // re-acquire the reader and continue. Return the first chunk
+            // so it is processed, not lost.
+            probeReader.releaseLock();
+            return { response: res, firstChunk: first.value };
+          } catch (error) {
+            // Re-classify a raw socket-close during the probe as a
+            // retryable ZeroByteSocketCloseError (0 chunks). Our own
+            // ZeroByteSocketCloseError (thrown above) passes through.
+            if (error instanceof ZeroByteSocketCloseError) {
+              throw error;
+            }
+            // Release the lock on a failed probe so the stream tears down.
+            try {
+              probeReader.releaseLock();
+            } catch {
+              // Already released or locked elsewhere — ignore.
+            }
+            if (isSocketCloseError(error)) {
+              throw new ZeroByteSocketCloseError();
+            }
+            throw error;
+          }
         } catch (error) {
           // If the connect timer fired (and ONLY the connect timer),
           // surface a typed ConnectTimeoutError so defaultRetryOn can
@@ -434,23 +452,53 @@ export async function readStream(
       { retryOn },
     );
 
-    // fetch resolved — first byte of the response body is available.
-    // Start the inactivity timer. Clear any connect-phase abort tag so
-    // a later inactivity fire is not misread as a connect timeout.
+    // Fix 6 — withRetry now returns the response PLUS the first chunk
+    // it probed (to detect a 0-byte close inside the retry window).
+    // Seed the buffer + chunk counter with that first chunk so it is
+    // processed by the loop, not lost.
     if ((abortReason as AbortReason) === 'connect') {
       abortReason = null;
     }
     resetInactivity();
 
-    if (!response.body) {
+    if (!response.response.body) {
       throw new Error(`${logTag} returned no response body.`);
     }
 
-    const reader = response.body.getReader();
+    const reader = response.response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '';
+    // Fix 6 — the first chunk was already read inside withRetry. Decode
+    // it into the buffer and account for it so chunksReceived reflects
+    // reality (used by the empty-stream + captive-portal detection
+    // below).
+    let buffer = decoder.decode(response.firstChunk, { stream: true });
+    chunksReceived += 1;
+    resetInactivity();
+    // Fix 6 — the first chunk was probed inside withRetry. Apply the
+    // same buffer-cap + line-processing the loop applies to subsequent
+    // chunks so a single oversized first chunk is caught and its lines
+    // are parsed (not deferred until the post-loop flush).
+    if (buffer.length > MAX_SSE_BUFFER_BYTES) {
+      throw new Error(
+        `${logTag}: stream buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes without a newline; aborting to prevent unbounded memory growth.`,
+      );
+    }
+    {
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const stop = options.processLine(line, lineCtx);
+        if (stop) {
+          done = true;
+          break;
+        }
+      }
+    }
 
     while (true) {
+      if (done) {
+        break;
+      }
       if (cancellationToken?.isCancellationRequested) {
         controller.abort();
         break;
@@ -514,6 +562,16 @@ export async function readStream(
         callbacks.onError(new ZeroByteSocketCloseError());
         return;
       }
+      // ArchCom 0011c (SSE finding #1): bytes arrived but NONE parsed
+      // as meaningful data. Likely HTML captive portal, CDN error page,
+      // or proxy interception. Surface as error — do NOT silently
+      // return an empty success.
+      if (parsedChunks === 0) {
+        callbacks.onError(new Error(
+          `${logTag}: received ${chunksReceived} chunk(s) of data but none were valid stream events. This may indicate a captive portal, proxy error page, or server misconfiguration.`,
+        ));
+        return;
+      }
       // Clean stream end without a terminal line from the callback.
       // Run the optional finalizer (compat flushToolCalls) before
       // onDone. If no finalizer, onDone directly.
@@ -524,6 +582,17 @@ export async function readStream(
       }
     }
   } catch (error) {
+    // ArchCom 0011c (SSE finding #2 — socket leak): on non-abort
+    // errors (MidStreamError, buffer overrun, whitelist throw), the
+    // response.body reader is never cancelled, so the socket lingers
+    // until the server closes it or max-duration fires (30 min). Abort
+    // the controller here to tear down the socket via the existing
+    // abort → req.destroy() wire. Idempotent: if already aborted (e.g.
+    // inactivity/maxDuration path already ran), this is a no-op. This
+    // runs BEFORE the AbortError branch — for errors that ARE already
+    // AbortError the abort is a no-op, and the routing decisions below
+    // (onError vs onDone) are unchanged.
+    controller.abort();
     // Route by abortReason. Connect → onError (retry already
     // exhausted inside withRetry). Inactivity → onError (terminal,
     // no retry). MaxDuration → onError (terminal). Cancel → onDone.
@@ -575,6 +644,17 @@ export async function readStream(
     // excludes our own typed errors, so they never match this branch
     // and fall through to the final `callbacks.onError(error)`.
     if (isSocketCloseError(error)) {
+      // v0.11.0 Task 2 — debug diagnostics for socket-close errors.
+      // Distinguishes ECONNRESET (server RST) from EPIPE (write after
+      // remote close) from UND_ERR_SOCKET (undici socket hang up) when
+      // ollamaCloud.debug is enabled. Matches the error.code access
+      // idiom used by isSocketCloseError in retry.ts.
+      if (error instanceof Error) {
+        const errCode = (error as { code?: unknown }).code;
+        logger.debug(
+          `${logTag}: socket-close error — code=${typeof errCode === 'string' ? errCode : 'none'} name=${error.name} chunksReceived=${chunksReceived} message=${error.message}`,
+        );
+      }
       if (chunksReceived === 0) {
         callbacks.onError(new ZeroByteSocketCloseError());
       } else {
