@@ -209,9 +209,9 @@ export async function readStream(
   const inactivityTimeoutMs = resolveInactivityTimeoutMs();
   const maxDurationMs = resolveMaxDurationMs();
 
-  // Tagged abort reason — the catch block routes by this tag to emit
-  // the right user-facing message and to decide onDone vs onError.
-  type AbortReason =
+    logger.debug(
+      `${logTag}: readStream START — connect=${connectTimeoutMs}ms, inactivity=${inactivityTimeoutMs}ms, maxDuration=${maxDurationMs}ms, probeUrl=${options.probeUrl ?? 'none'}`,
+    );
     | 'connect'
     | 'inactivity'
     | 'maxDuration'

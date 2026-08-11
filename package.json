@@ -303,6 +303,11 @@
           "default": "off",
           "description": "Context filtering level (ADR 0007). `off` (default) sends the payload as-is. `safe` removes duplicate messages, empty content parts, and redundant tool definitions, and compacts system-prompt whitespace. `aggressive` adds context-window truncation, similar-message merging, and metadata stripping. Per-connection `contextFilter.level` in `ollamaCloud.connections` overrides this global setting (`off`/`safe`/`aggressive` override; `auto` inherits).",
           "scope": "application"
+        },
+        "ollamaCloud.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging for stream diagnostics. Logs all stream events, timer fires, probe calls, and socket state to the Ollama Cloud output channel."
         }
       }
     }
