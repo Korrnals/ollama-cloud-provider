@@ -8,19 +8,6 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ### Changed
 - _(nothing yet)_
 
-## [0.10.1] - 2026-08-10
-A diagnostics-focused patch release adding a debug mode for stream-event tracing. Cut to investigate the recurring `ConnectionInterruptedError` (server-side socket close vs client-side abort).
-
-### Added
-- **`ollamaCloud.debug` setting** — new boolean setting (default `false`) for stream diagnostics. When enabled, `Logger.debug()` outputs to the Ollama Cloud output channel with per-chunk stream events (line processing, timer config, probe calls).
-- **Socket-close diagnostic logging** — the stream reader catch block now distinguishes error paths: client abort (`AbortError` with reason), server-side socket close (0-chunk retryable vs partial-response terminal loss), logging `chunksReceived` + error name/message so the root cause is visible without a reproducer replay.
-
-### Fixed
-- **`AbortReason` type corruption (TS1109)** — the type had duplicate members after an edit corruption; restored with correct members (`connect | inactivity | maxDuration | cancel`). `Logger.debug()`, `setDebugMode()`, and `scope:application` on the setting were restored in the same fix.
-
-### Notes
-- **SemVer PATCH (0.10.0 → 0.10.1)** — additive diagnostics only, no behavior change for users with debug disabled. The diagnostic output this release added directly informed the inactivity-timer removal and captive-portal detection shipped in [0.11.0].
-
 ## [0.11.0] - 2026-08-11
 
 A reliability and security overhaul driven by Architectural Committee findings 0011b (timer architecture) and 0011c (broad quality review). Two rounds of code review passed clean (0 P0, 0 P1). 511 tests pass.
@@ -51,6 +38,19 @@ A reliability and security overhaul driven by Architectural Committee findings 0
 
 ### Notes
 - **Breaking-change justification (MINOR during 0.x)** — two settings were removed from the schema and the inactivity timer was architecturally disabled. The runtime still honours the legacy aliases, so existing user configs continue to work without edits. The `StreamReaderOptions` API-surface change affects only internal callers (no published extension API).
+
+## [0.10.1] - 2026-08-10
+A diagnostics-focused patch release adding a debug mode for stream-event tracing. Cut to investigate the recurring `ConnectionInterruptedError` (server-side socket close vs client-side abort).
+
+### Added
+- **`ollamaCloud.debug` setting** — new boolean setting (default `false`) for stream diagnostics. When enabled, `Logger.debug()` outputs to the Ollama Cloud output channel with per-chunk stream events (line processing, timer config, probe calls).
+- **Socket-close diagnostic logging** — the stream reader catch block now distinguishes error paths: client abort (`AbortError` with reason), server-side socket close (0-chunk retryable vs partial-response terminal loss), logging `chunksReceived` + error name/message so the root cause is visible without a reproducer replay.
+
+### Fixed
+- **`AbortReason` type corruption (TS1109)** — the type had duplicate members after an edit corruption; restored with correct members (`connect | inactivity | maxDuration | cancel`). `Logger.debug()`, `setDebugMode()`, and `scope:application` on the setting were restored in the same fix.
+
+### Notes
+- **SemVer PATCH (0.10.0 → 0.10.1)** — additive diagnostics only, no behavior change for users with debug disabled. The diagnostic output this release added directly informed the inactivity-timer removal and captive-portal detection shipped in [0.11.0].
 
 ## [0.10.0] - 2026-08-10
 
