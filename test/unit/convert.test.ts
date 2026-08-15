@@ -1,12 +1,16 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import {
+  convertMessagesToNative,
   convertMessagesToOpenAI,
   convertToolsToOpenAI,
   countOpenAIRequestChars,
   getMessageText,
 } from '../../src/convert.js';
-import type { OpenAICompatibleMessage } from '../../src/protocolTypes.js';
+import type {
+  NativeChatMessage,
+  OpenAICompatibleMessage,
+} from '../../src/protocolTypes.js';
 
 const { LanguageModelChatMessageRole, LanguageModelTextPart, LanguageModelToolCallPart, LanguageModelToolResultPart } =
   vscode;
@@ -80,6 +84,69 @@ describe('convert.convertMessagesToOpenAI', () => {
     assert.equal(result[0].role, 'assistant');
     assert.equal(result[0].content, '');
     assert.ok(result[0].tool_calls);
+  });
+});
+
+describe('convert.convertMessagesToNative', () => {
+  it('emits tool role for tool-result-only user message (P0 regression)', () => {
+    // VS Code delivers tool results as user-role messages whose only
+    // content part is a LanguageModelToolResultPart (text=''). The
+    // converter must emit the tool message and must NOT drop it, and
+    // must NOT emit an empty user entry either (length stays 1).
+    const result = convertMessagesToNative([
+      userMsg(
+        new LanguageModelToolResultPart('call-1', [
+          new LanguageModelTextPart('result text'),
+        ]),
+      ),
+    ]);
+    assert.equal(result.length, 1, 'tool result must survive, empty user entry must not be emitted');
+    const tool = result[0] as NativeChatMessage;
+    assert.equal(tool.role, 'tool');
+    assert.equal(tool.content, 'result text');
+    assert.equal(tool.tool_call_id, 'call-1');
+  });
+
+  it('drops empty user message with no tool results', () => {
+    const result = convertMessagesToNative([userMsg()]);
+    assert.equal(result.length, 0, 'empty user message must be dropped');
+  });
+
+  it('keeps both user text and tool result from one message', () => {
+    const result = convertMessagesToNative([
+      userMsg(
+        new LanguageModelTextPart('tool output follows'),
+        new LanguageModelToolResultPart('call-1', [
+          new LanguageModelTextPart('result text'),
+        ]),
+      ),
+    ]);
+    assert.equal(result.length, 2);
+    assert.deepEqual(result[0], { role: 'user', content: 'tool output follows' });
+    const tool = result[1] as NativeChatMessage;
+    assert.equal(tool.role, 'tool');
+    assert.equal(tool.content, 'result text');
+    assert.equal(tool.tool_call_id, 'call-1');
+  });
+
+  it('emits multiple tool results from one user message', () => {
+    const result = convertMessagesToNative([
+      userMsg(
+        new LanguageModelToolResultPart('call-1', [
+          new LanguageModelTextPart('result one'),
+        ]),
+        new LanguageModelToolResultPart('call-2', [
+          new LanguageModelTextPart('result two'),
+        ]),
+      ),
+    ]);
+    assert.equal(result.length, 2);
+    assert.equal(result[0].role, 'tool');
+    assert.equal((result[0] as NativeChatMessage).tool_call_id, 'call-1');
+    assert.equal((result[0] as NativeChatMessage).content, 'result one');
+    assert.equal(result[1].role, 'tool');
+    assert.equal((result[1] as NativeChatMessage).tool_call_id, 'call-2');
+    assert.equal((result[1] as NativeChatMessage).content, 'result two');
   });
 });
 

@@ -265,6 +265,14 @@ function toNativeImageBase64(part: vscode.LanguageModelDataPart): string {
  * Empty assistant messages (no text AND no tool calls) are dropped,
  * mirroring the compat converter (an empty assistant turn would break
  * the `messages[]` shape).
+ *
+ * Empty user/system messages (no text AND no images) are dropped —
+ * EXCEPT when they carry tool results. VS Code delivers tool results
+ * as user-role messages, so a tool-result-only user message must NOT
+ * be dropped: its (empty) user entry is skipped (native rejects empty
+ * content) and the tool results are emitted after the role chain as
+ * `role: 'tool'` messages — mirroring the compat converter contract:
+ * tool results survive even when the host message is empty.
  */
 export function convertMessagesToNative(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
@@ -333,13 +341,21 @@ export function convertMessagesToNative(
       // but keep a user message that has images even with empty text —
       // native accepts `content: ""` + `images: [...]`.
       if (!text && images.length === 0) {
-        // v0.11.0 Task 1 — DEBUG for parity with the compat converter.
-        logger.debug(
-          `convertNative: dropped empty ${role} message (parts=${message.content.length})`,
-        );
-        continue;
+        if (toolResults.length === 0) {
+          // v0.11.0 Task 1 — DEBUG for parity with the compat converter.
+          logger.debug(
+            `convertNative: dropped empty ${role} message (parts=${message.content.length})`,
+          );
+          continue;
+        }
+        // Tool-result-only user message (P0 fix): do NOT push an empty
+        // user entry (native rejects empty content) and do NOT drop the
+        // message — the tool results are emitted after the if/else
+        // chain below, mirroring the compat converter contract: tool
+        // results survive even when the host message is empty.
+      } else {
+        result.push(entry);
       }
-      result.push(entry);
     } else {
       // tool role — emitted below from toolResults.
       if (text) {
