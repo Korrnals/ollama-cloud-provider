@@ -433,7 +433,15 @@ NOTES_FILE="/tmp/release-notes-${VERSION}.md"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "  would write notes to: $NOTES_FILE"
 else
-  PREV_TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+  # Find the PREVIOUS release tag — must exclude the tag created in
+  # step 7 (this release). v0.12.0 incident: `git describe --abbrev=0`
+  # matched the just-created tag, producing an empty "commits since
+  # v0.12.0" range and a notes body with no changes. `git describe
+  # ${VERSION}^` anchors at the commit BEFORE this release's tag.
+  PREV_TAG="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)"
+  if [ "$PREV_TAG" = "$VERSION" ]; then
+    PREV_TAG=""
+  fi
   if [ -n "$PREV_TAG" ]; then
     LOG_RANGE="${PREV_TAG}..HEAD"
   else
