@@ -497,11 +497,16 @@ echo
 # ─── Step 9: Push tag ─────────────────────────────────────────────────────
 step 9 "Push tag $VERSION to origin"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "  would run: git push origin '$VERSION'"
+  echo "  would run: git push origin 'main' '$VERSION'"
 else
+  # Push main FIRST (fast-forward only — never force) so the release
+  # commits are reachable from the default branch. Pushing the tag alone
+  # leaves the repo front page on the previous release (v0.12.0 incident:
+  # tag-only push kept origin/main at 0.11.0 while the release existed).
+  git push origin main || fail 9 "git push main failed (not a fast-forward?)"
   git push origin "$VERSION" || fail 9 "git push tag failed"
 fi
-ok "Tag $VERSION pushed to origin"
+ok "main + tag $VERSION pushed to origin"
 echo
 
 # ─── Step 10: Create GitHub Release + upload artifacts ─────────────────────
