@@ -398,6 +398,210 @@ export function convertToolsToNative(
   }));
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0007 — context-filter-aware native `/api/chat` conversion.
+//
+// `convertMessagesToNative` (above) consumes VS Code
+// `LanguageModelChatRequestMessage[]` directly — the original source of
+// the request. When the context filter runs at `safe`/`aggressive`, the
+// filter operates on `OpenAICompatibleMessage[]` (the `/chat/completions`
+// shape) and produces a filtered array. The native path — the DEFAULT
+// endpoint for cloud (`auto` → native) — must consume the FILTERED
+// payload too, or the filter silently does nothing for default users.
+// This converter shapes the filtered `OpenAICompatibleMessage[]`
+// directly into the native `/api/chat` `messages[]` form without a
+// VS Code ↔ OpenAI round-trip, mirroring
+// `convertOpenAIMessagesToResponsesInput` for `/v1/responses`.
+//
+// Mapping differences from `convertOpenAIMessagesToResponsesInput`:
+//   - NO `instructions` hoist — native has no top-level instructions
+//     field, so system messages stay in place (native accepts multiple
+//     system messages, unlike `/v1/responses`).
+//   - `tool_calls[].function.arguments` is parsed from its JSON STRING
+//     into an OBJECT (native contract; the OpenAI shape carries a
+//     string). Parse failure → `{}` so a malformed argument string
+//     never breaks the request.
+//   - `role:'tool'` messages emit a native `tool` message (native HAS
+//     a tool role, unlike `/v1/responses`' `function_call_output`
+//     items) and are ALWAYS emitted — tool-call integrity (P0 lesson):
+//     tool results survive regardless of host-message emptiness; the
+//     filter may legitimately produce them from integrity enforcement.
+// ---------------------------------------------------------------------------
+
+/**
+ * ADR 0007 — converts filtered `OpenAICompatibleMessage[]` (the output
+ * of `filterContext`) into the native `/api/chat` message schema.
+ * Used by the provider when the context filter ran at
+ * `safe`/`aggressive` AND the selected endpoint is native `/api/chat`
+ * — so the filtered payload reaches all three endpoints without a
+ * VS Code ↔ OpenAI round-trip. See ADR 0007 § Provider integration
+ * point.
+ *
+ * Role mapping:
+ *   - `system` → `{ role:'system', content }` kept IN PLACE (no
+ *     `instructions` hoist — native accepts multiple system messages).
+ *   - `user` → `{ role:'user', content }`; part-array content keeps
+ *     `text` parts, image parts are skipped (defence-in-depth — vision
+ *     content never reaches this path: the vision gate routes image
+ *     requests before the filter).
+ *   - `assistant` → `{ role:'assistant', content, tool_calls? ,
+ *     reasoning_content? }`; `tool_calls[].function.arguments` is
+ *     `JSON.parse`d into an object (failure → `{}`). An assistant with
+ *     no text AND no tool calls is dropped (mirrors
+ *     `convertMessagesToNative`).
+ *   - `tool` → `{ role:'tool', content, tool_call_id? }` — ALWAYS
+ *     emitted, even with empty content (P0 tool-call-integrity
+ *     lesson: tool results survive regardless).
+ *
+ * Pure + stateless — same contract as `convertMessagesToNative`.
+ */
+export function convertOpenAIMessagesToNative(
+  messages: readonly OpenAICompatibleMessage[],
+): NativeChatMessage[] {
+  const result: NativeChatMessage[] = [];
+
+  for (const message of messages) {
+    const role = message.role;
+
+    if (role === 'tool') {
+      // ALWAYS emit — tool-call integrity (P0 lesson): tool results
+      // survive regardless of emptiness; the filter may legitimately
+      // produce them from integrity enforcement.
+      result.push({
+        role: 'tool',
+        content: openAIContentToNativeText(message.content),
+        ...(message.tool_call_id !== undefined
+          ? { tool_call_id: message.tool_call_id }
+          : {}),
+      });
+      continue;
+    }
+
+    const text = openAIContentToNativeText(message.content);
+
+    if (role === 'assistant') {
+      if (text || (message.tool_calls !== undefined && message.tool_calls.length > 0)) {
+        result.push({
+          role: 'assistant',
+          content: text || '',
+          ...(message.tool_calls !== undefined && message.tool_calls.length > 0
+            ? { tool_calls: convertToolCallsToNative(message.tool_calls) }
+            : {}),
+          ...(message.reasoning_content !== undefined
+            ? { reasoning_content: message.reasoning_content }
+            : {}),
+        });
+      } else {
+        // Mirror `convertMessagesToNative`: drop empty assistant turns.
+        logger.debug(
+          'convertOpenAIToNative: dropped empty assistant message after context filter',
+        );
+      }
+      continue;
+    }
+
+    // system | user — NO instructions hoist: native has no top-level
+    // instructions field, so system messages stay in place (first one
+    // included, and a second system message after filtering stays too
+    // — native accepts multiple system messages, unlike /v1/responses).
+    result.push({ role, content: text });
+  }
+
+  return result;
+}
+
+/**
+ * ADR 0007 — extracts the native text from a filtered message's
+ * `OpenAIChatContent`: string → itself; null/undefined → ""; part
+ * array → concatenated `text` parts. `image_url` parts are SKIPPED
+ * with a debug log — vision content never reaches this path by design
+ * (the vision gate routes image requests before the filter), so the
+ * log is defence-in-depth only.
+ */
+function openAIContentToNativeText(
+  content: OpenAICompatibleMessage['content'],
+): string {
+  if (content === null || content === undefined) {
+    return '';
+  }
+  if (typeof content === 'string') {
+    return content;
+  }
+  let text = '';
+  for (const part of content) {
+    if (part.type === 'text') {
+      text += part.text;
+    } else {
+      logger.debug(
+        'convertOpenAIToNative: dropped image part after context filter',
+      );
+    }
+  }
+  return text;
+}
+
+/**
+ * ADR 0007 — maps an OpenAI tool-call list (JSON-string arguments)
+ * onto the native shape (object arguments).
+ */
+function convertToolCallsToNative(
+  calls: readonly OpenAICompatibleToolCall[],
+): NativeChatToolCall[] {
+  return calls.map((call) => ({
+    id: call.id,
+    type: 'function',
+    function: {
+      name: call.function.name,
+      arguments: parseNativeArguments(call.function.arguments),
+    },
+  }));
+}
+
+/**
+ * ADR 0007 — parses a tool-call arguments JSON string into the object
+ * native `/api/chat` requires. Parse failure (or a non-object result)
+ * → `{}` — an unparseable argument string must not break the request;
+ * native receives an empty object instead.
+ */
+function parseNativeArguments(raw: string): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * ADR 0007 — context-filter-aware tool conversion for native
+ * `/api/chat`. Mirrors `convertToolsToNative` but reads the
+ * OpenAI-compatible tool shape (`OpenAICompatibleTool`, the
+ * post-filter form) instead of VS Code's `LanguageModelChatTool[]`,
+ * symmetric with `convertOpenAIToolsToResponses` for `/v1/responses`.
+ *
+ * Returns `undefined` when the tool list is empty so the request body
+ * omits the `tools` field entirely (same contract as
+ * `convertToolsToNative`).
+ */
+export function convertOpenAIToolsToNative(
+  tools: readonly OpenAICompatibleTool[] | undefined,
+): NativeChatTool[] | undefined {
+  if (!tools || tools.length === 0) {
+    return undefined;
+  }
+
+  return tools.map((tool) => ({
+    type: 'function',
+    function: {
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: tool.function.parameters,
+    },
+  }));
+}
+
 // NOTE: `convertToolsToResponses` lives in `convertResponses.ts`
 // (flat `/v1/responses` tool schema) — do NOT re-add it here.
 

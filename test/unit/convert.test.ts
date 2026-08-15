@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import {
   convertMessagesToNative,
   convertMessagesToOpenAI,
+  convertOpenAIMessagesToNative,
+  convertOpenAIToolsToNative,
   convertToolsToOpenAI,
   countOpenAIRequestChars,
   getMessageText,
@@ -10,6 +12,7 @@ import {
 import type {
   NativeChatMessage,
   OpenAICompatibleMessage,
+  OpenAICompatibleTool,
 } from '../../src/protocolTypes.js';
 
 const { LanguageModelChatMessageRole, LanguageModelTextPart, LanguageModelToolCallPart, LanguageModelToolResultPart } =
@@ -221,5 +224,146 @@ describe('convert.getMessageText', () => {
       new LanguageModelTextPart('bar'),
     );
     assert.equal(getMessageText(msg), 'foobar');
+  });
+});
+
+describe('convert.convertOpenAIMessagesToNative (ADR 0007 — filtered payload → native /api/chat)', () => {
+  it('passes system messages through in place (no instructions hoist)', () => {
+    // Native has no top-level `instructions` field — unlike
+    // /v1/responses, BOTH system messages stay in the messages list.
+    const result = convertOpenAIMessagesToNative([
+      { role: 'system', content: 'first system' },
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: 'second system' },
+    ]);
+    assert.equal(result.length, 3);
+    assert.deepEqual(result[0], { role: 'system', content: 'first system' });
+    assert.deepEqual(result[2], { role: 'system', content: 'second system' });
+  });
+
+  it('maps user string content', () => {
+    const result = convertOpenAIMessagesToNative([
+      { role: 'user', content: 'hello' },
+    ]);
+    assert.deepEqual(result, [{ role: 'user', content: 'hello' }]);
+  });
+
+  it('keeps text parts and skips image parts from part-array content', () => {
+    // Vision content never reaches this path by design (the vision
+    // gate routes image requests before the filter) — the image part
+    // is skipped without crashing (defence-in-depth).
+    const result = convertOpenAIMessagesToNative([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look at ' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,xxx' } },
+          { type: 'text', text: 'this' },
+        ],
+      },
+    ]);
+    assert.deepEqual(result, [{ role: 'user', content: 'look at this' }]);
+  });
+
+  it('parses assistant tool_calls arguments from JSON string to object', () => {
+    const result = convertOpenAIMessagesToNative([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call-1',
+            type: 'function',
+            function: { name: 'search', arguments: '{"q":"x"}' },
+          },
+        ],
+      },
+    ]);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].role, 'assistant');
+    const call = result[0].tool_calls![0];
+    assert.equal(call.id, 'call-1');
+    assert.equal(call.type, 'function');
+    assert.equal(call.function.name, 'search');
+    assert.deepEqual(call.function.arguments, { q: 'x' });
+  });
+
+  it('maps unparseable tool_calls arguments to {}', () => {
+    const result = convertOpenAIMessagesToNative([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call-1',
+            type: 'function',
+            function: { name: 't', arguments: '{not json' },
+          },
+        ],
+      },
+    ]);
+    assert.deepEqual(result[0].tool_calls![0].function.arguments, {});
+  });
+
+  it('always emits tool messages, including empty content (P0 tool-call integrity)', () => {
+    // The filter may legitimately produce empty tool results from
+    // integrity enforcement — they must survive to the wire.
+    const result = convertOpenAIMessagesToNative([
+      { role: 'tool', content: '', tool_call_id: 'call-1' },
+    ]);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].role, 'tool');
+    assert.equal(result[0].content, '');
+    assert.equal(result[0].tool_call_id, 'call-1');
+  });
+
+  it('emits tool message without tool_call_id when absent', () => {
+    const result = convertOpenAIMessagesToNative([
+      { role: 'tool', content: 'result' },
+    ]);
+    assert.deepEqual(result, [{ role: 'tool', content: 'result' }]);
+  });
+
+  it('drops assistant with no text and no tool_calls', () => {
+    const result = convertOpenAIMessagesToNative([
+      { role: 'assistant', content: '' },
+    ]);
+    assert.equal(result.length, 0, 'empty assistant must be dropped');
+  });
+
+  it('passes reasoning_content through on assistant messages', () => {
+    const result = convertOpenAIMessagesToNative([
+      { role: 'assistant', content: 'answer', reasoning_content: 'thinking...' },
+    ]);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].reasoning_content, 'thinking...');
+    assert.equal(result[0].content, 'answer');
+  });
+});
+
+describe('convert.convertOpenAIToolsToNative', () => {
+  it('maps the OpenAI nested function shape to the native shape', () => {
+    const tools: OpenAICompatibleTool[] = [
+      {
+        type: 'function',
+        function: {
+          name: 'search',
+          description: 'search the web',
+          parameters: { type: 'object' },
+        },
+      },
+    ];
+    const out = convertOpenAIToolsToNative(tools);
+    assert.ok(out);
+    assert.equal(out!.length, 1);
+    assert.equal(out![0].type, 'function');
+    assert.equal(out![0].function.name, 'search');
+    assert.equal(out![0].function.description, 'search the web');
+    assert.deepEqual(out![0].function.parameters, { type: 'object' });
+  });
+
+  it('returns undefined for empty or undefined tools', () => {
+    assert.equal(convertOpenAIToolsToNative(undefined), undefined);
+    assert.equal(convertOpenAIToolsToNative([]), undefined);
   });
 });

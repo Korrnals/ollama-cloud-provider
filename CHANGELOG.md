@@ -5,6 +5,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Fixed
+- **Context filter now applies to the native `/api/chat` path (ADR 0007 gap)** — native (the cloud default, `auto` → native) silently bypassed the filter: default cloud users got zero filtering and the `Context filter:` log line never fired. The filtered OpenAI payload now converts via the new `convertOpenAIMessagesToNative` / `convertOpenAIToolsToNative` (no VS Code ↔ OpenAI round-trip); the raw conversion path is preserved when the filter is `off`. `requestChars` is now accurate on the native path too. 12 tests added.
+
 ## [0.12.0] - 2026-08-12
 
 Root-cause fix for "extension disconnects / agent loops" + SSRF guard + UX improvements.

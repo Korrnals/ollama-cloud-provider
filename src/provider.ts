@@ -4,6 +4,8 @@ import {
   countOpenAIRequestChars,
   convertMessagesToOpenAI,
   convertMessagesToNative,
+  convertOpenAIMessagesToNative,
+  convertOpenAIToolsToNative,
   convertToolsToOpenAI,
   convertToolsToNative,
   getMessageText,
@@ -68,7 +70,13 @@ import {
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
-import type { OpenAICompatibleTool, UsageInfo } from './protocolTypes.js';
+import type {
+  NativeChatMessage,
+  NativeChatTool,
+  OpenAICompatibleMessage,
+  OpenAICompatibleTool,
+  UsageInfo,
+} from './protocolTypes.js';
 import { filterContext, type ContextFilterLevel } from './contextFilter.js';
 
 const AUTH_REQUIRED_DETAIL =
@@ -289,6 +297,54 @@ function resolveResponsesTools(
     return convertOpenAIToolsToResponses(filteredTools);
   }
   return convertToolsToResponses(originalTools);
+}
+
+/**
+ * ADR 0007 — resolves the native `/api/chat` `messages[]` array from
+ * the filter state. When the context filter ran (`filterReport !==
+ * undefined`, i.e. `safe`/`aggressive`), the filter produced a
+ * filtered `OpenAICompatibleMessage[]` (`filteredMessages`) — convert
+ * it directly to the native schema via
+ * `convertOpenAIMessagesToNative` (no VS Code ↔ OpenAI round-trip,
+ * symmetric with `convertOpenAIMessagesToResponsesInput` for
+ * `/v1/responses`). When the filter did NOT run (`off` fast path,
+ * `filterReport === undefined`), convert the ORIGINAL VS Code
+ * `messages` via `convertMessagesToNative` — the regression path is
+ * untouched.
+ *
+ * Without this, the native path — the DEFAULT endpoint for cloud
+ * (`auto` → native) — silently bypassed the filter: default users got
+ * zero filtering and the `Context filter:` log line never fired for
+ * them. `requestChars` (computed AFTER the filter) is now accurate
+ * for the native path too.
+ */
+function resolveNativeMessages(
+  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
+  filteredMessages: readonly OpenAICompatibleMessage[],
+  originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
+): NativeChatMessage[] {
+  if (filterReport !== undefined) {
+    return convertOpenAIMessagesToNative(filteredMessages);
+  }
+  return convertMessagesToNative(originalMessages);
+}
+
+/**
+ * ADR 0007 — resolves the native `/api/chat` `tools[]` array from the
+ * filter state; the native mirror of `resolveResponsesTools`. When
+ * the filter ran, convert the filtered `OpenAICompatibleTool[]`
+ * directly via `convertOpenAIToolsToNative`; when the filter is `off`,
+ * use the original `convertToolsToNative` conversion path.
+ */
+function resolveNativeTools(
+  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
+  filteredTools: readonly OpenAICompatibleTool[] | undefined,
+  originalTools: readonly vscode.LanguageModelChatTool[] | undefined,
+): NativeChatTool[] | undefined {
+  if (filterReport !== undefined) {
+    return convertOpenAIToolsToNative(filteredTools);
+  }
+  return convertToolsToNative(originalTools);
 }
 
 type ModelPickerInformation = vscode.LanguageModelChatInformation & {
@@ -1092,8 +1148,15 @@ export class OllamaCloudChatProvider
             'native',
             ssrfGuard,
           );
-          const nativeMessages = convertMessagesToNative(messages);
-          const nativeTools = convertToolsToNative(options.tools);
+          // ADR 0007 — native `/api/chat` consumes the FILTERED
+          // payload, mirroring the `/v1/responses` path above: when
+          // the filter ran, convert the filtered OpenAI messages/tools
+          // directly (no VS Code ↔ OpenAI round-trip); when the filter
+          // is `off`, the original conversion path runs unchanged.
+          // Before this, the native path — the DEFAULT for cloud
+          // (`auto` → native) — silently bypassed the filter.
+          const nativeMessages = resolveNativeMessages(filterReport, filteredMessages, messages);
+          const nativeTools = resolveNativeTools(filterReport, filteredTools, options.tools);
           const nativeConfig = resolveModelRequestConfiguration(model, modelOptions, 'native');
           await this.runStream(
             (callbacks) =>

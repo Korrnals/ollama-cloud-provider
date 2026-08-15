@@ -2158,6 +2158,9 @@ describe('OllamaCloudChatProvider — endpoint indicator tooltip (Issue #41)', (
  *       preserved through the provider into the request body.
  *   (d) merge refuses tool-bearing messages — a duplicate tool-call pair
  *       survives `safe` (integrity preserved through the provider).
+ *   (e) native `/api/chat` dispatch consumes the FILTERED payload — the
+ *       cloud DEFAULT endpoint (auto → native) no longer bypasses the
+ *       filter (ADR 0007 gap).
  */
 describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Finding 1)', () => {
   let originalFetch: typeof fetch;
@@ -2404,6 +2407,84 @@ describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Findi
       hasToolResult,
       'safe preserved the matching tool result (tool_call_id=call-1) — integrity held',
     );
+  });
+
+  it('(e) native dispatch consumes the filtered payload (ADR 0007 gap — auto→native default bypassed the filter)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Mirror (b): two near-duplicate user turns; per-connection `safe`
+    // drops the second as a duplicate. But the connection routes to
+    // NATIVE /api/chat — the cloud DEFAULT (auto → native) — which
+    // before the fix bypassed the filter entirely (the converter read
+    // the raw VS Code messages, so default cloud users got zero
+    // filtering and the `Context filter:` line never fired).
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      contextFilter: { level: 'off' },
+      connections: [
+        {
+          id: 'cloud',
+          type: 'cloud',
+          baseUrl: BASE_URL,
+          preferredEndpoint: 'native',
+          contextFilter: 'safe',
+        },
+      ],
+    });
+
+    // Native /api/chat streams ndjson (no `data:` prefix; terminal
+    // marker is done:true) — mirrors the (e) production-default
+    // routing test above.
+    const chunks = [
+      encode('{"message":{"content":"ok"}}\n'),
+      encode('{"done":true}\n'),
+    ];
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchBodies.push({ url, body });
+      return mockResponse(streamFromChunks(chunks));
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [userMsg('tell me a joke'), userMsg('tell me a joke')],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The filter ran on the NATIVE path — the `Context filter:` log
+    // line fired (before the fix it never fired for native dispatch).
+    assert.ok(
+      logged.some((line) => line.includes('Context filter:') && line.includes('level=safe')),
+      'native dispatch emitted a Context filter log line',
+    );
+    // Exactly one native dispatch to /api/chat.
+    assert.equal(fetchBodies.length, 1, 'one /api/chat request');
+    assert.ok(fetchBodies[0].url.endsWith('/api/chat'), 'routed to /api/chat (native)');
+    // The FILTERED payload reached the wire — the duplicate user turn
+    // was dropped by `safe` dedup, so the native body carries ONE
+    // message (before the fix it carried the raw two-message list).
+    const body = fetchBodies[0].body as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    assert.equal(
+      body.messages.length,
+      1,
+      `native body must carry the deduped list, expected 1 message, got ${body.messages.length}`,
+    );
+    assert.equal(body.messages[0].role, 'user');
+    assert.equal(body.messages[0].content, 'tell me a joke');
   });
 });
 

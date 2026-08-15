@@ -100,6 +100,11 @@ export interface NativeChatMessage {
   tool_call_id?: string;
   tool_calls?: NativeChatToolCall[];
   images?: string[];
+  // ADR 0007 — assistant reasoning content passes through the context
+  // filter untouched; `convertOpenAIMessagesToNative` forwards it so
+  // the native path preserves what the OpenAI-format payload carried
+  // (serialised verbatim by `buildNativeRequestBody`).
+  reasoning_content?: string;
 }
 
 export interface UsageInfo {

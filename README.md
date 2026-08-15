@@ -241,7 +241,7 @@ See [ADR 0006](docs/adr/0006-responses-endpoint-primary.md), [ADR 0008](docs/adr
 
 ## ✂️ Context filtering
 
-Long chat sessions and tool-heavy workflows re-send the same trailing context every turn, advertise duplicate tool definitions, and accumulate whitespace the model bills for but ignores. Context filtering is an optional pre-processing step that removes this structural redundancy from the payload **before** it reaches the convert step — lowering token cost while preserving the semantic content of the request and the quality of the response. It removes redundancy only (duplicates, empty parts, whitespace, ignorable metadata); it never removes meaning. Both `/v1/responses` and `/chat/completions` benefit, because the filter runs at the shared provider entry point before the endpoint-specific convert. See [ADR 0007](docs/adr/0007-context-filtering.md) for the full specification.
+Long chat sessions and tool-heavy workflows re-send the same trailing context every turn, advertise duplicate tool definitions, and accumulate whitespace the model bills for but ignores. Context filtering is an optional pre-processing step that removes this structural redundancy from the payload **before** it reaches the convert step — lowering token cost while preserving the semantic content of the request and the quality of the response. It removes redundancy only (duplicates, empty parts, whitespace, ignorable metadata); it never removes meaning. All three endpoints — native `/api/chat`, `/v1/responses`, and `/chat/completions` — benefit, because the filter runs at the shared provider entry point before the endpoint-specific convert. See [ADR 0007](docs/adr/0007-context-filtering.md) for the full specification.
 
 ### Levels
 
