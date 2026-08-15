@@ -23,10 +23,8 @@ import { logger } from './logger.js';
  */
 
 const DEFAULT_ALLOWED_BASE_URLS: readonly string[] = ['https://ollama.com/v1'];
-const REQUEST_CONNECT_TIMEOUT_MIN_MS = 5000;
-const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
-const REQUEST_MAX_DURATION_MIN_MS = 60000;
-const REQUEST_MAX_DURATION_MAX_MS = 3600000;
+const REQUEST_MAX_DURATION_MIN_MIN = 1;
+const REQUEST_MAX_DURATION_MAX_MIN = 1440;
 const MAX_RETRIES_MAX = 10;
 // MEDIUM-2 — reachability probe uses a short 10s timeout (mirrors
 // healthCheck.ts) NOT the full REQUEST_TIMEOUT_MAX_MS (10 min). A
@@ -54,16 +52,15 @@ export interface ValidationResult {
  *   2. API key set (SecretStorage or fallback config/env)
  *   3. baseUrl reachable (fetch /v1/models — bounded by
  *      VALIDATE_REACHABILITY_TIMEOUT_MS, NOT the request timers)
- *   4. requestConnectTimeoutMs valid (between 5000 and 120000)
- *   5. requestMaxDurationMs valid (between 60000 and 3600000)
- *   6. maxRetries valid (>= 0 when the key exists)
+ *   4. requestMaxDurationMin valid (between 1 and 1440 minutes)
+ *   5. maxRetries valid (>= 0 when the key exists)
  *
- * Note: `requestTimeoutMs` (legacy single-timer) and
- * `requestInactivityTimeoutMs` (ArchCom 0011c — disabled) are NOT
- * validated here. Both settings were removed from `package.json`;
- * validating them would read `undefined` from config and FAIL every
- * run. The connect + max-duration timers (the two that remain) are
- * validated in checks 4–5.
+ * Note: `requestTimeoutMs` (legacy single-timer),
+ * `requestConnectTimeoutMs`, and `requestInactivityTimeoutMs`
+ * (ArchCom 0011c — disabled) are NOT validated here. All three
+ * settings were removed from `package.json`; validating them would
+ * read `undefined` from config and FAIL every run. Only the single
+ * max-duration timer (ADR 0012 revised) is validated (check 4).
  *
  * The reachability check requires an API key — if the key is missing,
  * the reachability check is marked as skipped (not failed) because a
@@ -143,36 +140,24 @@ export async function validateConfiguration(
     message: reachableMessage,
   });
 
-  // ADR 0005 — Check 4/5: the two live streaming timers. The legacy
+  // ADR 0012 (revised) — single-timer validation. Connect + inactivity
+  // timers were removed; only requestMaxDurationMin remains. The user
+  // configures the ceiling in MINUTES (1–1440). The legacy
   // `requestTimeoutMs` (single-timer alias) and the disabled
   // `requestInactivityTimeoutMs` (ArchCom 0011c) are NOT validated —
-  // both settings were removed from package.json, so reading them
-  // would always return `undefined` and FAIL every validation run.
+  // both settings were removed from package.json.
   const config = vscode.workspace.getConfiguration('ollamaCloud');
-  const connectMs = config.get<number>('requestConnectTimeoutMs');
-  const connectValid =
-    typeof connectMs === 'number' &&
-    connectMs >= REQUEST_CONNECT_TIMEOUT_MIN_MS &&
-    connectMs <= REQUEST_CONNECT_TIMEOUT_MAX_MS;
-  checks.push({
-    name: 'requestConnectTimeoutMs valid',
-    passed: connectValid,
-    message: connectValid
-      ? `requestConnectTimeoutMs=${connectMs}`
-      : `requestConnectTimeoutMs=${connectMs} is outside [${REQUEST_CONNECT_TIMEOUT_MIN_MS}, ${REQUEST_CONNECT_TIMEOUT_MAX_MS}]`,
-  });
-
-  const maxDurationMs = config.get<number>('requestMaxDurationMs');
+  const maxDurationMin = config.get<number>('requestMaxDurationMin');
   const maxDurationValid =
-    typeof maxDurationMs === 'number' &&
-    maxDurationMs >= REQUEST_MAX_DURATION_MIN_MS &&
-    maxDurationMs <= REQUEST_MAX_DURATION_MAX_MS;
+    typeof maxDurationMin === 'number' &&
+    maxDurationMin >= REQUEST_MAX_DURATION_MIN_MIN &&
+    maxDurationMin <= REQUEST_MAX_DURATION_MAX_MIN;
   checks.push({
-    name: 'requestMaxDurationMs valid',
+    name: 'requestMaxDurationMin valid',
     passed: maxDurationValid,
     message: maxDurationValid
-      ? `requestMaxDurationMs=${maxDurationMs}`
-      : `requestMaxDurationMs=${maxDurationMs} is outside [${REQUEST_MAX_DURATION_MIN_MS}, ${REQUEST_MAX_DURATION_MAX_MS}]`,
+      ? `requestMaxDurationMin=${maxDurationMin}`
+      : `requestMaxDurationMin=${maxDurationMin} is outside [${REQUEST_MAX_DURATION_MIN_MIN}, ${REQUEST_MAX_DURATION_MAX_MIN}]`,
   });
 
   // Check 5 — maxRetries valid (only if the key is declared).

@@ -60,12 +60,22 @@ export class ResponsesClient {
    */
   private readonly connection: ConnectionConfig | undefined;
 
+  /**
+   * v0.12.0 ADR 0012 — optional SSRF guard, threaded to `readStream`.
+   * See `OllamaClient.ssrfGuard` for the full contract.
+   */
+  private readonly ssrfGuard:
+    | { assertUrlAllowed(url: string): Promise<void> }
+    | undefined;
+
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
     connection?: ConnectionConfig,
+    ssrfGuard?: { assertUrlAllowed(url: string): Promise<void> },
   ) {
     this.connection = connection;
+    this.ssrfGuard = ssrfGuard;
   }
 
   /**
@@ -178,6 +188,7 @@ export class ResponsesClient {
         body,
         cancellationToken,
         processLine: processResponsesLineForStream,
+        ssrfGuard: this.ssrfGuard,
       },
       callbacks,
     );

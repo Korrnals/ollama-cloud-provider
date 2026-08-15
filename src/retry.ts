@@ -46,24 +46,6 @@ export class HttpError extends Error {
 }
 
 /**
- * Connect-phase timeout — `fetch` did not return a `Response` within
- * `requestConnectTimeoutMs`. Retriable by `withRetry`: the wrapper
- * retries the whole `fetch` + status check, which is idempotent at the
- * connect boundary (no stream bytes were produced yet).
- *
- * See ADR 0005 § "Three timers" — connect (30s default, retry).
- */
-export class ConnectTimeoutError extends Error {
-  readonly timeoutMs: number;
-
-  constructor(timeoutMs: number) {
-    super(`Ollama Cloud: connect timeout after ${timeoutMs}ms`);
-    this.name = 'ConnectTimeoutError';
-    this.timeoutMs = timeoutMs;
-  }
-}
-
-/**
  * Mid-stream error — the server sent an error event or a non-OK status
  * surfaced after the response stream had already begun. Terminal, NOT
  * retriable: POST `/chat/completions` is not idempotent, retrying bills
@@ -101,8 +83,7 @@ export class ZeroByteSocketCloseError extends Error {
  * or more chunks had already been received. Terminal, NOT retriable:
  * POST `/chat/completions` is not idempotent and tokens were already
  * billed (ADR 0005 "No mid-stream retry"). Distinct from
- * {@link ZeroByteSocketCloseError} (0 chunks, retryable) and
- * {@link InactivityTimeoutError} (timeout, not socket close).
+ * {@link ZeroByteSocketCloseError} (0 chunks, retryable).
  *
  * This class closes the ADR 0008 Phase 2 priority-level-4 gap: a raw
  * Node socket-close Error (e.g. `aborted at TLSSocket.socketCloseListener`)
@@ -161,10 +142,8 @@ export function isSocketCloseError(error: unknown): boolean {
   // Our own typed errors are already classified — never reclassify.
   if (
     error instanceof HttpError ||
-    error instanceof ConnectTimeoutError ||
     error instanceof ZeroByteSocketCloseError ||
     error instanceof ConnectionInterruptedError ||
-    error instanceof InactivityTimeoutError ||
     error instanceof MaxDurationError ||
     error instanceof MidStreamError
   ) {
@@ -259,34 +238,14 @@ const SOCKET_CLOSE_MESSAGE_RE =
   /\b(read|write|connect) (ECONNRESET|ECONNREFUSED|EPIPE|EHOSTUNREACH|ENETUNREACH|ETIMEDOUT|EAI_AGAIN)\b/;
 
 /**
- * Mid-stream silence — no chunk AND no `: keep-alive` SSE comment for
- * `requestInactivityTimeoutMs` after the first byte arrived. Terminal,
- * NOT retriable: POST `/chat/completions` is not idempotent, retrying
- * bills the user twice (ADR 0001 provider-not-agent, ADR 0005
- * "No mid-stream retry").
- */
-export class InactivityTimeoutError extends Error {
-  readonly timeoutMs: number;
-  readonly chunksReceived: number;
-
-  constructor(timeoutMs: number, chunksReceived: number) {
-    super(
-      `Ollama Cloud: stream stalled for ${timeoutMs}ms after ${chunksReceived} chunk(s)`,
-    );
-    this.name = 'InactivityTimeoutError';
-    this.timeoutMs = timeoutMs;
-    this.chunksReceived = chunksReceived;
-  }
-}
-
-/**
- * Hard ceiling on total stream duration — `requestMaxDurationMs`
- * elapsed since `streamChat` entry, regardless of chunk activity.
+ * Hard ceiling on total stream duration — `requestMaxDurationMin`
+ * (configured in minutes, converted to ms internally) elapsed since
+ * `streamChat` entry, regardless of chunk activity.
  * Terminal, NOT retriable. Protects the user's token budget from
  * forgotten tabs / crashed callers (owner constraint: «бюджет,
  * недопустимо утекать»).
  *
- * See ADR 0005 § "Three timers" — max-duration (30 min, no retry).
+ * See ADR 0005 § "Three timers" — max-duration (default 60 min, no retry).
  */
 export class MaxDurationError extends Error {
   readonly timeoutMs: number;
@@ -343,12 +302,11 @@ export function isRetriableHttpStatus(status: number): boolean {
  * Default retriable-error predicate.
  *
  * Retry is **connect-phase only** (ADR 0005). Stream errors
- * (`InactivityTimeoutError`, `MaxDurationError`) are terminal —
- * POST `/chat/completions` is not idempotent, retrying mid-stream
- * bills the user twice and shows a duplicate prefix already shown.
+ * (`MaxDurationError`) are terminal — POST `/chat/completions` is not
+ * idempotent, retrying mid-stream bills the user twice and shows a
+ * duplicate prefix already shown.
  *
  * Retries on:
- * - {@link ConnectTimeoutError} — connect-phase timeout, retryable
  * - {@link ZeroByteSocketCloseError} — 0-byte socket close, retryable
  * - {@link HttpError} with status 429 or >= 500
  * - `TypeError` (fetch failed — network error, DNS, connection refused)
@@ -364,20 +322,13 @@ export function isRetriableHttpStatus(status: number): boolean {
  * Does NOT retry:
  * - {@link MidStreamError} — server-sent mid-stream error, terminal
  * - {@link ConnectionInterruptedError} — mid-stream socket close, terminal
- * - {@link InactivityTimeoutError} — mid-stream silence, terminal
  * - {@link MaxDurationError} — total-duration cap, terminal
  */
 export function defaultRetryOn(error: unknown): boolean {
-  if (error instanceof ConnectTimeoutError) {
-    return true;
-  }
   if (error instanceof ZeroByteSocketCloseError) {
     return true;
   }
   if (error instanceof ConnectionInterruptedError) {
-    return false;
-  }
-  if (error instanceof InactivityTimeoutError) {
     return false;
   }
   if (error instanceof MaxDurationError) {
@@ -451,7 +402,7 @@ export async function withRetry<T>(
       // class so the audit can correlate stream errors (logged in
       // `provider.ts runStream` as `class=...`) with the retry that
       // followed them. `HttpError` adds the status; other retriable
-      // errors (ConnectTimeoutError, AbortError) add only the class.
+      // errors (AbortError) add only the class.
       const errorClass = error instanceof Error ? error.constructor.name : 'unknown';
       const statusSuffix =
         error instanceof HttpError ? ` status=${error.status}` : '';

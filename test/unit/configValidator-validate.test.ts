@@ -59,7 +59,7 @@ describe('configValidator.validateConfiguration', () => {
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
       requestConnectTimeoutMs: 30000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 3,
     });
     delete process.env.OLLAMA_API_KEY;
@@ -88,7 +88,7 @@ describe('configValidator.validateConfiguration', () => {
       baseUrl: 'https://evil.example.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
       requestConnectTimeoutMs: 30000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 3,
     });
     // Also set an API key to prove reachability is STILL skipped
@@ -107,32 +107,12 @@ describe('configValidator.validateConfiguration', () => {
     );
   });
 
-  it('fails when requestConnectTimeoutMs is out of range', async () => {
-    // requestTimeoutMs (legacy single-timer alias) is no longer validated —
-    // the setting was removed from package.json. The live connect timer is
-    // requestConnectTimeoutMs; an out-of-range value must FAIL the check.
-    setConfig({
-      baseUrl: 'https://ollama.com/v1',
-      allowedBaseUrls: ['https://ollama.com/v1'],
-      requestConnectTimeoutMs: 1000, // below 5000 min
-      requestMaxDurationMs: 1800000,
-      maxRetries: 3,
-    });
-    const auth = makeAuthManager();
-    const result = await validateConfiguration(auth);
-    assert.equal(result.ok, false);
-    const connectCheck = result.checks.find(
-      (c) => c.name === 'requestConnectTimeoutMs valid',
-    );
-    assert.equal(connectCheck!.passed, false);
-  });
-
   it('fails when maxRetries is negative', async () => {
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
       requestConnectTimeoutMs: 30000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: -1,
     });
     const auth = makeAuthManager();
@@ -142,23 +122,22 @@ describe('configValidator.validateConfiguration', () => {
     assert.equal(retriesCheck!.passed, false);
   });
 
-  it('fails the suite on missing API key but reports reachability as skipped (6 checks emitted)', async () => {
+  it('fails the suite on missing API key but reports reachability as skipped (5 checks emitted)', async () => {
     setConfig({
       baseUrl: 'https://ollama.com/v1',
       allowedBaseUrls: ['https://ollama.com/v1'],
       maxRetries: 3,
-      requestConnectTimeoutMs: 30000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
     });
     const auth = makeAuthManager();
     const result = await validateConfiguration(auth);
     // Missing API key fails the "API key set" check, so the suite
-    // is not ok — but all 6 checks are still emitted: baseUrl, API key,
-    // reachable, connect timer, max-duration timer, maxRetries. The
-    // legacy requestTimeoutMs and the disabled requestInactivityTimeoutMs
-    // are NOT validated (both removed from package.json).
+    // is not ok — but all 5 checks are still emitted: baseUrl, API key,
+    // reachable, max-duration timer, maxRetries. ADR 0012 (revised)
+    // removed requestConnectTimeoutMs + requestInactivityTimeoutMs +
+    // legacy requestTimeoutMs — none are validated.
     assert.equal(result.ok, false);
-    assert.equal(result.checks.length, 6);
+    assert.equal(result.checks.length, 5);
     const reachCheck = result.checks.find((c) => c.name === 'baseUrl reachable');
     assert.ok(reachCheck, 'reachable check missing');
     assert.ok(

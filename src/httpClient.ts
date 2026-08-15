@@ -4,10 +4,9 @@
  * Problem: VS Code intercepts `global.fetch()` in the extension host.
  * When `chat.agent.sandbox.enabled: "on"`, the sandbox can block or
  * slow network egress. An intercepted `fetch()` never resolves → the
- * ADR 0005 connect timer fires → `ConnectTimeoutError` → `withRetry`
- * re-issues the SAME `fetch()` → same interception → same hang. Every
- * retry attempt is wasted because the transport is the bug, not the
- * remote endpoint.
+ * max-duration timer fires → `withRetry` re-issues the SAME `fetch()`
+ * → same interception → same hang. Every retry attempt is wasted
+ * because the transport is the bug, not the remote endpoint.
  *
  * Fix: use Node.js native `node:https` / `node:http` modules directly.
  * They are NOT intercepted by VS Code (the interception patches

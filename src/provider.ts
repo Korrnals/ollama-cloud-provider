@@ -57,6 +57,11 @@ import {
   isSocketCloseError,
 } from './retry.js';
 import {
+  SsrfBlockedError,
+  createProductionSsrfGuard,
+  type SsrfGuard,
+} from './ssrfGuard.js';
+import {
   loadConnections,
   nativeBaseUrl,
   openAiBaseUrl,
@@ -158,6 +163,14 @@ function endpointExplicitUnavailableError(
 export function classifyStreamError(error: unknown): Error {
   if (error instanceof MidStreamError) {
     return new Error(`Ollama Cloud: ${error.serverMessage}`);
+  }
+  // v0.12.0 ADR 0012 — SSRF guard blocked the URL. Surface a clean,
+  // actionable message. The raw `SsrfBlockedError` already carries a
+  // clean message (no stack), so pass it through. Classified as
+  // Blocked — the request was rejected by the extension's own security
+  // policy, not by the server.
+  if (error instanceof SsrfBlockedError) {
+    return vscode.LanguageModelError.Blocked(error.message);
   }
   if (error instanceof ZeroByteSocketCloseError) {
     // ADR 0008 Phase 3 — server closed before any chunk. Retryable at
@@ -688,7 +701,23 @@ export class OllamaCloudChatProvider
       const clientBaseUrl = connection
         ? openAiBaseUrl(connection)
         : this.authManager.getBaseUrl();
-      const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
+
+      // v0.12.0 ADR 0012 — SSRF guard. Defence-in-depth: the SEC-03
+      // string-whitelist check already ran in the client (assertBaseUrl
+      // AllowedOrThrow), but it cannot catch DNS-rebinding. The guard
+      // resolves the hostname to an IP right before fetch and rejects
+      // protected ranges (cloud metadata, RFC 1918, loopback, etc.).
+      // Local connections allow loopback (legitimate local Ollama);
+      // cloud connections reject it. Guard creation is cheap — one
+      // object allocation per request, no DNS resolution at construction.
+      // Declared early so the legacy `client` below (and all dispatch
+      // branches) can thread it through.
+      const isLocalConnection = connection?.type === 'local';
+      const ssrfGuard: SsrfGuard = isLocalConnection
+        ? createProductionSsrfGuard({ allowLoopback: true })
+        : createProductionSsrfGuard({ allowLoopback: false });
+
+      const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection, 'compat', ssrfGuard);
       const modelOptions = options as ModelConfigurationOptions;
       const requestConfiguration = resolveModelRequestConfiguration(
         model,
@@ -966,6 +995,7 @@ export class OllamaCloudChatProvider
             clientBaseUrl,
             apiKey ?? '',
             connection,
+            ssrfGuard,
           );
           // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
           // When the filter ran (`filterReport !== undefined`), shape
@@ -1060,6 +1090,7 @@ export class OllamaCloudChatProvider
             apiKey ?? '',
             endpointConnection,
             'native',
+            ssrfGuard,
           );
           const nativeMessages = convertMessagesToNative(messages);
           const nativeTools = convertToolsToNative(options.tools);
@@ -1133,6 +1164,7 @@ export class OllamaCloudChatProvider
             clientBaseUrl,
             apiKey ?? '',
             connection,
+            ssrfGuard,
           );
           // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
           // When the filter ran (`filterReport !== undefined`), shape
@@ -1261,6 +1293,7 @@ export class OllamaCloudChatProvider
             clientBaseUrl,
             apiKey ?? '',
             connection,
+            ssrfGuard,
           );
           // ADR 0007 — same filtered-payload routing as the primary
           // /v1/responses path above.

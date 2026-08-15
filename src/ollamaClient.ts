@@ -89,6 +89,12 @@ interface NativeChatChunk {
       function?: {
         name?: string;
         arguments?: Record<string, unknown>;
+        // Bug 2 fix — the server returns `function.index` inside
+        // tool_calls (confirmed via curl: glm-5.2 sends
+        // {"function":{"index":0,...}}). The field is informational
+        // for native (full-event, no delta accumulation) but must be
+        // present in the type for accuracy and forward-compat.
+        index?: number;
       };
     }>;
   };
@@ -123,14 +129,27 @@ export class OllamaClient {
    */
   private readonly endpointFormat: EndpointFormat;
 
+  /**
+   * v0.12.0 ADR 0012 — optional SSRF guard. When set, it is passed
+   * to `readStream` and runs inside `withRetry` before every fetch.
+   * Tests pass `undefined` to disable; production wires
+   * `createProductionSsrfGuard()`. Local Ollama connections may opt
+   * out (loopback is legitimate for them).
+   */
+  private readonly ssrfGuard:
+    | { assertUrlAllowed(url: string): Promise<void> }
+    | undefined;
+
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string,
     connection?: ConnectionConfig,
     endpointFormat: EndpointFormat = 'compat',
+    ssrfGuard?: { assertUrlAllowed(url: string): Promise<void> },
   ) {
     this.connection = connection;
     this.endpointFormat = endpointFormat;
+    this.ssrfGuard = ssrfGuard;
   }
 
   /**
@@ -286,6 +305,7 @@ export class OllamaClient {
         cancellationToken,
         processLine: processLineForFormat,
         finalize,
+        ssrfGuard: this.ssrfGuard,
       },
       callbacks,
     );
@@ -399,12 +419,28 @@ function flushToolCalls(
 ): void {
   for (const toolCall of pendingToolCalls.values()) {
     callbacks.onToolCall({
-      id: toolCall.id,
+      // Bug 1 fix (compat path) — same vulnerability as native: an
+      // empty `id` breaks VS Code tool-result routing. The compat
+      // delta-accumulation path only creates a pending entry when the
+      // first delta carries an id, but a server that sends the id on
+      // a later delta (or not at all) would leave `id` unset. Guard
+      // with the same fallback generator.
+      id: toolCall.id || generateToolCallId(),
       name: toolCall.function.name,
       input: safeJsonParse(toolCall.function.arguments),
     });
   }
   pendingToolCalls.clear();
+}
+
+/**
+ * Bug 1 fix — generates a fallback tool-call id when the model omits
+ * one. VS Code's `LanguageModelToolCallPart.callId` must be non-empty
+ * for tool-result correlation. The id is `call_<timestamp>_<rand>` —
+ * unique within a stream, stable enough for the single response.
+ */
+function generateToolCallId(): string {
+  return `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 /**
@@ -512,7 +548,13 @@ function processNdjsonLine(
     // immediately — NO pendingToolCalls accumulation.
     if (message.tool_calls) {
       for (const toolCall of message.tool_calls) {
-        const id = toolCall.id ?? '';
+        // Bug 1 fix — VS Code's LanguageModelToolCallPart requires a
+        // non-empty `callId` for the tool result to route back. When
+        // the model omits `id` (some native servers / models do), an
+        // empty string breaks tool-result correlation and crashes VS
+        // Code subagents with a `tryDeserialize` error. Generate a
+        // stable fallback id so the callId is never empty.
+        const id = toolCall.id ?? generateToolCallId();
         const name = toolCall.function?.name ?? '';
         const input =
           (toolCall.function?.arguments as Record<string, unknown> | undefined) ??
@@ -550,10 +592,11 @@ function mapNativeUsage(chunk: NativeChatChunk): UsageInfo | undefined {
   return { inputTokens, outputTokens, totalTokens };
 }
 
-// ADR 0010 — the timer resolvers (`resolveConnectTimeoutMs`,
-// `resolveInactivityTimeoutMs`, `resolveMaxDurationMs`) and
-// `extractErrorMessage` have moved to `streamReader.ts`. This client
-// no longer owns the streaming lifecycle.
+// ADR 0010 / 0012 (revised) — the single timer resolver
+// (`resolveMaxDurationMs`) and `extractErrorMessage` have moved to
+// `streamReader.ts`. This client no longer owns the streaming
+// lifecycle. Connect + inactivity timers were removed (ADR 0012
+// revised); only max-duration (60 min) remains.
 
 /**
  * Issue 10 — hardened safeJsonParse for tool-call arguments.
