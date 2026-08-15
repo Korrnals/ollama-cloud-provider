@@ -531,6 +531,14 @@ else
 
   # Upload from releases/ — all artefacts are already staged there.
   # --clobber overwrites existing assets if the release pre-existed.
+  #
+  # Stale-bundle guard (2026-08-16 v0.12.0 incident): when cosign is
+  # unavailable this run, any pre-existing .sigstore.bundle files date
+  # from an OLDER build and must never ship with this release — a
+  # signature over different content is worse than no signature.
+  if ! command -v cosign >/dev/null 2>&1; then
+    rm -f "${VSIX_FILE}.sigstore.bundle" "${SHA256_FILE}.sigstore.bundle"
+  fi
   UPLOAD_ARGS=()
   for f in "$VSIX_FILE" "$SHA256_FILE" "${SHA256_FILE}.asc" "${VSIX_FILE}.sigstore.bundle" "${SHA256_FILE}.sigstore.bundle" "$SBOM_FILE"; do
     [ -f "$f" ] && UPLOAD_ARGS+=("$f")
