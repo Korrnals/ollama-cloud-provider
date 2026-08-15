@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-cloud-provider-icon.png",
@@ -120,20 +120,12 @@
           "description": "Whitelist of permitted base URLs. The extension refuses to send requests to any baseUrl not in this list.",
           "scope": "application"
         },
-        "ollamaCloud.requestConnectTimeoutMs": {
+        "ollamaCloud.requestMaxDurationMin": {
           "type": "integer",
-          "default": 60000,
-          "minimum": 5000,
-          "maximum": 120000,
-          "markdownDescription": "**Advanced** — Connect timeout in milliseconds — bounds the initial fetch + status check. Retried via maxRetries on timeout. Covers 'server unreachable'. ADR 0005.",
-          "scope": "application"
-        },
-        "ollamaCloud.requestMaxDurationMs": {
-          "type": "integer",
-          "default": 1800000,
-          "minimum": 60000,
-          "maximum": 3600000,
-          "markdownDescription": "**Advanced** — Max stream duration in milliseconds — hard ceiling from streamChat entry, never reset. NO retry. Protects token budget from forgotten tabs / crashed callers. ADR 0005.",
+          "default": 60,
+          "minimum": 1,
+          "maximum": 1440,
+          "markdownDescription": "**Advanced** — Hard ceiling on total stream duration in **minutes**. Single timer (ADR 0012) — protects from forgotten tabs / hung connections. Default 60 min. No reasoning request takes 60 min; if it fires, something is genuinely hung.",
           "scope": "application"
         },
         "ollamaCloud.maxRetries": {
@@ -238,25 +230,25 @@
             "type": "string"
           },
           "default": [],
-          "description": "Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection visionModels override this list for that connection's models.",
+          "description": "Mark custom models as image-capable. Add wildcard patterns (e.g. 'my-vision-model:*', '*-vl:*') to tell the extension which models can process images. The built-in catalog already knows most Ollama Cloud vision models — use this only for custom or local models the catalog does not recognize. Example: [\"gemma3:*\", \"my-model:*\"].",
           "scope": "application"
         },
         "ollamaCloud.visionFallback.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable Vision Fallback Pass-through (ADR 0004). When the primary model cannot handle an image, route the turn to a vision-capable model. Opt-in — enables transparent image processing via a vision model when the primary is text-only. An inline annotation (🖼️) shows when routing fires. See `ollamaCloud.visionFallback.model` and `ollamaCloud.visionFallback.connection`.",
+          "description": "Enable automatic image fallback. When you attach an image to a text-only model (like glm-5.2), the extension routes the image to a vision-capable model automatically, then returns to your primary model. Off by default.",
           "scope": "application"
         },
         "ollamaCloud.visionFallback.model": {
           "type": "string",
           "default": "",
-          "description": "Vision-capable model id used for the fallback turn. When empty, the extension auto-searches the primary connection's catalog for the first vision-capable model. Set via the command palette (Ollama Cloud: Set Vision Fallback Model) or enter a model id manually.",
+          "description": "Which vision-capable model handles the image when fallback fires. Leave empty to auto-pick the first vision model found on your connection. Set it via the command palette (Ollama Cloud: Set Vision Fallback Model) or type a model id here.",
           "scope": "application"
         },
         "ollamaCloud.visionFallback.connection": {
           "type": "string",
           "default": "",
-          "description": "Optional connection id for the vision fallback. When empty, the extension uses the primary connection (where the primary model lives). Set via the command palette (Ollama Cloud: Set Vision Fallback Connection) when the primary connection has no vision models.",
+          "description": "**Advanced** — which connection hosts the vision model, for multi-connection setups (e.g. primary on Cloud, vision model on Local). Leave empty to use the primary connection. Only set this if your primary connection has no vision-capable models. Set via the command palette (Ollama Cloud: Set Vision Fallback Connection).",
           "scope": "application"
         },
         "ollamaCloud.preferredEndpoint": {

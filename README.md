@@ -138,8 +138,7 @@ Three ways to configure — pick one.
   "ollamaCloud.baseUrl": "https://ollama.com/v1",
   "ollamaCloud.allowedBaseUrls": ["https://ollama.com/v1"],
   "ollamaCloud.preferredEndpoint": "auto",
-  "ollamaCloud.requestConnectTimeoutMs": 60000,
-  "ollamaCloud.requestMaxDurationMs": 1800000,
+  "ollamaCloud.requestMaxDurationMin": 60,
   "ollamaCloud.maxRetries": 3,
   "ollamaCloud.connections": [
     {
@@ -169,8 +168,7 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.baseUrl` | `https://ollama.com/v1` | API base URL. Must be in `allowedBaseUrls`. |
 | `ollamaCloud.allowedBaseUrls` | `["https://ollama.com/v1"]` | Whitelist of permitted base URLs. |
 | `ollamaCloud.preferredEndpoint` | `"auto"` | Primary endpoint for cloud/remote. Enum: `"auto"` (default — resolves to `native` (`/api/chat`) for cloud, `chat` (`/chat/completions`) for local; auto-select with 3×404 auto-recovery — switches after 3 consecutive 404s in 5 min, returns to native after 5 min silence), `"native"` (`/api/chat` — ndjson, first-class `think`, object tool args), `"responses"` (`/v1/responses` — structured reasoning, typed events), `"chat"` (`/chat/completions` — classic OpenAI-compatible). Local Ollama always uses `/chat/completions`. Per-connection `preferredEndpoint` overrides this. See [Endpoint routing](#endpoint-routing). |
-| `ollamaCloud.requestConnectTimeoutMs` | `60000` | Max time for the initial connection (60 s). Retried via `maxRetries` on timeout. ADR 0005. |
-| `ollamaCloud.requestMaxDurationMs` | `1800000` | Max total streaming duration (30 min, safety cap). Never reset. No retry. Dead connections are detected via TCP keepalive, not an inactivity timer (v0.11.0). |
+| `ollamaCloud.requestMaxDurationMin` | `60` | Hard ceiling on total stream duration in **minutes** (1–1440). Single timer (ADR 0012) — protects from forgotten tabs / hung connections. Never reset. No retry. Default 60 min. |
 | `ollamaCloud.maxRetries` | `3` | Maximum retries for transient failures (429, 5xx, connect timeout). |
 | `ollamaCloud.connections` | `[]` | Multi-connection list. Each entry is a distinct OpenAI-compatible endpoint with its own URL whitelist and API key. When empty, the single-connection settings are used. Each connection can override the global `ollamaCloud.contextFilter.level` via a per-connection `contextFilter.level` (`off`/`safe`/`aggressive` override; `auto` inherits). |
 | `ollamaCloud.visionModels` | `[]` | Global vision wildcard patterns. A model id matching any pattern is treated as image-capable. Per-connection `visionModels` override this list. |

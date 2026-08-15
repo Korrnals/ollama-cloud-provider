@@ -5,8 +5,28 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-12
+
+Root-cause fix for "extension disconnects / agent loops" + SSRF guard + UX improvements.
+
+### Fixed — root cause of disconnects/loops
+- **P0 — native converter dropped tool results (subagent breakage)** — `convertMessagesToNative` dropped user messages whose only content was a `LanguageModelToolResultPart` (the `continue` on empty text skipped the tool-results emit). The model never saw tool outputs, so subagents looped, re-issued calls, and reported success without files changing. Evidence: debug log showed `convertNative: dropped empty user message (parts=1)` 36× in a row. Fix mirrors the compat converter contract: tool results survive even when the host message is empty. 4 regression tests added.
+- **Removed connect + inactivity timers (ADR 0012 revised)** — the connect timer (60s) killed legitimate reasoning-model requests with slow TTFT (60-70s). 12 curl tests proved the server never disconnected. Both timers deleted entirely; only max-duration (60min) remains as single hard ceiling.
+
+### Added
+- **SSRF guard** (`src/ssrfGuard.ts`) — DNS-resolution-based defence-in-depth. Blocks cloud metadata (169.254.169.254), RFC 1918 private, loopback, IPv6 unique-local. Uses dependency injection (not sinon). 26 unit tests.
+- **Context filter tool-integrity integration tests** — 11 tests verifying tool_call_output survives safe/aggressive filtering.
+
 ### Changed
-- _(nothing yet)_
+- **max-duration: ms → minutes** — `requestMaxDurationMs` renamed to `requestMaxDurationMin`, default 60 (minutes), range 1-1440. User-friendly.
+- **Vision params UX** — descriptions rewritten for non-technical users. Three params remain: `enabled`, `model`, `connection` (marked Advanced).
+- **`defaultRetryOn` simplified** — removed ConnectTimeoutError/InactivityTimeoutError checks (classes deleted).
+
+### Removed
+- `ConnectTimeoutError`, `InactivityTimeoutError` classes
+- `resolveConnectTimeoutMs()`, `resolveInactivityTimeoutMs()`
+- `ollamaCloud.requestConnectTimeoutMs`, `ollamaCloud.requestInactivityTimeoutMs` settings
+- 7 stale tests for removed timer behavior
 
 ## [0.11.0] - 2026-08-11
 
