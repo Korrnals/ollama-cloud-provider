@@ -7,7 +7,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ### Fixed
 - **Context filter now applies to the native `/api/chat` path (ADR 0007 gap)** — native (the cloud default, `auto` → native) silently bypassed the filter: default cloud users got zero filtering and the `Context filter:` log line never fired. The filtered OpenAI payload now converts via the new `convertOpenAIMessagesToNative` / `convertOpenAIToolsToNative` (no VS Code ↔ OpenAI round-trip); the raw conversion path is preserved when the filter is `off`. `requestChars` is now accurate on the native path too. 12 tests added.
-
+- **P1 (review) — SSRF guard closed IPv4-embedded IPv6 bypass** — `::ffff:169.254.169.254`, NAT64 (`64:ff9b::/96`) and IPv4-compatible (`::a.b.c.d`) forms were never classified against the embedded IPv4 address; all three now run the low 32 bits through the shared IPv4 classifier (mapped loopback respects `allowLoopback`). Unspecified `::` is blocked as well.
+- **P1 (review) — LAN-hosted Ollama unblocked on local connections** — RFC 1918 ranges were hard-blocked even for `type:'local'` connections, and the block error promised a non-existent "explicit override". Local connections now set `allowPrivateRanges` (10/8, 172.16/12, 192.168/16 allowed); cloud metadata (169.254/16), CGNAT and all IPv6-sensitive ranges never relax. Error message rewritten; cloud errors point at `ollamaCloud.allowedBaseUrls`.
+- **P1 (review) — ADR 0012 rewritten** to match the shipped single-timer + SSRF-guard implementation; the rejected raise-timeout draft is preserved as an appendix.
+- **P2 (review) — native converter drops empty `user`/`system` entries** after filtering (mirrors the VS Code-path guard; tool messages unaffected); SSRF error messages strip control characters (log-forging hygiene).
 ## [0.12.0] - 2026-08-12
 
 Root-cause fix for "extension disconnects / agent loops" + SSRF guard + UX improvements.

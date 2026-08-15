@@ -439,11 +439,13 @@ export function convertToolsToNative(
  *
  * Role mapping:
  *   - `system` → `{ role:'system', content }` kept IN PLACE (no
- *     `instructions` hoist — native accepts multiple system messages).
+ *     `instructions` hoist — native accepts multiple system messages);
+ *     empty content is dropped.
  *   - `user` → `{ role:'user', content }`; part-array content keeps
  *     `text` parts, image parts are skipped (defence-in-depth — vision
  *     content never reaches this path: the vision gate routes image
- *     requests before the filter).
+ *     requests before the filter). Empty text is dropped (mirrors
+ *     `convertMessagesToNative`).
  *   - `assistant` → `{ role:'assistant', content, tool_calls? ,
  *     reasoning_content? }`; `tool_calls[].function.arguments` is
  *     `JSON.parse`d into an object (failure → `{}`). An assistant with
@@ -504,7 +506,17 @@ export function convertOpenAIMessagesToNative(
     // instructions field, so system messages stay in place (first one
     // included, and a second system message after filtering stays too
     // — native accepts multiple system messages, unlike /v1/responses).
-    result.push({ role, content: text });
+    // Empty text after filtering is dropped — mirrors the VS Code-path
+    // guard in `convertMessagesToNative` (v0.12.0 review P2 fix; the
+    // filter already guarantees non-empty user/system messages, this
+    // is defence-in-depth for raw payloads).
+    if (text) {
+      result.push({ role, content: text });
+    } else {
+      logger.debug(
+        'convertOpenAIToNative: dropped empty user/system message after context filter',
+      );
+    }
   }
 
   return result;

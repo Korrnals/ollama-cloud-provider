@@ -331,6 +331,22 @@ describe('convert.convertOpenAIMessagesToNative (ADR 0007 — filtered payload �
     assert.equal(result.length, 0, 'empty assistant must be dropped');
   });
 
+  it('drops user/system messages whose content became empty after filtering', () => {
+    // v0.12.0 review P2 fix — mirrors the VS Code-path guard in
+    // convertMessagesToNative: no empty {role:'user'|'system'} entries
+    // reach the wire, even if a future filter step produces them. Tool
+    // messages are NOT affected (always emitted — P0 integrity).
+    const result = convertOpenAIMessagesToNative([
+      { role: 'system', content: 'keep' },
+      { role: 'user', content: '' },
+      { role: 'system', content: '' },
+      { role: 'user', content: 'real' },
+    ]);
+    assert.equal(result.length, 2, 'empty user/system entries must be dropped');
+    assert.deepEqual(result[0], { role: 'system', content: 'keep' });
+    assert.deepEqual(result[1], { role: 'user', content: 'real' });
+  });
+
   it('passes reasoning_content through on assistant messages', () => {
     const result = convertOpenAIMessagesToNative([
       { role: 'assistant', content: 'answer', reasoning_content: 'thinking...' },

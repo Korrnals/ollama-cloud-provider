@@ -763,15 +763,23 @@ export class OllamaCloudChatProvider
       // AllowedOrThrow), but it cannot catch DNS-rebinding. The guard
       // resolves the hostname to an IP right before fetch and rejects
       // protected ranges (cloud metadata, RFC 1918, loopback, etc.).
-      // Local connections allow loopback (legitimate local Ollama);
-      // cloud connections reject it. Guard creation is cheap — one
-      // object allocation per request, no DNS resolution at construction.
-      // Declared early so the legacy `client` below (and all dispatch
-      // branches) can thread it through.
+      // Local connections allow loopback AND RFC 1918 private ranges
+      // (v0.12.0 review P1 fix — LAN-hosted Ollama such as
+      // http://192.168.1.50:11434 is a user-configured endpoint);
+      // cloud metadata (169.254/16), CGNAT and all IPv6-sensitive
+      // ranges stay blocked even for local. Cloud connections reject
+      // everything private and point block errors at the whitelist.
+      // Guard creation is cheap — one object allocation per request,
+      // no DNS resolution at construction. Declared early so the
+      // legacy `client` below (and all dispatch branches) can thread
+      // it through.
       const isLocalConnection = connection?.type === 'local';
       const ssrfGuard: SsrfGuard = isLocalConnection
-        ? createProductionSsrfGuard({ allowLoopback: true })
-        : createProductionSsrfGuard({ allowLoopback: false });
+        ? createProductionSsrfGuard({ allowLoopback: true, allowPrivateRanges: true })
+        : createProductionSsrfGuard({
+            allowLoopback: false,
+            advice: 'Check the URL or your ollamaCloud.allowedBaseUrls whitelist.',
+          });
 
       const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection, 'compat', ssrfGuard);
       const modelOptions = options as ModelConfigurationOptions;

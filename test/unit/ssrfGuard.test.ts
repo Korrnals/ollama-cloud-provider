@@ -23,6 +23,11 @@ import {
  *   - Unique-local IPv6 (fc00::/7, fd00:ec2::) → blocked
  *   - CGNAT (100.64.0.0/10) → blocked
  *   - 0.0.0.0/8 → blocked
+ *   - IPv4-mapped IPv6 (::ffff:a.b.c.d), NAT64 (64:ff9b::/96) and
+ *     IPv4-compatible (::a.b.c.d) → embedded IPv4 classified (P1 fix)
+ *   - Unspecified (::) → blocked
+ *   - allowPrivateRanges → RFC 1918 allowed for local LAN connections;
+ *     metadata/CGNAT/IPv6-sensitive ranges never relax (P1 fix)
  *   - Public IPv4 (1.2.3.4) → allowed
  *   - Public IPv6 (2606:4700::) → allowed
  *   - Literal IP in URL (no DNS) → classified directly
@@ -160,6 +165,193 @@ describe('SsrfGuard (v0.12.0 ADR 0012)', () => {
     });
   });
 
+  describe('blocks IPv4-embedded IPv6 forms (v0.12.0 review P1 fix)', () => {
+    it('blocks ::ffff:169.254.169.254 (IPv4-mapped cloud metadata)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::ffff:169.254.169.254'));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /169\.254\.0\.0\/16/,
+      );
+    });
+
+    it('blocks ::ffff:192.168.1.1 (IPv4-mapped RFC 1918)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::ffff:192.168.1.1'));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /192\.168\.0\.0\/16/,
+      );
+    });
+
+    it('allows ::ffff:1.2.3.4 (IPv4-mapped public)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::ffff:1.2.3.4'));
+      await guard.assertUrlAllowed('https://edge.example.com/api');
+      // No throw = pass
+    });
+
+    it('blocks ::ffff:127.0.0.1 by default (IPv4-mapped loopback)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::ffff:127.0.0.1'));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://localhost.example.com/api'),
+        SsrfBlockedError,
+        /127\.0\.0\.0\/8/,
+      );
+    });
+
+    it('allows ::ffff:127.0.0.1 with allowLoopback: true', async () => {
+      const guard = new SsrfGuard(fakeResolver('::ffff:127.0.0.1'), { allowLoopback: true });
+      await guard.assertUrlAllowed('http://[::ffff:127.0.0.1]:11434/api/chat');
+      // No throw = pass
+    });
+
+    it('blocks 64:ff9b::192.168.1.1 (NAT64-mapped RFC 1918)', async () => {
+      const guard = new SsrfGuard(fakeResolver('64:ff9b::192.168.1.1'));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /192\.168\.0\.0\/16/,
+      );
+    });
+
+    it('blocks ::7f00:1 (IPv4-compatible loopback)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::7f00:1'));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /127\.0\.0\.0\/8/,
+      );
+    });
+
+    it('blocks a literal IPv4-mapped URL without DNS', async () => {
+      const guard = new SsrfGuard(throwingResolver(new Error('should not resolve')));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://[::ffff:169.254.169.254]/x'),
+        SsrfBlockedError,
+        /169\.254\.0\.0\/16/,
+      );
+    });
+
+    it('blocks :: (unspecified address)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::'));
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /::\/128 \(unspecified\)/,
+      );
+    });
+  });
+
+  describe('allowPrivateRanges (v0.12.0 review P1 fix — local LAN connections)', () => {
+    it('allows 192.168.1.1 with allowPrivateRanges: true', async () => {
+      const guard = new SsrfGuard(fakeResolver('192.168.1.1'), { allowPrivateRanges: true });
+      await guard.assertUrlAllowed('https://lan.example.com/api');
+      // No throw = pass (default-block case covered above)
+    });
+
+    it('allows 10.0.0.1 with allowPrivateRanges: true', async () => {
+      const guard = new SsrfGuard(fakeResolver('10.0.0.1'), { allowPrivateRanges: true });
+      await guard.assertUrlAllowed('https://lan.example.com/api');
+    });
+
+    it('allows 172.16.0.1 with allowPrivateRanges: true', async () => {
+      const guard = new SsrfGuard(fakeResolver('172.16.0.1'), { allowPrivateRanges: true });
+      await guard.assertUrlAllowed('https://lan.example.com/api');
+    });
+
+    it('allows a literal LAN URL (http://192.168.1.50:11434) with allowPrivateRanges: true', async () => {
+      const guard = new SsrfGuard(
+        throwingResolver(new Error('should not resolve')),
+        { allowPrivateRanges: true },
+      );
+      await guard.assertUrlAllowed('http://192.168.1.50:11434/api/chat');
+    });
+
+    it('still blocks 169.254.169.254 with allowPrivateRanges + allowLoopback (metadata never relaxes)', async () => {
+      const guard = new SsrfGuard(fakeResolver('169.254.169.254'), {
+        allowPrivateRanges: true,
+        allowLoopback: true,
+      });
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /169\.254\.0\.0\/16/,
+      );
+    });
+
+    it('still blocks fd00:ec2::254 with allowPrivateRanges: true', async () => {
+      const guard = new SsrfGuard(fakeResolver('fd00:ec2::254'), { allowPrivateRanges: true });
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /fc00::\/7/,
+      );
+    });
+
+    it('still blocks ::ffff:169.254.169.254 with allowPrivateRanges: true (mapped metadata)', async () => {
+      const guard = new SsrfGuard(fakeResolver('::ffff:169.254.169.254'), { allowPrivateRanges: true });
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /169\.254\.0\.0\/16/,
+      );
+    });
+
+    it('still blocks 100.64.0.1 (CGNAT) with allowPrivateRanges: true', async () => {
+      const guard = new SsrfGuard(fakeResolver('100.64.0.1'), { allowPrivateRanges: true });
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://evil.example.com/api'),
+        SsrfBlockedError,
+        /100\.64\.0\.0\/10/,
+      );
+    });
+
+    it('still blocks 127.0.0.1 with allowPrivateRanges alone (loopback needs allowLoopback)', async () => {
+      const guard = new SsrfGuard(fakeResolver('127.0.0.1'), { allowPrivateRanges: true });
+      await assertRejects(
+        () => guard.assertUrlAllowed('https://localhost.example.com/api'),
+        SsrfBlockedError,
+        /127\.0\.0\.0\/8/,
+      );
+    });
+  });
+
+  describe('error message hygiene (v0.12.0 review P2 fix)', () => {
+    it('no longer promises a non-existent override', async () => {
+      const guard = new SsrfGuard(fakeResolver('10.0.0.1'));
+      await assert.rejects(
+        () => guard.assertUrlAllowed('https://internal.example.com/api'),
+        (error: unknown) => {
+          assert.ok(error instanceof SsrfBlockedError, 'expected SsrfBlockedError');
+          assert.ok(
+            !/override/i.test(error.message),
+            `message must not mention an override: ${error.message}`,
+          );
+          return true;
+        },
+      );
+    });
+
+    it('strips control characters from malformed-URL error messages', async () => {
+      const guard = new SsrfGuard(fakeResolver('1.2.3.4'));
+      await assert.rejects(
+        () => guard.assertUrlAllowed('not a url\u0000with\u007fcontrols'),
+        (error: unknown) => {
+          assert.ok(error instanceof Error, 'expected Error');
+          assert.match(error.message, /malformed URL/);
+          for (const ch of error.message) {
+            const code = ch.charCodeAt(0);
+            assert.ok(
+              code > 0x1f && code !== 0x7f,
+              `control char U+${code.toString(16).padStart(4, '0')} leaked into message`,
+            );
+          }
+          return true;
+        },
+      );
+    });
+  });
+
   describe('blocks CGNAT and unrouted', () => {
     it('blocks 100.64.0.1 (CGNAT)', async () => {
       const guard = new SsrfGuard(fakeResolver('100.64.0.1'));
@@ -284,7 +476,10 @@ async function assertRejects(
   // Structural type — accepts any constructor that returns an Error-like
   // instance, regardless of its parameter signature. Avoids friction with
   // classes like SsrfBlockedError that take multiple constructor args.
-  ExpectedError: { new (...args: any[]): Error; name: string },
+  // `never[]` is the bottom type: every concrete constructor signature
+  // satisfies it, without `any` (`unknown[]` would NOT compile — a
+  // string-taking constructor is not callable with arbitrary unknowns).
+  ExpectedError: { new (...args: never[]): Error; name: string },
   messageRegex: RegExp,
 ): Promise<void> {
   let threw = false;
