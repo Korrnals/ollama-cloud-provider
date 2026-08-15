@@ -149,7 +149,7 @@ describe('streamReader.readStream — module contract', () => {
       requestTimeoutMs: 120000,
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
   });
@@ -269,7 +269,7 @@ describe('streamReader.readStream — module contract', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 1000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
 
@@ -306,68 +306,12 @@ describe('streamReader.readStream — module contract', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Connect timeout → ConnectTimeoutError → retry → success.
-  // We set maxRetries=1 and connectTimeoutMs short; first attempt times
-  // out, second succeeds.
-  // -------------------------------------------------------------------------
-
-  it('retries to success after connect timeout (ConnectTimeoutError path)', async function () {
-    this.timeout(5000);
-
-    setConfig({
-      baseUrl: BASE_URL,
-      allowedBaseUrls: [BASE_URL],
-      requestConnectTimeoutMs: 200,
-      requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
-      maxRetries: 1,
-    });
-
-    let attemptCount = 0;
-    const successBody = streamFromChunks([encode('data: ok\n')]);
-
-    const originalFetch = global.fetch;
-    global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      attemptCount += 1;
-      const sig = init?.signal;
-      if (attemptCount === 1) {
-        // First attempt never resolves on its own — the connect timer
-        // (200ms) fires, aborts the signal, and the fetch must reject
-        // with AbortError. Wire the signal so abort causes rejection.
-        return new Promise<Response>((_resolve, reject) => {
-          if (sig) {
-            const onAbort = (): void => {
-              const err = new Error('The operation was aborted');
-              err.name = 'AbortError';
-              reject(err);
-            };
-            if (sig.aborted) {
-              onAbort();
-            } else {
-              sig.addEventListener('abort', onAbort, { once: true });
-            }
-          }
-        });
-      }
-      return mockResponse(successBody);
-    }) as typeof fetch;
-
-    const recorder = makeCallbacks();
-    await readStream(makeBaseOptions(), recorder);
-
-    assert.equal(attemptCount, 2, 'must have retried once after connect timeout');
-    assert.equal(
-      recorder.doneCount,
-      1,
-      'onDone must fire after successful retry',
-    );
-
-    global.fetch = originalFetch;
-  });
-
-  // -------------------------------------------------------------------------
   // Caller cancel mid-stream → onDone (not onError).
   // -------------------------------------------------------------------------
+  // ADR 0012 (revised) — connect-timer retry tests removed: the connect
+  // timer (and ConnectTimeoutError) were deleted. A hanging fetch now
+  // waits until max-duration (60 min) or caller cancel; there is no
+  // connect-phase timeout to trigger a retry.
 
   it('fires onDone (not onError) when caller cancels mid-stream', async function () {
     this.timeout(5000);

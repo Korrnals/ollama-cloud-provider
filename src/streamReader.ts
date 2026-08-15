@@ -3,9 +3,9 @@
  *
  * CONDITION #7 — this is NOT a generic SSE reader. This module is
  * tightly coupled to `retry.ts` and its error classes
- * (`ConnectTimeoutError`, `InactivityTimeoutError`, `MidStreamError`,
- * `ZeroByteSocketCloseError`, `ConnectionInterruptedError`,
- * `MaxDurationError`). Those classes encode Ollama Cloud's
+ * (`MidStreamError`, `ZeroByteSocketCloseError`,
+ * `ConnectionInterruptedError`, `MaxDurationError`). Those classes
+ * encode Ollama Cloud's
  * non-idempotency contract (POST `/chat/completions` and
  * `/v1/responses` are NOT idempotent — retrying mid-stream would bill
  * the user twice, per ADR 0001 "provider-not-agent" and ADR 0005
@@ -22,7 +22,7 @@
  * ## Module boundary (ADR 0010)
  *
  * This module OWNS (invariant lifecycle):
- *   - Three timers (max-duration, inactivity soft+grace) — ADR 0005
+ *   - Single max-duration timer (ADR 0012 revised — connect + inactivity removed)
  *   - `withRetry` connect wrapper + per-attempt AbortController
  *   - Reader loop + 1 MiB buffer cap
  *   - `chunksReceived` accounting + 0-chunk / >0-chunk boundary
@@ -65,9 +65,7 @@ import { httpRequest, type HttpResponseLike } from './httpClient.js';
 import { logger, redactSensitive } from './logger.js';
 import type { StreamCallbacks } from './protocolTypes.js';
 import {
-  ConnectTimeoutError,
   ConnectionInterruptedError,
-  InactivityTimeoutError,
   MaxDurationError,
   ZeroByteSocketCloseError,
   defaultRetryOn,
@@ -77,32 +75,18 @@ import {
 } from './retry.js';
 
 // -------------------------------------------------------------------------
-// ADR 0005 — three timers. Same defaults/maxes as the former per-client
-// constants (now centralized here). The resolver helpers are shared
-// (not duplicated) — the deprecation-warning flag is module-level.
-// v0.9.0 — connect default raised to 60s (1 min), inactivity default
-// raised to 300s (5 min) with a soft/grace extension (see
-// resetInactivity). The max stays at 600s (10 min)... actually the max
-// duration default is 1800000 (30 min).
+// ADR 0012 (revised) — single-timer architecture. The connect timer
+// (60s default) and the inactivity timer were removed: production
+// debug logs (2026-08-12) proved the connect timer killed legitimate
+// reasoning-model requests with slow TTFT (60–70s), aborting working
+// streams and triggering the "extension disconnects / agent loops"
+// retry loop. Only max-duration (60 min) remains as the single hard
+// ceiling — protects the user's token budget from forgotten tabs and
+// crashed callers without cutting off slow-but-alive reasoning.
 // -------------------------------------------------------------------------
-const REQUEST_CONNECT_TIMEOUT_MAX_MS = 120000;
-const REQUEST_CONNECT_TIMEOUT_DEFAULT_MS = 60000;
-
-// ArchCom 0011c — inactivity timer disabled permanently.
-// Constants retained for resolveInactivityTimeoutMs() backward-compat
-// (the setting was removed from package.json but resolveInactivityMs
-// still returns a value; the timer itself never fires).
-const REQUEST_INACTIVITY_TIMEOUT_MAX_MS = 600000;
-const REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS = 300000;
-
-const REQUEST_MAX_DURATION_MAX_MS = 3600000;
-const REQUEST_MAX_DURATION_DEFAULT_MS = 1800000;
-
-// Legacy single-timer clamp — kept for the deprecation alias. The
-// default is intentionally unused (new default is
-// REQUEST_MAX_DURATION_DEFAULT_MS); the alias only applies when the
-// user explicitly set requestTimeoutMs.
-const REQUEST_TIMEOUT_MAX_MS = 600000;
+const REQUEST_MAX_DURATION_MAX_MIN = 1440;
+const REQUEST_MAX_DURATION_DEFAULT_MIN = 60;
+const MS_PER_MINUTE = 60000;
 
 // MEDIUM-2 — cap the SSE buffer at 1 MiB. A well-formed stream emits
 // newline-delimited chunks, so the buffer between line splits stays
@@ -176,6 +160,19 @@ export interface StreamReaderOptions {
   processLine: StreamLineProcessor;
   /** Optional finalizer for clean stream-end (compat flushToolCalls). */
   finalize?: StreamFinalizer;
+  /**
+   * Optional SSRF guard (v0.12.0, ADR 0012). When set, the guard's
+   * `assertUrlAllowed(url)` runs inside `withRetry` BEFORE every
+   * fetch attempt — right after the whitelist check passes and right
+   * before the TCP connect. A blocked URL throws `SsrfBlockedError`,
+   * which is terminal (retrying the same URL hits the same IP).
+   *
+   * The guard is injected (not imported) so tests can pass a fake
+   * without stubbing `node:dns`. Clients pass `undefined` to disable
+   * SSRF protection (e.g. unit tests that do not exercise the network
+   * path); production clients wire `createProductionSsrfGuard()`.
+   */
+  ssrfGuard?: { assertUrlAllowed(url: string): Promise<void> };
 }
 
 /**
@@ -194,28 +191,21 @@ export async function readStream(
 ): Promise<void> {
   const { logTag, url, headers, body, cancellationToken } = options;
 
-  // ADR 0005 — three timers replace the single end-to-end setTimeout.
-  //   connect      — wraps fetch only, retryable, 60s default
-  //   inactivity   — resets per chunk + per :keep-alive, NO retry, 300s
-  //   maxDuration  — never reset, NO retry, 30 min safety cap
+  // ADR 0012 (revised) — single timer (max-duration) replaces the
+  // former three-timer architecture. Connect + inactivity timers were
+  // removed: the connect timer killed legitimate slow-TTFT reasoning
+  // requests. Only max-duration (60 min) remains as the hard ceiling.
   // No mid-stream retry: POST endpoints are not idempotent.
   const controller = new AbortController();
-  const connectTimeoutMs = resolveConnectTimeoutMs();
-  const inactivityTimeoutMs = resolveInactivityTimeoutMs();
   const maxDurationMs = resolveMaxDurationMs();
 
   logger.debug(
-    `${logTag}: readStream START — connect=${connectTimeoutMs}ms, inactivity=${inactivityTimeoutMs}ms, maxDuration=${maxDurationMs}ms`,
+    `${logTag}: readStream START — maxDuration=${maxDurationMs}ms`,
   );
 
   // Tagged abort reason — the catch block routes by this tag to emit
   // the right user-facing message and to decide onDone vs onError.
-  type AbortReason =
-    | 'connect'
-    | 'inactivity'
-    | 'maxDuration'
-    | 'cancel'
-    | null;
+  type AbortReason = 'maxDuration' | 'cancel' | null;
   let abortReason: AbortReason = null;
 
   // Max-duration: one setTimeout at start, never reset, cleared in finally.
@@ -226,50 +216,6 @@ export async function readStream(
     );
     controller.abort();
   }, maxDurationMs);
-
-  // Inactivity: started after fetch resolves (first byte), reset per
-  // chunk + per :keep-alive. Declared here so the finally block can
-  // clear it from both the stream path and the early-throw path.
-  // v0.9.0 — soft/grace period: the FIRST fire at the soft threshold
-  // (120s) logs a warning and extends the timer to the full
-  // `inactivityTimeoutMs` grace period (300s default). Only the SECOND
-  // fire hard-kills the stream. This accommodates long reasoning
-  // models that go silent between the reasoning phase and token
-  // emission without being truly dead.
-  let inactivityHandle: ReturnType<typeof setTimeout> | undefined;
-  // ArchCom 0011c — inactivity timer DISABLED permanently.
-  //
-  // Evidence (ArchCom 0011b + 0011c):
-  //   - Inactivity timer killed working streams during LLM reasoning
-  //     pauses — false-positive machine, crashed subagents, froze
-  //     terminals. Empirical fact, not theory.
-  //   - Researcher confirmed: Continue and Cline do NOT use
-  //     inactivity timers — they trust user AbortController + server
-  //     close + OS TCP keepalive.
-  //   - TCP keepalive added in httpClient.ts (setKeepAlive(true, 30000))
-  //     provides OS-level dead connection detection.
-  //   - SSE noted keepalive doesn't pierce nginx proxy_read_timeout,
-  //     but that risk is unproven for Ollama Cloud; if it manifests,
-  //     we'll see ConnectionInterruptedError and add a targeted fix.
-  //
-  // resetInactivity is a no-op: timer never starts, abortReason
-  // 'inactivity' never fires. Max-duration (30min) remains as the
-  // only safety cap.
-  //
-  // The inactivity soft/grace/short-timeout machinery is DISABLED via
-  // no-op — NOT deleted. The dead code (resetInactivity, clearInactivity,
-  // inactivityHandle, the REQUEST_INACTIVITY_TIMEOUT_* constants, and
-  // resolveInactivityTimeoutMs) is RETAINED for v0.12.0 re-evaluation.
-  // Do NOT re-enable without revisiting ArchCom 0011c first.
-  const resetInactivity = (): void => {
-    // No-op — inactivity timer disabled (ArchCom 0011c).
-  };
-  const clearInactivity = (): void => {
-    if (inactivityHandle !== undefined) {
-      clearTimeout(inactivityHandle);
-      inactivityHandle = undefined;
-    }
-  };
 
   // Count of chunks received — condition #3: incremented by this module,
   // NOT by the callback. Used by the catch block to distinguish
@@ -301,27 +247,24 @@ export async function readStream(
   // main→attempt listener once the stream is done.
   let streamMainAbortListener: (() => void) | undefined;
 
-  // StreamLineContext passed to processLine — exposes resetInactivity
-  // so keep-alive comments reset the inactivity timer.
+  // StreamLineContext passed to processLine. resetInactivity is a
+  // no-op stub (inactivity timer removed in ADR 0012 revised); kept on
+  // the interface for backward-compat with the callback contract.
   const lineCtx: StreamLineContext = {
-    resetInactivity,
+    resetInactivity: () => { /* no-op — inactivity timer removed */ },
     markParsed: () => { parsedChunks += 1; },
   };
 
   try {
     // Issue 13 / ADR 0005 — retry the INITIAL CONNECTION only.
     // `withRetry` wraps just the `fetch` + status check; the body
-    // reader loop is outside the wrapper. Connect-phase timeouts
-    // (ConnectTimeoutError) are retriable; stream errors are terminal.
+    // reader loop is outside the wrapper. Stream errors are terminal.
     const retryOn = (error: unknown): boolean => {
       if (cancellationToken?.isCancellationRequested) {
         return false;
       }
-      // Do not retry on our own intentional aborts once a stream has
-      // started — but the connect-phase AbortError from the connect
-      // timer is wrapped as ConnectTimeoutError by the fetch wrapper
-      // below, so a raw AbortError here means caller-cancel or an
-      // ambiguous network abort: default to not retrying.
+      // Do not retry on AbortError — it means caller-cancel or an
+      // ambiguous network abort. Default to not retrying.
       if (error instanceof Error && error.name === 'AbortError') {
         return false;
       }
@@ -346,12 +289,6 @@ export async function readStream(
         }
 
         const attemptController = new AbortController();
-        const connectHandle = setTimeout(() => {
-          if (abortReason === null) {
-            abortReason = 'connect';
-          }
-          attemptController.abort();
-        }, connectTimeoutMs);
 
         // If the main controller already aborted (caller cancel or
         // maxDuration fired before this attempt started), abort the
@@ -370,6 +307,18 @@ export async function readStream(
         streamMainAbortListener = mainAbortListener;
 
         try {
+          // v0.12.0 ADR 0012 — SSRF guard. Runs AFTER the SEC-03
+          // string-whitelist check (which already passed in the
+          // client) and BEFORE the TCP connect. The window between
+          // this check and the actual connect is the smallest a
+          // DNS-rebinding attack can exploit. A blocked URL throws
+          // `SsrfBlockedError` — terminal (retry hits same IP), so it
+          // propagates out of `withRetry` without retry. The guard is
+          // optional; clients pass `undefined` to disable (tests,
+          // local Ollama connections that opted out).
+          if (options.ssrfGuard) {
+            await options.ssrfGuard.assertUrlAllowed(url);
+          }
           const res = await httpRequest(url, {
             method: 'POST',
             headers,
@@ -423,20 +372,10 @@ export async function readStream(
             throw error;
           }
         } catch (error) {
-          // If the connect timer fired (and ONLY the connect timer),
-          // surface a typed ConnectTimeoutError so defaultRetryOn can
-          // retry. When abortReason is 'cancel' or 'maxDuration',
-          // rethrow the raw AbortError unchanged.
-          if (
-            abortReason === 'connect' &&
-            error instanceof Error &&
-            error.name === 'AbortError'
-          ) {
-            throw new ConnectTimeoutError(connectTimeoutMs);
-          }
+          // ADR 0012 (revised) — connect timer removed. Rethrow all
+          // errors unchanged; defaultRetryOn decides retryability.
           throw error;
         } finally {
-          clearTimeout(connectHandle);
           // Do NOT remove the listener here on a successful fetch —
           // it must stay attached so the stream reader remains
           // abortable. On a failed attempt detach now.
@@ -456,11 +395,6 @@ export async function readStream(
     // it probed (to detect a 0-byte close inside the retry window).
     // Seed the buffer + chunk counter with that first chunk so it is
     // processed by the loop, not lost.
-    if ((abortReason as AbortReason) === 'connect') {
-      abortReason = null;
-    }
-    resetInactivity();
-
     if (!response.response.body) {
       throw new Error(`${logTag} returned no response body.`);
     }
@@ -473,7 +407,6 @@ export async function readStream(
     // below).
     let buffer = decoder.decode(response.firstChunk, { stream: true });
     chunksReceived += 1;
-    resetInactivity();
     // Fix 6 — the first chunk was probed inside withRetry. Apply the
     // same buffer-cap + line-processing the loop applies to subsequent
     // chunks so a single oversized first chunk is caught and its lines
@@ -509,12 +442,7 @@ export async function readStream(
         break;
       }
 
-      // ADR 0005 — each chunk resets the inactivity timer. This is
-      // the core fix: a long-reasoning model that emits a chunk every
-      // ~0.5s keeps the stream alive indefinitely; only genuine
-      // silence (>inactivityTimeoutMs) fires.
       chunksReceived += 1;
-      resetInactivity();
 
       buffer += decoder.decode(chunk.value, { stream: true });
       // MEDIUM-2 — unbounded stream buffer is a DoS vector. Cap at
@@ -605,17 +533,6 @@ export async function readStream(
         callbacks.onError(new MaxDurationError(maxDurationMs));
         return;
       }
-      if (abortReason === 'inactivity') {
-        callbacks.onError(
-          new InactivityTimeoutError(inactivityTimeoutMs, chunksReceived),
-        );
-        return;
-      }
-      if (abortReason === 'connect') {
-        // Connect abort that escaped withRetry (e.g. maxRetries=0).
-        callbacks.onError(new ConnectTimeoutError(connectTimeoutMs));
-        return;
-      }
       // ADR 0005 § No mid-stream retry (Revision 2026-08-03) —
       // bare socket close: AbortError with no abortReason tag.
       if (abortReason === null && chunksReceived === 0) {
@@ -663,14 +580,13 @@ export async function readStream(
       return;
     }
     // Non-abort errors (HttpError, whitelist throw, buffer overrun,
-    // ConnectTimeoutError that withRetry gave up on, MidStreamError
-    // thrown by the processLine callback) — surface directly.
+    // MidStreamError thrown by the processLine callback) — surface
+    // directly.
     callbacks.onError(
       error instanceof Error ? error : new Error(String(error)),
     );
   } finally {
     clearTimeout(maxDurationHandle);
-    clearInactivity();
     cancelListener?.dispose();
     // Detach any lingering main→attempt abort wire from the last
     // `withRetry` attempt.
@@ -688,79 +604,34 @@ export async function readStream(
 // -------------------------------------------------------------------------
 
 /**
- * Reads, clamps, and resolves the connect timeout. Guards against
- * non-number / NaN / non-positive values (returns the default).
- * Above-maximum values are clamped; below-minimum values are used as-is
- * (tests and power users).
- */
-function resolveConnectTimeoutMs(): number {
-  const configured = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestConnectTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
-    return REQUEST_CONNECT_TIMEOUT_DEFAULT_MS;
-  }
-  if (configured > REQUEST_CONNECT_TIMEOUT_MAX_MS) {
-    logger.warn(
-      `ollamaCloud.requestConnectTimeoutMs=${configured} is above maximum ${REQUEST_CONNECT_TIMEOUT_MAX_MS}; clamping.`,
-    );
-    return REQUEST_CONNECT_TIMEOUT_MAX_MS;
-  }
-  return configured;
-}
-
-/**
- * Reads, clamps, and resolves the inactivity timeout. Same guarding
- * as `resolveConnectTimeoutMs`.
- */
-function resolveInactivityTimeoutMs(): number {
-  const configured = vscode.workspace
-    .getConfiguration('ollamaCloud')
-    .get<number>('requestInactivityTimeoutMs');
-  if (typeof configured !== 'number' || Number.isNaN(configured) || configured <= 0) {
-    return REQUEST_INACTIVITY_TIMEOUT_DEFAULT_MS;
-  }
-  if (configured > REQUEST_INACTIVITY_TIMEOUT_MAX_MS) {
-    logger.warn(
-      `ollamaCloud.requestInactivityTimeoutMs=${configured} is above maximum ${REQUEST_INACTIVITY_TIMEOUT_MAX_MS}; clamping.`,
-    );
-    return REQUEST_INACTIVITY_TIMEOUT_MAX_MS;
-  }
-  return configured;
-}
-
-let maxDurationDeprecationWarned = false;
-
-/**
- * Reads, clamps, and resolves the max-duration timeout. Honours the
- * deprecated `ollamaCloud.requestTimeoutMs` alias: if set but
- * `requestMaxDurationMs` is NOT, the legacy value (clamped to its own
- * range) is used. A deprecation warning is logged once per process.
+ * Reads, clamps, and resolves the max-duration timeout — the single
+ * remaining timer (ADR 0012 revised). Connect + inactivity timers were
+ * removed; only max-duration (60 min default) survives as the hard
+ * ceiling.
+ *
+ * The user configures the ceiling in MINUTES via
+ * `ollamaCloud.requestMaxDurationMin` (package.json enforces integer
+ * 1–1440). Internally the timer uses ms, so we multiply by 60000. The
+ * code clamp is a secondary defence — a user can still set an
+ * out-of-range value via raw JSON.
  */
 function resolveMaxDurationMs(): number {
   const config = vscode.workspace.getConfiguration('ollamaCloud');
-  const configured = config.get<number>('requestMaxDurationMs');
-  if (typeof configured === 'number' && !Number.isNaN(configured) && configured > 0) {
-    if (configured > REQUEST_MAX_DURATION_MAX_MS) {
+  const configuredMin = config.get<number>('requestMaxDurationMin');
+  if (
+    typeof configuredMin === 'number' &&
+    !Number.isNaN(configuredMin) &&
+    configuredMin > 0
+  ) {
+    if (configuredMin > REQUEST_MAX_DURATION_MAX_MIN) {
       logger.warn(
-        `ollamaCloud.requestMaxDurationMs=${configured} is above maximum ${REQUEST_MAX_DURATION_MAX_MS}; clamping.`,
+        `ollamaCloud.requestMaxDurationMin=${configuredMin} is above maximum ${REQUEST_MAX_DURATION_MAX_MIN}; clamping.`,
       );
-      return REQUEST_MAX_DURATION_MAX_MS;
+      return REQUEST_MAX_DURATION_MAX_MIN * MS_PER_MINUTE;
     }
-    return configured;
+    return configuredMin * MS_PER_MINUTE;
   }
-  // Deprecated alias: requestTimeoutMs → requestMaxDurationMs.
-  const legacy = config.get<number>('requestTimeoutMs');
-  if (typeof legacy === 'number' && !Number.isNaN(legacy) && legacy > 0) {
-    if (!maxDurationDeprecationWarned) {
-      logger.warn(
-        'ollamaCloud.requestTimeoutMs is deprecated; use ollamaCloud.requestMaxDurationMs. Mapping requestTimeoutMs → requestMaxDurationMs for backward compatibility.',
-      );
-      maxDurationDeprecationWarned = true;
-    }
-    return Math.min(legacy, REQUEST_TIMEOUT_MAX_MS);
-  }
-  return REQUEST_MAX_DURATION_DEFAULT_MS;
+  return REQUEST_MAX_DURATION_DEFAULT_MIN * MS_PER_MINUTE;
 }
 
 /**

@@ -203,6 +203,21 @@ The following are explicitly **out of scope for v0.7.0**:
 | (E) Filter inside the converters (`convert.ts` / `convertResponses.ts`) | rejected | Couples filtering to protocol translation; the filter becomes endpoint-specific; harder to test in isolation. Separate module + run-before-convert keeps the converters unchanged. |
 | (F) Two-level scheme (`off` / `on`) | rejected | Too coarse. `safe` (no message removal) and `aggressive` (with truncation) serve different risk appetites; collapsing them forces users who want dedup but not truncation into the truncation path. |
 
+## Revision history — 2026-08-15 (native `/api/chat` integration)
+
+**Native `/api/chat` now consumes the filtered payload.** ADR 0009 later made
+native the cloud default (`auto` → native), but the native dispatch block
+converted the raw VS Code messages (`convertMessagesToNative`) and bypassed the
+filter — the "endpoint-agnostic" property above held in practice only for
+`/chat/completions` and `/v1/responses`. The gap is closed by
+`convertOpenAIMessagesToNative` / `convertOpenAIToolsToNative`
+(`src/convert.ts`): when the filter ran, the filtered OpenAI payload converts
+directly to the native schema (no VS Code ↔ OpenAI round-trip, symmetric with
+`convertOpenAIMessagesToResponsesInput`); the raw conversion path is preserved
+when the filter is `off`. The filter is now genuinely endpoint-agnostic across
+all three endpoints, and `requestChars` (computed after the filter) is accurate
+on the native path too.
+
 ## References
 
 - ADR 0001 — Security Goals (zero-runtime-deps invariant, provider-not-agent, SEC-03 `allowedBaseUrls` whitelist — the filter inherits all security invariants)

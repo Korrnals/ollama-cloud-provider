@@ -4,6 +4,8 @@ import {
   countOpenAIRequestChars,
   convertMessagesToOpenAI,
   convertMessagesToNative,
+  convertOpenAIMessagesToNative,
+  convertOpenAIToolsToNative,
   convertToolsToOpenAI,
   convertToolsToNative,
   getMessageText,
@@ -57,13 +59,24 @@ import {
   isSocketCloseError,
 } from './retry.js';
 import {
+  SsrfBlockedError,
+  createProductionSsrfGuard,
+  type SsrfGuard,
+} from './ssrfGuard.js';
+import {
   loadConnections,
   nativeBaseUrl,
   openAiBaseUrl,
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
-import type { OpenAICompatibleTool, UsageInfo } from './protocolTypes.js';
+import type {
+  NativeChatMessage,
+  NativeChatTool,
+  OpenAICompatibleMessage,
+  OpenAICompatibleTool,
+  UsageInfo,
+} from './protocolTypes.js';
 import { filterContext, type ContextFilterLevel } from './contextFilter.js';
 
 const AUTH_REQUIRED_DETAIL =
@@ -158,6 +171,14 @@ function endpointExplicitUnavailableError(
 export function classifyStreamError(error: unknown): Error {
   if (error instanceof MidStreamError) {
     return new Error(`Ollama Cloud: ${error.serverMessage}`);
+  }
+  // v0.12.0 ADR 0012 — SSRF guard blocked the URL. Surface a clean,
+  // actionable message. The raw `SsrfBlockedError` already carries a
+  // clean message (no stack), so pass it through. Classified as
+  // Blocked — the request was rejected by the extension's own security
+  // policy, not by the server.
+  if (error instanceof SsrfBlockedError) {
+    return vscode.LanguageModelError.Blocked(error.message);
   }
   if (error instanceof ZeroByteSocketCloseError) {
     // ADR 0008 Phase 3 — server closed before any chunk. Retryable at
@@ -276,6 +297,54 @@ function resolveResponsesTools(
     return convertOpenAIToolsToResponses(filteredTools);
   }
   return convertToolsToResponses(originalTools);
+}
+
+/**
+ * ADR 0007 — resolves the native `/api/chat` `messages[]` array from
+ * the filter state. When the context filter ran (`filterReport !==
+ * undefined`, i.e. `safe`/`aggressive`), the filter produced a
+ * filtered `OpenAICompatibleMessage[]` (`filteredMessages`) — convert
+ * it directly to the native schema via
+ * `convertOpenAIMessagesToNative` (no VS Code ↔ OpenAI round-trip,
+ * symmetric with `convertOpenAIMessagesToResponsesInput` for
+ * `/v1/responses`). When the filter did NOT run (`off` fast path,
+ * `filterReport === undefined`), convert the ORIGINAL VS Code
+ * `messages` via `convertMessagesToNative` — the regression path is
+ * untouched.
+ *
+ * Without this, the native path — the DEFAULT endpoint for cloud
+ * (`auto` → native) — silently bypassed the filter: default users got
+ * zero filtering and the `Context filter:` log line never fired for
+ * them. `requestChars` (computed AFTER the filter) is now accurate
+ * for the native path too.
+ */
+function resolveNativeMessages(
+  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
+  filteredMessages: readonly OpenAICompatibleMessage[],
+  originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
+): NativeChatMessage[] {
+  if (filterReport !== undefined) {
+    return convertOpenAIMessagesToNative(filteredMessages);
+  }
+  return convertMessagesToNative(originalMessages);
+}
+
+/**
+ * ADR 0007 — resolves the native `/api/chat` `tools[]` array from the
+ * filter state; the native mirror of `resolveResponsesTools`. When
+ * the filter ran, convert the filtered `OpenAICompatibleTool[]`
+ * directly via `convertOpenAIToolsToNative`; when the filter is `off`,
+ * use the original `convertToolsToNative` conversion path.
+ */
+function resolveNativeTools(
+  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
+  filteredTools: readonly OpenAICompatibleTool[] | undefined,
+  originalTools: readonly vscode.LanguageModelChatTool[] | undefined,
+): NativeChatTool[] | undefined {
+  if (filterReport !== undefined) {
+    return convertOpenAIToolsToNative(filteredTools);
+  }
+  return convertToolsToNative(originalTools);
 }
 
 type ModelPickerInformation = vscode.LanguageModelChatInformation & {
@@ -688,7 +757,31 @@ export class OllamaCloudChatProvider
       const clientBaseUrl = connection
         ? openAiBaseUrl(connection)
         : this.authManager.getBaseUrl();
-      const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection);
+
+      // v0.12.0 ADR 0012 — SSRF guard. Defence-in-depth: the SEC-03
+      // string-whitelist check already ran in the client (assertBaseUrl
+      // AllowedOrThrow), but it cannot catch DNS-rebinding. The guard
+      // resolves the hostname to an IP right before fetch and rejects
+      // protected ranges (cloud metadata, RFC 1918, loopback, etc.).
+      // Local connections allow loopback AND RFC 1918 private ranges
+      // (v0.12.0 review P1 fix — LAN-hosted Ollama such as
+      // http://192.168.1.50:11434 is a user-configured endpoint);
+      // cloud metadata (169.254/16), CGNAT and all IPv6-sensitive
+      // ranges stay blocked even for local. Cloud connections reject
+      // everything private and point block errors at the whitelist.
+      // Guard creation is cheap — one object allocation per request,
+      // no DNS resolution at construction. Declared early so the
+      // legacy `client` below (and all dispatch branches) can thread
+      // it through.
+      const isLocalConnection = connection?.type === 'local';
+      const ssrfGuard: SsrfGuard = isLocalConnection
+        ? createProductionSsrfGuard({ allowLoopback: true, allowPrivateRanges: true })
+        : createProductionSsrfGuard({
+            allowLoopback: false,
+            advice: 'Check the URL or your ollamaCloud.allowedBaseUrls whitelist.',
+          });
+
+      const client = new OllamaClient(clientBaseUrl, apiKey ?? '', connection, 'compat', ssrfGuard);
       const modelOptions = options as ModelConfigurationOptions;
       const requestConfiguration = resolveModelRequestConfiguration(
         model,
@@ -966,6 +1059,7 @@ export class OllamaCloudChatProvider
             clientBaseUrl,
             apiKey ?? '',
             connection,
+            ssrfGuard,
           );
           // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
           // When the filter ran (`filterReport !== undefined`), shape
@@ -1060,9 +1154,17 @@ export class OllamaCloudChatProvider
             apiKey ?? '',
             endpointConnection,
             'native',
+            ssrfGuard,
           );
-          const nativeMessages = convertMessagesToNative(messages);
-          const nativeTools = convertToolsToNative(options.tools);
+          // ADR 0007 — native `/api/chat` consumes the FILTERED
+          // payload, mirroring the `/v1/responses` path above: when
+          // the filter ran, convert the filtered OpenAI messages/tools
+          // directly (no VS Code ↔ OpenAI round-trip); when the filter
+          // is `off`, the original conversion path runs unchanged.
+          // Before this, the native path — the DEFAULT for cloud
+          // (`auto` → native) — silently bypassed the filter.
+          const nativeMessages = resolveNativeMessages(filterReport, filteredMessages, messages);
+          const nativeTools = resolveNativeTools(filterReport, filteredTools, options.tools);
           const nativeConfig = resolveModelRequestConfiguration(model, modelOptions, 'native');
           await this.runStream(
             (callbacks) =>
@@ -1133,6 +1235,7 @@ export class OllamaCloudChatProvider
             clientBaseUrl,
             apiKey ?? '',
             connection,
+            ssrfGuard,
           );
           // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
           // When the filter ran (`filterReport !== undefined`), shape
@@ -1261,6 +1364,7 @@ export class OllamaCloudChatProvider
             clientBaseUrl,
             apiKey ?? '',
             connection,
+            ssrfGuard,
           );
           // ADR 0007 — same filtered-payload routing as the primary
           // /v1/responses path above.

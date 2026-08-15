@@ -5,8 +5,34 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Fixed
+- **Context filter now applies to the native `/api/chat` path (ADR 0007 gap)** — native (the cloud default, `auto` → native) silently bypassed the filter: default cloud users got zero filtering and the `Context filter:` log line never fired. The filtered OpenAI payload now converts via the new `convertOpenAIMessagesToNative` / `convertOpenAIToolsToNative` (no VS Code ↔ OpenAI round-trip); the raw conversion path is preserved when the filter is `off`. `requestChars` is now accurate on the native path too. 12 tests added.
+- **P1 (review) — SSRF guard closed IPv4-embedded IPv6 bypass** — `::ffff:169.254.169.254`, NAT64 (`64:ff9b::/96`) and IPv4-compatible (`::a.b.c.d`) forms were never classified against the embedded IPv4 address; all three now run the low 32 bits through the shared IPv4 classifier (mapped loopback respects `allowLoopback`). Unspecified `::` is blocked as well.
+- **P1 (review) — LAN-hosted Ollama unblocked on local connections** — RFC 1918 ranges were hard-blocked even for `type:'local'` connections, and the block error promised a non-existent "explicit override". Local connections now set `allowPrivateRanges` (10/8, 172.16/12, 192.168/16 allowed); cloud metadata (169.254/16), CGNAT and all IPv6-sensitive ranges never relax. Error message rewritten; cloud errors point at `ollamaCloud.allowedBaseUrls`.
+- **P1 (review) — ADR 0012 rewritten** to match the shipped single-timer + SSRF-guard implementation; the rejected raise-timeout draft is preserved as an appendix.
+- **P2 (review) — native converter drops empty `user`/`system` entries** after filtering (mirrors the VS Code-path guard; tool messages unaffected); SSRF error messages strip control characters (log-forging hygiene).
+## [0.12.0] - 2026-08-12
+
+Root-cause fix for "extension disconnects / agent loops" + SSRF guard + UX improvements.
+
+### Fixed — root cause of disconnects/loops
+- **P0 — native converter dropped tool results (subagent breakage)** — `convertMessagesToNative` dropped user messages whose only content was a `LanguageModelToolResultPart` (the `continue` on empty text skipped the tool-results emit). The model never saw tool outputs, so subagents looped, re-issued calls, and reported success without files changing. Evidence: debug log showed `convertNative: dropped empty user message (parts=1)` 36× in a row. Fix mirrors the compat converter contract: tool results survive even when the host message is empty. 4 regression tests added.
+- **Removed connect + inactivity timers (ADR 0012 revised)** — the connect timer (60s) killed legitimate reasoning-model requests with slow TTFT (60-70s). 12 curl tests proved the server never disconnected. Both timers deleted entirely; only max-duration (60min) remains as single hard ceiling.
+
+### Added
+- **SSRF guard** (`src/ssrfGuard.ts`) — DNS-resolution-based defence-in-depth. Blocks cloud metadata (169.254.169.254), RFC 1918 private, loopback, IPv6 unique-local. Uses dependency injection (not sinon). 26 unit tests.
+- **Context filter tool-integrity integration tests** — 11 tests verifying tool_call_output survives safe/aggressive filtering.
+
 ### Changed
-- _(nothing yet)_
+- **max-duration: ms → minutes** — `requestMaxDurationMs` renamed to `requestMaxDurationMin`, default 60 (minutes), range 1-1440. User-friendly.
+- **Vision params UX** — descriptions rewritten for non-technical users. Three params remain: `enabled`, `model`, `connection` (marked Advanced).
+- **`defaultRetryOn` simplified** — removed ConnectTimeoutError/InactivityTimeoutError checks (classes deleted).
+
+### Removed
+- `ConnectTimeoutError`, `InactivityTimeoutError` classes
+- `resolveConnectTimeoutMs()`, `resolveInactivityTimeoutMs()`
+- `ollamaCloud.requestConnectTimeoutMs`, `ollamaCloud.requestInactivityTimeoutMs` settings
+- 7 stale tests for removed timer behavior
 
 ## [0.11.0] - 2026-08-11
 

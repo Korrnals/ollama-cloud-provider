@@ -3,6 +3,8 @@ import * as vscode from 'vscode';
 import { OllamaClient } from '../../src/ollamaClient.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 
+import type { ToolCallEvent } from '../../src/protocolTypes.js';
+
 /** Typed view of a stubbed global.fetch — carries restore metadata. */
 type FetchStub = typeof fetch & {
   __isStub?: boolean;
@@ -74,10 +76,12 @@ function wireAbortSignal(
 function makeCallbacks(): StreamCallbacks & {
   text: string[];
   errors: Error[];
+  toolCalls: ToolCallEvent[];
   doneCount: number;
 } {
   const text: string[] = [];
   const errors: Error[] = [];
+  const toolCalls: ToolCallEvent[] = [];
   // Use a mutable state object so the getter reflects the current count.
   // A plain `doneCount` property would snapshot 0 at creation time and
   // never update — the onDone closure would increment a local variable
@@ -86,11 +90,12 @@ function makeCallbacks(): StreamCallbacks & {
   return {
     text,
     errors,
+    toolCalls,
     get doneCount() {
       return state.doneCount;
     },
     onText: (t) => text.push(t),
-    onToolCall: () => {},
+    onToolCall: (tc) => toolCalls.push(tc),
     onDone: () => {
       state.doneCount += 1;
     },
@@ -110,7 +115,7 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
       requestTimeoutMs: 120000,
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
   });
@@ -134,7 +139,7 @@ describe('ollamaClient.streamChat — timeout / buffer / cancel', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 1000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
 
@@ -335,7 +340,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
   });
@@ -343,61 +348,6 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
   afterEach(() => {
     const stub = global.fetch as FetchStub;
     if (stub.__isStub && stub.__original) global.fetch = stub.__original;
-  });
-
-  it('connect timeout fires when fetch never resolves and retries', async function () {
-    // fetch hangs forever — the connect timer (1000ms) aborts it.
-    // maxRetries=2 → fetch called 3 times (1 + 2 retries). Each
-    // attempt hits the connect timeout → ConnectTimeoutError → retried
-    // via defaultRetryOn → after maxRetries exhausted → onError.
-    this.timeout(15000);
-
-    setConfig({
-      baseUrl: BASE_URL,
-      allowedBaseUrls: [BASE_URL],
-      requestConnectTimeoutMs: 1000,
-      requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
-      maxRetries: 2,
-    });
-
-    let fetchCalls = 0;
-    const originalFetch = global.fetch;
-    global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      fetchCalls += 1;
-      // Never resolve — simulate an unreachable server. The connect
-      // timer aborts the signal; fetch rejects with AbortError.
-      return new Promise<Response>((_resolve, reject) => {
-        const signal = init?.signal;
-        if (signal) {
-          if (signal.aborted) {
-            const err = new Error('aborted');
-            err.name = 'AbortError';
-            reject(err);
-            return;
-          }
-          signal.addEventListener('abort', () => {
-            const err = new Error('aborted');
-            err.name = 'AbortError';
-            reject(err);
-          });
-        }
-      });
-    }) as typeof fetch;
-
-    const recorder = makeCallbacks();
-    const client = new OllamaClient(BASE_URL, 'sk-test-key');
-    await client.streamChat(
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
-      recorder,
-    );
-
-    assert.equal(recorder.errors.length, 1, 'onError must fire after retries exhausted');
-    assert.match(recorder.errors[0]!.message, /connect timeout/);
-    assert.equal(fetchCalls, 3, 'fetch must be called maxRetries+1 = 3 times');
-    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
-
-    global.fetch = originalFetch;
   });
 
   it('inactivity timer resets on each chunk — long stream does not false-trigger', async function () {
@@ -410,7 +360,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 1000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
 
@@ -460,7 +410,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 1000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 2,
     });
 
@@ -509,7 +459,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 500,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
 
@@ -551,7 +501,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 300,
+      requestMaxDurationMin: 0.005,
       maxRetries: 0,
     });
 
@@ -644,7 +594,7 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 1000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
 
@@ -682,139 +632,6 @@ describe('ollamaClient.streamChat — ADR 0005 streaming timers', () => {
     global.fetch = originalFetch;
   });
 
-  it('requestTimeoutMs (legacy) maps to requestMaxDurationMs — bounds total duration', async function () {
-    // Set ONLY requestTimeoutMs=400 (legacy), leave the new settings
-    // unset. The resolver maps legacy → maxDuration=400. A stream that
-    // emits chunks forever hits max-duration at 400ms.
-    this.timeout(5000);
-
-    setConfig({
-      baseUrl: BASE_URL,
-      allowedBaseUrls: [BASE_URL],
-      requestTimeoutMs: 400,
-      requestConnectTimeoutMs: 30000,
-      requestInactivityTimeoutMs: 90000,
-      // requestMaxDurationMs intentionally unset → alias kicks in
-      maxRetries: 0,
-    });
-
-    let streamController: ReadableStreamDefaultController<Uint8Array> | null =
-      null;
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        streamController = controller;
-        const interval = setInterval(() => {
-          controller.enqueue(
-            encode('data: {"choices":[{"delta":{"content":"x"}}]}\n'),
-          );
-        }, 50);
-        (controller as TestableStreamController)._testInterval = interval;
-      },
-    });
-
-    const originalFetch = global.fetch;
-    global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      wireAbortSignal(init?.signal ?? undefined, streamController);
-      return mockResponse(body);
-    }) as typeof fetch;
-
-    const recorder = makeCallbacks();
-    const client = new OllamaClient(BASE_URL, 'sk-test-key');
-    await client.streamChat(
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
-      recorder,
-    );
-
-    assert.equal(recorder.errors.length, 1, 'legacy timeout bounds total duration');
-    assert.match(
-      recorder.errors[0]!.message,
-      /max stream duration/,
-      'legacy requestTimeoutMs maps to maxDuration error',
-    );
-
-    if (streamController) {
-      const interval = (streamController as TestableStreamController)._testInterval;
-      if (interval) clearInterval(interval);
-    }
-    global.fetch = originalFetch;
-  });
-
-  it('connect timeout retries with a fresh AbortController and succeeds on the 3rd attempt', async function () {
-    // Regression test for the per-attempt AbortController fix
-    // (ADR 0005). Before the fix, the connect timer aborted the MAIN
-    // controller. Once aborted, `fetch(url, { signal: aborted })`
-    // rejected instantly on every retry — all attempts wasted, user
-    // saw "connect timeout after 30000ms". With the fix, each attempt
-    // gets its own fresh `attemptController`; only the connect timer
-    // aborts it (per-attempt), so retry actually re-issues fetch.
-    //
-    // Mock fetch to hang (never resolve) for the first 2 attempts,
-    // then resolve a clean SSE stream on the 3rd. connectTimeoutMs
-    // is short (100ms) so each hang triggers a ConnectTimeoutError
-    // quickly. maxRetries=3 → fetch called 3 times (2 timeouts + 1
-    // success). This test would FAIL with the old bug: after the
-    // first connect timeout aborted the main controller, attempts 2
-    // and 3 would reject instantly with AbortError — fetch would be
-    // called 3 times but the 3rd would never reach the success
-    // branch because its signal is already aborted, so onDone would
-    // never fire and onError would fire instead.
-    this.timeout(15000);
-
-    setConfig({
-      baseUrl: BASE_URL,
-      allowedBaseUrls: [BASE_URL],
-      requestConnectTimeoutMs: 100,
-      requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
-      maxRetries: 3,
-    });
-
-    let fetchCalls = 0;
-    const originalFetch = global.fetch;
-    global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      fetchCalls += 1;
-      const signal = init?.signal;
-      // Attempts 1 and 2: hang until the connect timer aborts the
-      // per-attempt signal. Attempt 3: resolve a clean stream.
-      if (fetchCalls < 3) {
-        return new Promise<Response>((_resolve, reject) => {
-          if (signal) {
-            if (signal.aborted) {
-              const err = new Error('aborted');
-              err.name = 'AbortError';
-              reject(err);
-              return;
-            }
-            signal.addEventListener('abort', () => {
-              const err = new Error('aborted');
-              err.name = 'AbortError';
-              reject(err);
-            });
-          }
-        });
-      }
-      // Attempt 3 — success. Return a minimal well-formed SSE stream.
-      const body = streamFromChunks([
-        encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
-        encode('data: [DONE]\n'),
-      ]);
-      return mockResponse(body);
-    }) as typeof fetch;
-
-    const recorder = makeCallbacks();
-    const client = new OllamaClient(BASE_URL, 'sk-test-key');
-    await client.streamChat(
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
-      recorder,
-    );
-
-    assert.equal(fetchCalls, 3, 'fetch must be called 3 times (2 connect timeouts + 1 success)');
-    assert.equal(recorder.doneCount, 1, 'onDone must fire after the 3rd attempt succeeds');
-    assert.equal(recorder.errors.length, 0, 'onError must NOT fire — retry recovered');
-    assert.equal(recorder.text.join(''), 'ok', 'stream text from the 3rd attempt is delivered');
-
-    global.fetch = originalFetch;
-  });
 });
 
 /**
@@ -839,7 +656,7 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
   });
@@ -979,7 +796,7 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 2,
     });
 
@@ -1012,6 +829,135 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
     assert.equal(recorder.doneCount, 1, 'onDone must fire after retry recovers');
     assert.equal(recorder.errors.length, 0, 'onError must NOT fire');
     assert.equal(recorder.text.join(''), 'ok');
+
+    global.fetch = originalFetch;
+  });
+});
+
+/**
+ * Native `/api/chat` tool-call streaming — the default cloud endpoint.
+ *
+ * Regression coverage for the VS Code subagent `tryDeserialize` crash:
+ * tool_calls arrive as a single full-event chunk (non-terminal,
+ * `done:false`), followed by an empty chunk, then a terminal
+ * `done:true` chunk. The fix ensures `onToolCall` fires with a
+ * non-empty `id` even when the model omits one.
+ */
+describe('ollamaClient.streamChat — native /api/chat tool-call streaming', () => {
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMin: 30,
+      maxRetries: 0,
+    });
+  });
+
+  afterEach(() => {
+    const stub = global.fetch as FetchStub;
+    if (stub.__isStub && stub.__original) global.fetch = stub.__original;
+  });
+
+  it('emits thinking → tool_calls → empty → done as a clean non-terminal sequence', async () => {
+    // The exact failing scenario: thinking chunk, tool_calls chunk
+    // (done:false), an empty content chunk (done:false), then the
+    // terminal done:true chunk. The empty chunk must be a no-op,
+    // not an error.
+    const chunks = [
+      encode('{"message":{"role":"assistant","thinking":"calculating"},"done":false}\n'),
+      encode('{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_abc123","type":"function","function":{"index":0,"name":"calculator","arguments":{"expression":"2+2"}}}]},"done":false}\n'),
+      encode('{"message":{"role":"assistant","content":""},"done":false}\n'),
+      encode('{"model":"glm-5.2","done":true,"done_reason":"stop","prompt_eval_count":10,"eval_count":5}\n'),
+    ];
+    const body = streamFromChunks(chunks);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key', undefined, 'native');
+    await client.streamChat(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'what is 2+2?' }] },
+      recorder,
+    );
+
+    // onToolCall fires exactly once with the full-event tool call.
+    assert.equal(recorder.toolCalls.length, 1, 'onToolCall must fire once');
+    assert.equal(recorder.toolCalls[0]!.id, 'call_abc123', 'id must be forwarded');
+    assert.equal(recorder.toolCalls[0]!.name, 'calculator');
+    assert.deepEqual(recorder.toolCalls[0]!.input, { expression: '2+2' });
+
+    // onDone fires exactly once (only on the terminal done:true chunk).
+    assert.equal(recorder.doneCount, 1, 'onDone must fire exactly once');
+    assert.equal(recorder.errors.length, 0, 'empty chunk must NOT be an error');
+    assert.equal(recorder.text.length, 0, 'no text content in this stream');
+
+    global.fetch = originalFetch;
+  });
+
+  it('generates a non-empty fallback id when the model omits toolCall.id', async () => {
+    // Bug 1 regression: when toolCall.id is undefined, the old code
+    // emitted id:'' which broke VS Code tool-result routing. The fix
+    // generates a `call_<ts>_<rand>` fallback so callId is never empty.
+    const chunks = [
+      encode('{"message":{"role":"assistant","tool_calls":[{"type":"function","function":{"index":0,"name":"search","arguments":{"query":"hello"}}}]},"done":false}\n'),
+      encode('{"done":true,"done_reason":"stop"}\n'),
+    ];
+    const body = streamFromChunks(chunks);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key', undefined, 'native');
+    await client.streamChat(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'search hello' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.toolCalls.length, 1, 'onToolCall must fire');
+    const id = recorder.toolCalls[0]!.id;
+    assert.ok(id && id.length > 0, 'fallback id must be non-empty');
+    assert.match(id, /^call_\d+_[a-z0-9]+$/, 'fallback id must match the generator pattern');
+    assert.equal(recorder.toolCalls[0]!.name, 'search');
+    assert.deepEqual(recorder.toolCalls[0]!.input, { query: 'hello' });
+    assert.equal(recorder.doneCount, 1);
+    assert.equal(recorder.errors.length, 0);
+
+    global.fetch = originalFetch;
+  });
+
+  it('handles multiple tool calls in a single full-event chunk', async () => {
+    // Native mode can emit multiple tool_calls in one chunk. Each must
+    // be emitted as a separate onToolCall with its own (non-empty) id.
+    const chunks = [
+      encode('{"message":{"role":"assistant","tool_calls":[{"id":"call_one","function":{"name":"add","arguments":{"a":1,"b":2}}},{"function":{"name":"mul","arguments":{"a":3,"b":4}}}]},"done":false}\n'),
+      encode('{"done":true,"done_reason":"tool_calls"}\n'),
+    ];
+    const body = streamFromChunks(chunks);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key', undefined, 'native');
+    await client.streamChat(
+      { model: 'glm-5.2', messages: [{ role: 'user', content: 'multi' }] },
+      recorder,
+    );
+
+    assert.equal(recorder.toolCalls.length, 2, 'both tool calls must fire');
+    assert.equal(recorder.toolCalls[0]!.id, 'call_one');
+    assert.equal(recorder.toolCalls[0]!.name, 'add');
+    assert.deepEqual(recorder.toolCalls[0]!.input, { a: 1, b: 2 });
+    // Second call has no id — fallback must kick in.
+    assert.ok(recorder.toolCalls[1]!.id.length > 0, 'second call fallback id non-empty');
+    assert.equal(recorder.toolCalls[1]!.name, 'mul');
+    assert.deepEqual(recorder.toolCalls[1]!.input, { a: 3, b: 4 });
+    assert.equal(recorder.doneCount, 1);
 
     global.fetch = originalFetch;
   });

@@ -94,7 +94,7 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
       requestTimeoutMs: 120000,
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
   });
@@ -253,7 +253,7 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 1000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
 
@@ -279,55 +279,6 @@ describe('responsesClient.streamResponses — /v1/responses event protocol', () 
 
     assert.equal(recorder.errors.length, 1);
     assert.match(recorder.errors[0].message, /stalled/);
-    assert.equal(recorder.doneCount, 0);
-
-    global.fetch = originalFetch;
-  });
-
-  it('retries the connect phase when fetch hangs (connect timeout)', async function () {
-    this.timeout(15000);
-
-    setConfig({
-      baseUrl: BASE_URL,
-      allowedBaseUrls: [BASE_URL],
-      requestConnectTimeoutMs: 1000,
-      requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
-      maxRetries: 2,
-    });
-
-    let fetchCalls = 0;
-    const originalFetch = global.fetch;
-    global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      fetchCalls += 1;
-      return new Promise<Response>((_resolve, reject) => {
-        const signal = init?.signal;
-        if (signal) {
-          if (signal.aborted) {
-            const err = new Error('aborted');
-            err.name = 'AbortError';
-            reject(err);
-            return;
-          }
-          signal.addEventListener('abort', () => {
-            const err = new Error('aborted');
-            err.name = 'AbortError';
-            reject(err);
-          });
-        }
-      });
-    }) as typeof fetch;
-
-    const recorder = makeCallbacks();
-    const client = new ResponsesClient(BASE_URL, 'sk-test-key');
-    await client.streamResponses(
-      { model: 'm', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
-      recorder,
-    );
-
-    assert.equal(recorder.errors.length, 1);
-    assert.match(recorder.errors[0].message, /connect timeout/);
-    assert.equal(fetchCalls, 3, 'fetch must be called maxRetries+1 = 3 times');
     assert.equal(recorder.doneCount, 0);
 
     global.fetch = originalFetch;
@@ -414,7 +365,7 @@ describe('responsesClient.streamResponses — ADR 0008 socket-close classificati
       allowedBaseUrls: [BASE_URL],
       requestConnectTimeoutMs: 30000,
       requestInactivityTimeoutMs: 90000,
-      requestMaxDurationMs: 1800000,
+      requestMaxDurationMin: 30,
       maxRetries: 0,
     });
   });
