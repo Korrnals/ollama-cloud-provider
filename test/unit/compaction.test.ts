@@ -1,10 +1,14 @@
 import assert from 'node:assert';
 import {
+  COMPACT_COOLDOWN_MS,
   SUMMARY_MARKER,
   applyCompacted,
   buildSummaryPrompt,
+  capEvictedBlock,
   compactIfNeeded,
   estimateTokens,
+  evictedCapTokens,
+  retrievalBudgetTokens,
   shouldCompact,
   splitZones,
   type CompactionState,
@@ -68,6 +72,34 @@ function fakeSummarizer(summary: string, err?: Error): Summarizer & { calls: str
     calls.push(prompt);
     if (err) throw err;
     return summary;
+  };
+  return Object.assign(fn, { calls });
+}
+
+/** Store fake returning a queued pointer per call (slice 1.1 chain tests). */
+function queueStore(pointers: string[]): EvictedStore & { calls: string[] } {
+  const calls: string[] = [];
+  let i = 0;
+  return {
+    calls,
+    store: async (blockText: string): Promise<string> => {
+      calls.push(blockText);
+      const p = pointers[Math.min(i, pointers.length - 1)]!;
+      i++;
+      return p;
+    },
+  };
+}
+
+/** Summarizer fake returning a queued summary per call (slice 1.1 chain tests). */
+function queueSummarizer(summaries: string[]): Summarizer & { calls: string[] } {
+  const calls: string[] = [];
+  let i = 0;
+  const fn = async (prompt: string): Promise<string> => {
+    calls.push(prompt);
+    const s = summaries[Math.min(i, summaries.length - 1)]!;
+    i++;
+    return s;
   };
   return Object.assign(fn, { calls });
 }
@@ -287,6 +319,7 @@ describe('compaction (v0.13.0 slice 1)', () => {
         store,
         render,
         isPinned: (m) => m.content.startsWith('PIN'),
+        nowMs: 123_456, // slice 1.1: deterministic lastFiredAt
       });
 
       assert.strictEqual(result.compacted, true);
@@ -313,7 +346,13 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.ok(summarize.calls[0]!.includes('t01u'));
       assert.strictEqual(result.pointer, 'ptr-1');
       assert.strictEqual(result.summary, 'GOAL: keep the goal. DONE: work.');
-      assert.deepStrictEqual(result.state, { armed: false });
+      // Slice 1.1 (additive): the fire stamps the summary chain onto the state.
+      assert.deepStrictEqual(result.state, {
+        armed: false,
+        lastSummary: 'GOAL: keep the goal. DONE: work.',
+        lastPointer: 'ptr-1',
+        lastFiredAt: 123_456,
+      });
     });
 
     it('re-arms when the compaction result lands at or below the 40% target', async () => {
@@ -328,11 +367,17 @@ describe('compaction (v0.13.0 slice 1)', () => {
         summarize: fakeSummarizer('GOAL: keep the goal. DONE: work.'),
         store: fakeStore('ptr-1'),
         render,
+        nowMs: 1_000_000, // slice 1.1: deterministic lastFiredAt
       });
       assert.strictEqual(result.compacted, true);
       assert.strictEqual(result.messages.length, 1 + 1 + 20); // sys + inject + recency
       assert.strictEqual(result.messages[2], messages[61]); // user of turn 31
-      assert.deepStrictEqual(result.state, { armed: true });
+      assert.deepStrictEqual(result.state, {
+        armed: true,
+        lastSummary: 'GOAL: keep the goal. DONE: work.',
+        lastPointer: 'ptr-1',
+        lastFiredAt: 1_000_000,
+      });
     });
 
     it('falls back to passthrough when the summarizer throws', async () => {
@@ -372,6 +417,171 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(result.compacted, false);
       assert.deepStrictEqual(result.messages, messages);
       assert.strictEqual(summarize.calls.length, 0);
+    });
+  });
+
+  describe('capEvictedBlock (slice 1.1)', () => {
+    it('passes the block through untouched when under the cap', () => {
+      const text = 'x'.repeat(400);
+      const r = capEvictedBlock(text, 500, 1);
+      assert.strictEqual(r.capped, false);
+      assert.strictEqual(r.text, text);
+      assert.strictEqual(r.originalTokens, 400);
+    });
+
+    it('keeps head + tail with a single omission marker when over the cap', () => {
+      // H×200 + z×200 + T×200 = 600 tokens; cap 100 tokens (cpt 1).
+      const text = 'H'.repeat(200) + 'z'.repeat(200) + 'T'.repeat(200);
+      const r = capEvictedBlock(text, 100, 1);
+      assert.strictEqual(r.capped, true);
+      assert.strictEqual(r.originalTokens, 600);
+      assert.match(r.text, /\[… \d+ chars omitted, stored in full under pointer …\]/);
+      assert.strictEqual(r.text.match(/chars omitted/g)?.length, 1); // single marker
+      assert.ok(r.text.startsWith('H')); // head kept from the very start
+      assert.ok(r.text.endsWith('T')); // tail kept to the very end
+      assert.ok(!r.text.includes('z')); // the middle was dropped
+      assert.ok(estimateTokens(r.text.length, 1) <= 100); // result fits the cap
+    });
+  });
+
+  describe('budget helpers (slice 1.1)', () => {
+    it('computes the evicted cap as 25% and the retrieval budget as 10% of the window', () => {
+      assert.strictEqual(evictedCapTokens(2000), 500);
+      assert.strictEqual(retrievalBudgetTokens(4000), 400);
+      assert.strictEqual(retrievalBudgetTokens(1234), 123); // floored, never above 10%
+    });
+  });
+
+  describe('shouldCompact rate guard (slice 1.1)', () => {
+    it('refuses a second fire within the cooldown, allows it after', () => {
+      const state: CompactionState = { armed: true, lastFiredAt: 1_000_000 };
+      assert.strictEqual(shouldCompact(state, 900, 1000, 1_000_000 + 60_000), false);
+      assert.strictEqual(shouldCompact(state, 900, 1000, 1_000_000 + COMPACT_COOLDOWN_MS - 1), false);
+      assert.strictEqual(shouldCompact(state, 900, 1000, 1_000_000 + COMPACT_COOLDOWN_MS), true);
+    });
+
+    it('honours a custom cooldown and ignores the guard when never fired', () => {
+      const state: CompactionState = { armed: true, lastFiredAt: 500 };
+      assert.strictEqual(shouldCompact(state, 900, 1000, 1_000, 10_000), false); // 500 elapsed < 10s
+      assert.strictEqual(shouldCompact(state, 900, 1000, 10_500, 10_000), true); // 10s elapsed
+      assert.strictEqual(shouldCompact({ armed: true }, 900, 1000, 42), true); // never fired
+    });
+  });
+
+  describe('compactIfNeeded (slice 1.1)', () => {
+    it('chains: the second compaction folds the first summary and pointer', async () => {
+      const store = queueStore(['ptr-1', 'ptr-2']);
+      const summarize = queueSummarizer(['SUMMARY-ONE', 'SUMMARY-TWO']);
+      const history = (): Msg[] => [sys('s1'), ...turns(20)]; // used = 2050, fire at 1050 (window 1400)
+
+      const first = await compactIfNeeded({
+        messages: history(),
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        nowMs: 1_000_000,
+      });
+      assert.strictEqual(first.compacted, true);
+      assert.strictEqual(first.pointer, 'ptr-1');
+      assert.ok(!summarize.calls[0]!.includes('PREVIOUS CHECKPOINT')); // first: no chain yet
+      assert.deepStrictEqual(first.state, {
+        armed: false,
+        lastSummary: 'SUMMARY-ONE',
+        lastPointer: 'ptr-1',
+        lastFiredAt: 1_000_000,
+      });
+      const firstInjected = first.messages[1] as Msg;
+      assert.ok(!firstInjected.content.includes('previous pointer'));
+
+      // Caller re-arms after observing the result at <= 40% (applyCompacted contract).
+      const second = await compactIfNeeded({
+        messages: history(),
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: { ...first.state, armed: true },
+        summarize,
+        store,
+        render,
+        nowMs: 2_000_000, // outside the 5-minute cooldown
+      });
+      assert.strictEqual(second.compacted, true);
+      assert.strictEqual(second.pointer, 'ptr-2');
+      assert.ok(summarize.calls[1]!.includes('PREVIOUS CHECKPOINT'));
+      assert.ok(summarize.calls[1]!.includes('SUMMARY-ONE')); // folded into the prompt
+      assert.deepStrictEqual(second.state, {
+        armed: false,
+        lastSummary: 'SUMMARY-TWO',
+        lastPointer: 'ptr-2',
+        lastFiredAt: 2_000_000,
+      });
+      const secondInjected = second.messages[1] as Msg;
+      assert.ok(secondInjected.content.includes('[evicted-block pointer: ptr-2]'));
+      assert.ok(secondInjected.content.includes('[previous pointer: ptr-1]')); // pointer chain
+    });
+
+    it('caps the evicted block for the summarizer only — the store keeps the full text', async () => {
+      const messages = [sys('s1'), ...turns(30)]; // used = 3050, fire at 3000 (window 4000)
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('GOAL: keep. DONE: work.');
+      const result = await compactIfNeeded({
+        messages,
+        windowTokens: 4000,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        summarizerWindowTokens: 2000, // cap = 500 tokens; evicted block ≈ 2078 tokens
+        nowMs: 5_000_000,
+      });
+      assert.strictEqual(result.compacted, true);
+      assert.strictEqual(result.stats?.capped, true);
+      // Store received the FULL evicted block (t01u..t20a, middle included).
+      assert.strictEqual(store.calls.length, 1);
+      assert.ok(store.calls[0]!.includes('t01u'));
+      assert.ok(store.calls[0]!.includes('t10a'));
+      assert.ok(store.calls[0]!.includes('t20a'));
+      // Summarizer saw the capped head + tail, not the middle.
+      assert.match(summarize.calls[0]!, /chars omitted, stored in full under pointer/);
+      assert.ok(summarize.calls[0]!.includes('t01u')); // head kept
+      assert.ok(summarize.calls[0]!.includes('t20a')); // tail kept
+      assert.ok(!summarize.calls[0]!.includes('t10a')); // middle dropped
+    });
+
+    it('populates stats on compaction and reports null on passthrough', async () => {
+      const messages = [sys('s1'), ...turns(20)]; // used = 2050
+      const compacted = await compactIfNeeded({
+        messages,
+        windowTokens: 2600, // fire at 1950
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize: fakeSummarizer('GOAL: keep.'),
+        store: fakeStore('ptr-9'),
+        render,
+        nowMs: 42,
+      });
+      assert.strictEqual(compacted.compacted, true);
+      assert.deepStrictEqual(compacted.stats, {
+        beforeTokens: 2050,
+        afterTokens: compacted.messages.reduce((s, m) => s + est(m), 0),
+        evictedMessages: 27, // 40 messages − 13-message recency
+        capped: false, // no summarizerWindowTokens → no cap
+      });
+
+      const idle = await compactIfNeeded({
+        messages,
+        windowTokens: 4000, // 75% = 3000 > 2050 → no fire
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize: fakeSummarizer('x'),
+        store: fakeStore('p'),
+        render,
+      });
+      assert.strictEqual(idle.compacted, false);
+      assert.strictEqual(idle.stats, null);
     });
   });
 });

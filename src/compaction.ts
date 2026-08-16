@@ -21,8 +21,14 @@
  *     tool results.
  *   - Sliding summary: summarize(previous + only the newly evicted
  *     block) into a checkpoint (Goal first line, Done, Decisions, Open
- *     threads, Turn range). Slice 1 passes `previousSummary = null`;
- *     the stored chain is Slice 2.
+ *     threads, Turn range). Slice 1.1 carries the chain in
+ *     `CompactionState.lastSummary/lastPointer` — `previousSummary` is
+ *     null only on the FIRST compaction.
+ *   - Slice 1.1 hardening: the evicted block is capped to 25% of the
+ *     summarizer window before prompting (the store keeps the full
+ *     text); a 5-minute cooldown rate-guards re-fires against estimate
+ *     oscillation; the compaction result carries before/after/capped
+ *     stats for Slice 2 logging.
  */
 
 /** Fire threshold — fraction of the model window (spec: 75%). */
@@ -33,6 +39,12 @@ export const COMPACT_TARGET_RATIO = 0.4;
 export const RECENCY_WINDOW_RATIO = 0.25;
 /** Recency turn floor — minimum number of recent turns kept verbatim (spec: 6). */
 export const RECENCY_TURN_FLOOR = 6;
+/** Rate-guard cooldown in ms — minimum spacing between two fires (spec slice 1.1: 5 minutes). */
+export const COMPACT_COOLDOWN_MS = 300_000;
+/** Evicted-block cap — fraction of the SUMMARIZER window the block may occupy (spec slice 1.1: 25%). */
+export const EVICTED_CAP_RATIO = 0.25;
+/** Retrieval budget — fraction of the model window a dereferenced block may occupy (spec slice 1.1: 10%). */
+export const RETRIEVAL_BUDGET_RATIO = 0.1;
 
 /**
  * Prefix of the injected summary message content. Identifies the
@@ -59,6 +71,64 @@ export function estimateTokens(chars: number, charsPerToken: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Evicted-block cap + retrieval budget (slice 1.1)
+// ---------------------------------------------------------------------------
+
+/** Result of {@link capEvictedBlock}. */
+export interface CappedBlock {
+  /** The block as the summarizer may see it — uncapped, or head+tail with one omission marker. */
+  text: string;
+  /** `true` when the input exceeded the cap and was truncated. */
+  capped: boolean;
+  /** Token estimate of the ORIGINAL text (useful in stats even when uncapped). */
+  originalTokens: number;
+}
+
+/** The single omission marker inserted at the cut (spec slice 1.1 wording). */
+function omittedMarker(omittedChars: number): string {
+  return `[… ${omittedChars} chars omitted, stored in full under pointer …]`;
+}
+
+/**
+ * Caps an evicted block to `maxTokens` before it reaches the summarizer —
+ * self-compaction loop protection: the cheap model has its own window and
+ * must never be handed a block proportional to the MAIN window. Local and
+ * deterministic (head + tail + one marker, zero LLM cost); the full text
+ * still goes to the store — this cap applies ONLY to what the summarizer
+ * sees. `maxTokens` is the cap itself (e.g. `evictedCapTokens(window)` or,
+ * on the Slice 2 deref path, `retrievalBudgetTokens(window)`).
+ */
+export function capEvictedBlock(text: string, maxTokens: number, charsPerToken: number): CappedBlock {
+  const originalTokens = estimateTokens(text.length, charsPerToken);
+  if (originalTokens <= maxTokens) return { text, capped: false, originalTokens };
+
+  const budgetChars = maxTokens * charsPerToken;
+  // Reserve room for the marker at its widest (omitted <= text.length never
+  // needs more digits), so head + marker + tail is guaranteed within budget.
+  const reserve = omittedMarker(text.length).length;
+  const keepBudget = Math.max(0, budgetChars - reserve);
+  const half = Math.floor(keepBudget / 2);
+  const head = text.slice(0, half);
+  const tail = text.slice(text.length - half);
+  const omitted = text.length - head.length - tail.length;
+  return { text: head + omittedMarker(omitted) + tail, capped: true, originalTokens };
+}
+
+/** Evicted-block cap in tokens for a given summarizer window (25%, floored). */
+export function evictedCapTokens(summarizerWindowTokens: number): number {
+  return Math.floor(EVICTED_CAP_RATIO * summarizerWindowTokens);
+}
+
+/**
+ * Retrieval budget in tokens for a given model window (10%, floored).
+ * Slice 2's deref path MUST pass retrieved blocks through
+ * `capEvictedBlock` with this budget before injecting them.
+ */
+export function retrievalBudgetTokens(windowTokens: number): number {
+  return Math.floor(RETRIEVAL_BUDGET_RATIO * windowTokens);
+}
+
+// ---------------------------------------------------------------------------
 // Hysteresis state machine
 // ---------------------------------------------------------------------------
 
@@ -70,16 +140,40 @@ export function estimateTokens(chars: number, charsPerToken: number): number {
  */
 export interface CompactionState {
   armed: boolean;
+  /** Last checkpoint summary — the sliding-summary chain; absent/null until the first compaction (slice 1.1). */
+  lastSummary?: string | null;
+  /** Pointer to the last evicted block; absent/null until the first compaction (slice 1.1). */
+  lastPointer?: string | null;
+  /** Epoch-ms timestamp of the last fire; gates the cooldown rate guard (slice 1.1). */
+  lastFiredAt?: number | null;
 }
 
 /**
  * Whether a compaction should fire now. Pure: the caller owns the
  * state transition (a `true` result means "fire", after which the
  * machine is discharged and must not fire again until re-armed).
+ *
+ * Rate guard (slice 1.1): when `state.lastFiredAt` is set and `nowMs`
+ * is within `cooldownMs` of it, the fire is refused — protects the
+ * summarizer quota against estimate oscillation bugs. `nowMs` defaults
+ * to `Date.now()`; tests inject it for determinism. Exactly `cooldownMs`
+ * elapsed counts as "after the cooldown" and is allowed.
  */
-export function shouldCompact(state: CompactionState, usedTokens: number, windowTokens: number): boolean {
+export function shouldCompact(
+  state: CompactionState,
+  usedTokens: number,
+  windowTokens: number,
+  nowMs?: number,
+  cooldownMs: number = COMPACT_COOLDOWN_MS,
+): boolean {
   if (!state.armed) return false;
-  return usedTokens >= COMPACT_AT_RATIO * windowTokens;
+  if (usedTokens < COMPACT_AT_RATIO * windowTokens) return false;
+  const fired = state.lastFiredAt ?? null;
+  if (fired !== null) {
+    const now = nowMs ?? Date.now();
+    if (now - fired < cooldownMs) return false;
+  }
+  return true;
 }
 
 /**
@@ -92,14 +186,17 @@ export function shouldCompact(state: CompactionState, usedTokens: number, window
  * to truncation rather than compacting again immediately.
  *
  * Evaluating an armed machine never disarms it — only a fire discharges.
+ *
+ * Slice 1.1: chain fields (`lastSummary`, `lastPointer`, `lastFiredAt`)
+ * are carried through untouched — only `armed` is (re)evaluated.
  */
 export function applyCompacted(
   state: CompactionState,
   usedTokensAfter: number,
   windowTokens: number,
 ): CompactionState {
-  if (state.armed) return { armed: true };
-  return { armed: usedTokensAfter <= COMPACT_TARGET_RATIO * windowTokens };
+  if (state.armed) return { ...state };
+  return { ...state, armed: usedTokensAfter <= COMPACT_TARGET_RATIO * windowTokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +350,22 @@ export interface CompactIfNeededInput<T> {
   render: (m: T) => string;
   /** Optional pinned-marker predicate (default: nothing pinned). */
   isPinned?: (m: T) => boolean;
+  /** Summarizer window — when set, the evicted block is capped to 25% of it before prompting (slice 1.1). */
+  summarizerWindowTokens?: number;
+  /** Clock injection for the rate guard / `lastFiredAt` (defaults to `Date.now()`; tests inject it). */
+  nowMs?: number;
+}
+
+/** Compaction statistics — Slice 2 logs these; Slice 1.1 tests assert them. */
+export interface CompactionStats {
+  /** Estimated usage before the fire. */
+  beforeTokens: number;
+  /** Estimated usage of the assembled (compacted) history. */
+  afterTokens: number;
+  /** Number of messages moved into the evicted block. */
+  evictedMessages: number;
+  /** Whether the evicted block was capped for the summarizer prompt. */
+  capped: boolean;
 }
 
 /** Result of one compaction check. */
@@ -267,6 +380,8 @@ export interface CompactionResult<T> {
   summary: string | null;
   /** Evicted-store pointer on compaction, else `null`. */
   pointer: string | null;
+  /** Stats on compaction, else `null` (slice 1.1). */
+  stats: CompactionStats | null;
 }
 
 /**
@@ -275,11 +390,14 @@ export interface CompactionResult<T> {
  * Flow: estimate usage (sum of per-message `estimateTokens(render(m))`)
  * → `shouldCompact`? no → passthrough (input copied, deps untouched).
  * yes → `splitZones` → empty evictable → passthrough (nothing to
- * compact). Otherwise: `store(evictable rendered)` →
- * `buildSummaryPrompt(null, evictedText)` (Slice 1: no stored chain)
- * → `summarize` → assemble `[system..., pinned..., summary-inject,
- * recency...]` → evaluate the new hysteresis state against the
- * post-compaction usage.
+ * compact). Otherwise: `store(evictable rendered)` — the FULL text,
+ * the cap never applies to the store — → cap the block to 25% of
+ * `summarizerWindowTokens` when provided (slice 1.1) →
+ * `buildSummaryPrompt(state.lastSummary, cappedText)` (null only on
+ * the first compaction) → `summarize` → assemble `[system...,
+ * pinned..., summary-inject, recency...]` → evaluate the new
+ * hysteresis state against the post-compaction usage and stamp the
+ * chain (`lastSummary`/`lastPointer`/`lastFiredAt`) onto it.
  *
  * Fallback contract (spec decision 1): if `store` or `summarize`
  * throws, the history is passed through untouched with
@@ -291,6 +409,7 @@ export async function compactIfNeeded<T extends { role: string }>(
 ): Promise<CompactionResult<T>> {
   const { messages, windowTokens, charsPerToken, state, summarize, store, render } = input;
   const isPinned = input.isPinned ?? (() => false);
+  const nowMs = input.nowMs ?? Date.now();
   const estimate = (m: T): number => estimateTokens(render(m).length, charsPerToken);
   const usedTokens = messages.reduce((sum, m) => sum + estimate(m), 0);
 
@@ -300,19 +419,31 @@ export async function compactIfNeeded<T extends { role: string }>(
     messages: [...messages],
     summary: null,
     pointer: null,
+    stats: null,
   });
 
-  if (!shouldCompact(state, usedTokens, windowTokens)) return passthrough();
+  if (!shouldCompact(state, usedTokens, windowTokens, nowMs)) return passthrough();
 
   const zones = splitZones(messages, windowTokens, estimate, isPinned);
   if (zones.evictable.length === 0) return passthrough();
 
   const evictedText = zones.evictable.map(render).join('\n\n');
+  // Slice 1.1 chain: fold the previous checkpoint in — null only on the first compaction.
+  const previousSummary = state.lastSummary ?? null;
+  const previousPointer = state.lastPointer ?? null;
   let pointer: string;
   let summary: string;
+  let capped = false;
   try {
+    // Full text goes to the store — the cap below protects only the summarizer's window.
     pointer = await store.store(evictedText);
-    summary = await summarize(buildSummaryPrompt(null, evictedText));
+    let promptBlock = evictedText;
+    if (input.summarizerWindowTokens !== undefined) {
+      const cap = capEvictedBlock(evictedText, evictedCapTokens(input.summarizerWindowTokens), charsPerToken);
+      promptBlock = cap.text;
+      capped = cap.capped;
+    }
+    summary = await summarize(buildSummaryPrompt(previousSummary, promptBlock));
   } catch {
     return passthrough();
   }
@@ -320,16 +451,38 @@ export async function compactIfNeeded<T extends { role: string }>(
   // Spec assembles the summary message as {role:'system', content: marker +
   // summary + pointer}. T is only constrained to {role}, so the literal is
   // cast — Slice 2 production callers use OpenAI-shaped messages where the
-  // cast is exact.
+  // cast is exact. Slice 1.1: the pointer chain appends `previous pointer`
+  // when a chain exists.
+  const pointerChain = previousPointer === null ? '' : `\n[previous pointer: ${previousPointer}]`;
   const summaryMessage = {
     role: 'system',
-    content: `${SUMMARY_MARKER}\n${summary}\n[evicted-block pointer: ${pointer}]`,
+    content: `${SUMMARY_MARKER}\n${summary}\n[evicted-block pointer: ${pointer}]${pointerChain}`,
   } as unknown as T;
 
   const assembled: T[] = [...zones.system, ...zones.pinned, summaryMessage, ...zones.recency];
   const usedAfter = assembled.reduce((sum, m) => sum + estimate(m), 0);
-  // The fire discharged the machine above; evaluate re-arm against the result.
-  const nextState = applyCompacted({ armed: false }, usedAfter, windowTokens);
+  // The fire discharged the machine above; evaluate re-arm against the
+  // result while stamping the chain onto the state (slice 1.1).
+  const firedState: CompactionState = {
+    ...state,
+    armed: false,
+    lastSummary: summary,
+    lastPointer: pointer,
+    lastFiredAt: nowMs,
+  };
+  const nextState = applyCompacted(firedState, usedAfter, windowTokens);
 
-  return { compacted: true, state: nextState, messages: assembled, summary, pointer };
+  return {
+    compacted: true,
+    state: nextState,
+    messages: assembled,
+    summary,
+    pointer,
+    stats: {
+      beforeTokens: usedTokens,
+      afterTokens: usedAfter,
+      evictedMessages: zones.evictable.length,
+      capped,
+    },
+  };
 }
