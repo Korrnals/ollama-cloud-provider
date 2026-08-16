@@ -80,3 +80,44 @@ export async function compactIfNeeded<T extends { role: string }>(input: {
 - `npx tsc` 0; `npm run lint` 0; `npm test` 0 failing (582 + new).
 - No vscode import inside compaction.ts (pure module — vscode wiring is Slice 2).
 - One semantic commit: `feat(compaction): core module — zones, hysteresis, sliding summary (DI)`.
+
+
+## Slice 1.1 (spec amendment 2026-08-16 — gap fixes + hardening)
+
+Two gaps found in Slice 1 self-review + three hardening additions. Core module only, same DI discipline.
+
+### Gap 1 — evicted-block cap (self-compaction loop protection)
+
+The summarizer (cheap model, own window) must never receive an evicted block larger than a fraction of ITS window.
+
+- `capEvictedBlock(text: string, maxTokens: number, charsPerToken: number): { text: string; capped: boolean; originalTokens: number }`
+- Cap = 25% of the SUMMARIZER window in tokens (caller passes its own window). Over-cap content: keep head + tail with a single `[… N chars omitted, stored in full under pointer …]` marker in the middle (local, deterministic, zero LLM cost). Full text still goes to the store — the cap applies ONLY to what the summarizer sees.
+- `compactIfNeeded` gains optional `summarizerWindowTokens` + applies the cap before `buildSummaryPrompt`.
+
+### Gap 2 — sliding summary chain (second compaction loses the first)
+
+`CompactionState` extends to `{ armed: boolean; lastSummary: string | null; lastPointer: string | null }`.
+
+- `compactIfNeeded` on success: `state.lastSummary = summary; state.lastPointer = pointer`, and `buildSummaryPrompt` receives `previousSummary = state.lastSummary` (null only on the FIRST compaction).
+- The injected summary message now includes the pointer chain: current pointer + `previous pointer: <p>` line when present.
+
+### Hardening 1 — rate guard
+
+- `shouldCompact` signature extends: `shouldCompact(state, usedTokens, windowTokens, nowMs?, cooldownMs = 300_000)` — refuses to fire when `state.lastFiredAt` is within cooldown (protects quota against estimate oscillation bugs). `CompactionState.lastFiredAt: number | null`, set on fire.
+- Default cooldown 5 minutes; tests: fire twice within cooldown → second refused; after cooldown → allowed.
+
+### Hardening 2 — retrieval cap (constant for Slice 2 wiring)
+
+- `export const RETRIEVAL_BUDGET_TOKENS = ...` computed as 10% of window; Slice 2 deref path MUST pass blocks through `capEvictedBlock` with this budget.
+
+### Hardening 3 — compaction stats result
+
+- `compactIfNeeded` result gains `stats: { beforeTokens: number; afterTokens: number; evictedMessages: number; capped: boolean } | null` (null when not compacted) — Slice 2 logs it; Slice 1 tests assert it.
+
+### Slice 1.1 tests (extend test/unit/compaction.test.ts)
+
+- capEvictedBlock: under cap passthrough; over cap → marker present, head+tail kept, capped=true.
+- chain: two consecutive compactIfNeeded calls — second passes first summary into prompt (assert via fake summarizer capturing prompt), pointer chain line present.
+- rate guard: within cooldown refused; after cooldown fires.
+- stats: populated on compact, null on passthrough.
+- backward compat: existing 21 tests keep passing (state shape change is additive; `armed` semantics unchanged).
