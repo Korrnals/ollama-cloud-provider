@@ -121,3 +121,43 @@ The summarizer (cheap model, own window) must never receive an evicted block lar
 - rate guard: within cooldown refused; after cooldown fires.
 - stats: populated on compact, null on passthrough.
 - backward compat: existing 21 tests keep passing (state shape change is additive; `armed` semantics unchanged).
+
+
+## Slice 2 (spec 2026-08-16 — production wiring)
+
+Everything below builds on the core module (commits 714aa02 + 27f6b39). Default OFF.
+
+### Settings (package.json, scope application)
+
+- `ollamaCloud.compaction.enabled` — boolean, default `false`.
+- `ollamaCloud.compaction.model` — string, default `gpt-oss:20b`. Description states: cheap model used ONLY for context summarization, not for chat.
+
+### New module `src/compactionStore.ts`
+
+- `class CompactionStore { constructor(storageUri: vscode.Uri) }` — files under `<globalStorage>/compaction/`, name = sha256 hex of content + `.txt`.
+- `async store(text: string): Promise<string>` — writes (idempotent: existing file → same pointer), returns pointer `ocp-compaction://<hash>`.
+- `async resolve(pointer: string): Promise<string | null>` — validates the scheme, reads the file; null on unknown hash. NO traversal: reject pointers containing `/`, `..`, or non-hex chars.
+- Retention: `async prune(keepCount = 200)` — delete oldest by mtime beyond keepCount; called opportunistically after each store.
+
+### Summarizer `src/compactionSummarizer.ts`
+
+- `function createSummarizer(deps: { request: (body: unknown) => Promise<string>; model: string; timeoutMs?: number }): Summarizer`
+- `request` = a NON-STREAMING native `/api/chat` call via existing `httpRequest` (reuse the client's URL/auth/whitelist path — one small exported helper or a callback injected from provider). `stream: false`, `think: false` if supported; response `message.content`.
+- Timeout default 60s via AbortController → throws (caller falls back). NEVER retries (single call per compaction event; rate guard already caps frequency).
+
+### Provider integration (`src/provider.ts`)
+
+- Per-conversation state: `Map<string, { armed: boolean; lastSummary: string|null; lastPointer: string|null; lastFiredAt: number|null }>` keyed by model id (per-model windows differ). Constructor-created.
+- In `provideLanguageModelChatResponse`, BEFORE endpoint dispatch and BEFORE the context filter: if `compaction.enabled` → build render/estimate over `openaiMessages` (render = JSON.stringify message; estimate = charsPerTokenEMA per model) → `compactIfNeeded` with real summarizer + store. On `compacted:true` → REPLACE `openaiMessages` with result messages (the injected summary message is a `role:'system'` OpenAI message — flows through all 3 endpoints unchanged), log `logger.info('Compaction: before=X after=Y tokens evicted=N capped=Z pointer=P')`, emit ONE inline annotation via progress (`LanguageModelTextPart`: `🧠 Context compacted X→Y tokens`). On `compacted:false` → existing filter path untouched (fallback contract).
+- Summarizer failure → log warn + proceed with UNCOMPACTED messages (filter path may still truncate — that is the accepted degradation).
+
+### Tests
+
+- compactionStore: store→resolve roundtrip; idempotent pointer; traversal rejected; prune keeps newest N. (Use vscode stub's storage or tmp dir via real fs — mirror how existing tests fake Uri/globalStorage; check test/_vscode-stub.mjs first and follow its pattern.)
+- summarizer: fake `request` returns content; timeout path throws (use tiny timeoutMs); no retry on failure (count calls === 1).
+- provider integration: compaction disabled → NO summarizer calls, messages unchanged; enabled + under threshold → passthrough; enabled + over threshold (fake huge messages, tiny window via model override or injected estimate) → messages replaced, summary-injected message present, annotation emitted, filter still applied afterwards on the COMPACTED list.
+- Settings: defaults present in package.json (enabled=false, model=gpt-oss:20b).
+
+### Out of scope (Slice 3+)
+
+Retrieval/deref UI (pointer text only for now), pinning, GCW-side consumption, compaction of the summarizer's own context (cap handles it), CHANGELOG wording beyond [Unreleased] bullet.
