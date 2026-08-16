@@ -5,6 +5,19 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Added
+- **Context compaction core module** (`src/compaction.ts`, v0.13.0 Slice 1 per
+  `docs/compaction-spec.md`) — pure, DI-only module: token estimation,
+  hysteresis state machine (compact at 75% of the model window, re-arm at the
+  40% target), zone split (system/pinned/evictable/recency; recency = 25% of
+  window in tokens or 6 turns, whichever covers more; the cut is repaired so an
+  assistant tool_call is never separated from its tool results), sliding-summary
+  prompt builder (checkpoint shape: Goal first line, Done, Decisions, Open
+  threads, Turn range) and the `compactIfNeeded` orchestrator with the
+  never-fail-the-chat fallback contract (summarizer/store errors → passthrough).
+  No vscode import; production wiring (cheap-model summarizer, local store,
+  provider integration) is Slice 2. 21 unit tests added (582 → 603).
+
 ### Fixed
 - **Context filter now applies to the native `/api/chat` path (ADR 0007 gap)** — native (the cloud default, `auto` → native) silently bypassed the filter: default cloud users got zero filtering and the `Context filter:` log line never fired. The filtered OpenAI payload now converts via the new `convertOpenAIMessagesToNative` / `convertOpenAIToolsToNative` (no VS Code ↔ OpenAI round-trip); the raw conversion path is preserved when the filter is `off`. `requestChars` is now accurate on the native path too. 12 tests added.
 - **P1 (review) — SSRF guard closed IPv4-embedded IPv6 bypass** — `::ffff:169.254.169.254`, NAT64 (`64:ff9b::/96`) and IPv4-compatible (`::a.b.c.d`) forms were never classified against the embedded IPv4 address; all three now run the low 32 bits through the shared IPv4 classifier (mapped loopback respects `allowLoopback`). Unspecified `::` is blocked as well.
