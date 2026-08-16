@@ -78,6 +78,9 @@ import type {
   UsageInfo,
 } from './protocolTypes.js';
 import { filterContext, type ContextFilterLevel } from './contextFilter.js';
+import { compactIfNeeded, type CompactionState } from './compaction.js';
+import { CompactionStore } from './compactionStore.js';
+import { createSummarizer } from './compactionSummarizer.js';
 
 const AUTH_REQUIRED_DETAIL =
   'Run Ollama Cloud: Set API Key to configure access.';
@@ -376,6 +379,19 @@ export class OllamaCloudChatProvider
    */
   private readonly charsPerTokenEMA = new Map<string, number>();
   private static readonly CHARS_PER_TOKEN_DEFAULT = 4;
+  /**
+   * v0.13.0 Slice 2 — per-conversation compaction hysteresis state,
+   * keyed by model id (per-model windows differ; spec:
+   * docs/compaction-spec.md § Slice 2). Constructor-created.
+   */
+  private readonly compactionStates = new Map<string, CompactionState>();
+  /**
+   * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
+   * constructor; the `CompactionStore` itself is created lazily because
+   * test harnesses may build contexts without `globalStorageUri`.
+   */
+  private readonly compactionStorageUri: vscode.Uri | undefined;
+  private compactionStore: CompactionStore | undefined;
   private lastCatalogSync = 0;
   private static readonly CATALOG_SYNC_COOLDOWN = 30_000;
 
@@ -394,6 +410,7 @@ export class OllamaCloudChatProvider
   constructor(context: vscode.ExtensionContext) {
     this.authManager = new AuthManager(context);
     this.modelCatalog = new ModelCatalog(this.authManager);
+    this.compactionStorageUri = context.globalStorageUri;
 
     context.subscriptions.push(
       this.onDidChangeLanguageModelChatInformationEmitter,
@@ -787,7 +804,24 @@ export class OllamaCloudChatProvider
         model,
         modelOptions,
       );
-      const openaiMessages = convertMessagesToOpenAI(messages);
+      let openaiMessages = convertMessagesToOpenAI(messages);
+
+      // v0.13.0 Slice 2 — context compaction (spec:
+      // docs/compaction-spec.md, default OFF). Runs BEFORE the ADR 0007
+      // context filter and BEFORE endpoint dispatch, so the filter
+      // operates on the COMPACTED list and the injected summary message
+      // (a `role:'system'` OpenAI message) flows through all three
+      // endpoints unchanged. Fallback contract: compaction never fails
+      // the chat — every failure inside `maybeCompact` logs a warning
+      // and returns the uncompacted history (the filter path may still
+      // truncate; that is the accepted degradation).
+      openaiMessages = await this.maybeCompact(
+        openaiMessages,
+        model,
+        modelInfo.id,
+        client,
+        progress,
+      );
 
       // ADR 0006 — endpoint selection deferred to the block below (it
       // needs `endpointConnection` + `globalConfig`). ADR 0007 context
@@ -1469,6 +1503,111 @@ export class OllamaCloudChatProvider
       this.charsPerTokenEMA.get(apiModel) ??
       OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
     this.charsPerTokenEMA.set(apiModel, prev * 0.7 + observed * 0.3);
+  }
+
+  /**
+   * v0.13.0 Slice 2 — returns the evicted-block store, creating it on
+   * first use. Returns `null` when the host context carried no
+   * `globalStorageUri` (mock contexts in tests) — compaction requires
+   * the pointer store and degrades to passthrough without it.
+   */
+  private getOrCreateCompactionStore(): CompactionStore | null {
+    if (!this.compactionStore) {
+      if (!this.compactionStorageUri?.fsPath) return null;
+      this.compactionStore = new CompactionStore(this.compactionStorageUri);
+    }
+    return this.compactionStore;
+  }
+
+  /**
+   * v0.13.0 Slice 2 — runs one compaction check over the OpenAI-format
+   * history when `ollamaCloud.compaction.enabled` is on (default off).
+   * Returns the messages to send onward: the compacted array on fire,
+   * the input array otherwise. Called BEFORE the ADR 0007 context
+   * filter and endpoint dispatch, so the filter runs on the COMPACTED
+   * list and the injected summary message (a `role:'system'` OpenAI
+   * message) flows through every endpoint unchanged.
+   *
+   * Fallback contract: NEVER throws — a summarizer/store failure logs
+   * a warning and returns the uncompacted history (the filter path
+   * may still truncate; that is the accepted degradation).
+   */
+  private async maybeCompact(
+    openaiMessages: OpenAICompatibleMessage[],
+    model: ModelDefinition,
+    modelId: string,
+    client: OllamaClient,
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  ): Promise<OpenAICompatibleMessage[]> {
+    const config = vscode.workspace.getConfiguration('ollamaCloud');
+    if (!config.get<boolean>('compaction.enabled', false)) {
+      return openaiMessages;
+    }
+    const store = this.getOrCreateCompactionStore();
+    if (!store) {
+      logger.warn(
+        'Compaction: enabled but globalStorage is unavailable — skipping compaction.',
+      );
+      return openaiMessages;
+    }
+    try {
+      const state: CompactionState =
+        this.compactionStates.get(modelId) ?? {
+          armed: true,
+          lastSummary: null,
+          lastPointer: null,
+          lastFiredAt: null,
+        };
+      const charsPerToken =
+        this.charsPerTokenEMA.get(model.apiModel ?? model.id) ??
+        OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
+      const summarizerModel = config.get<string>(
+        'compaction.model',
+        'gpt-oss:20b',
+      );
+      const summarizer = createSummarizer({
+        model: summarizerModel,
+        request: (body, signal) => client.nativeChatOnce(body, signal),
+      });
+      // Slice 1.1 — cap the evicted block to 25% of the summarizer's
+      // OWN window when the catalog knows the model (self-compaction
+      // loop protection; unknown summarizer models omit the cap).
+      const summarizerWindowTokens = this.modelCatalog
+        .list()
+        .find((m) => m.apiModel === summarizerModel)?.maxInputTokens;
+      const result = await compactIfNeeded<OpenAICompatibleMessage>({
+        messages: openaiMessages,
+        windowTokens: model.maxInputTokens,
+        charsPerToken,
+        state,
+        summarize: summarizer,
+        store,
+        render: (m) => JSON.stringify(m),
+        ...(summarizerWindowTokens !== undefined
+          ? { summarizerWindowTokens }
+          : {}),
+      });
+      if (!result.compacted) {
+        return openaiMessages;
+      }
+      this.compactionStates.set(modelId, result.state);
+      const stats = result.stats;
+      logger.info(
+        `Compaction: before=${stats?.beforeTokens} after=${stats?.afterTokens} tokens evicted=${stats?.evictedMessages} capped=${stats?.capped} pointer=${result.pointer}`,
+      );
+      progress.report(
+        new vscode.LanguageModelTextPart(
+          `🧠 Context compacted ${stats?.beforeTokens}→${stats?.afterTokens} tokens`,
+        ),
+      );
+      return result.messages;
+    } catch (error) {
+      logger.warn(
+        'Compaction: summarizer failed — proceeding with uncompacted context (the context filter may still truncate).',
+        error,
+      );
+      return openaiMessages;
+    }
   }
 
   /**

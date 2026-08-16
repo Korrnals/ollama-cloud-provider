@@ -5,6 +5,7 @@ import {
 } from './configValidator.js';
 import type { ConnectionConfig } from './connections.js';
 import { nativeBaseUrl } from './connections.js';
+import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 import type {
   OpenAICompatibleMessage,
@@ -15,7 +16,7 @@ import type {
   StreamCallbacks,
   UsageInfo,
 } from './protocolTypes.js';
-import { MidStreamError } from './retry.js';
+import { HttpError, MidStreamError } from './retry.js';
 import {
   readStream,
   type StreamLineContext,
@@ -309,6 +310,91 @@ export class OllamaClient {
       },
       callbacks,
     );
+  }
+
+  /**
+   * v0.13.0 Slice 2 — ONE-SHOT non-streaming native `/api/chat` call
+   * for the compaction summarizer (spec: docs/compaction-spec.md
+   * § Slice 2). Unlike `streamChat` this goes straight through
+   * `httpRequest` — no `readStream`, no `withRetry`, no timers beyond
+   * the caller's AbortSignal: the summarizer contract is a SINGLE
+   * call per compaction event (the 5-minute rate guard upstream caps
+   * frequency; a retry here would double-bill the cheap-model quota).
+   *
+   * Reuses the client's URL / auth / whitelist path:
+   *   - URL: `nativeChatUrl()` — always the native `/api/chat`
+   *     endpoint, regardless of this client's `endpointFormat`.
+   *   - SEC-03 whitelist: native-base semantics (connection clients
+   *     gate on `nativeBaseUrl(connection)` — the validator admits
+   *     the `/api` base sharing the origin of a whitelisted `/v1`
+   *     base; legacy clients gate on the globally whitelisted
+   *     `baseUrl` the native URL is derived from).
+   *   - ADR 0012 SSRF guard re-resolves the hostname right before
+   *     the fetch, same as the streaming path.
+   *
+   * The body is owned by the caller (`createSummarizer` builds
+   * `{ model, messages, stream: false, think: false }`) and is
+   * serialised verbatim. Returns `message.content`; throws on
+   * non-2xx, transport error, abort, or a missing/empty content —
+   * every throw makes the provider fall back to the uncompacted
+   * history (fallback contract).
+   */
+  async nativeChatOnce(body: unknown, signal?: AbortSignal): Promise<string> {
+    const url = this.nativeChatUrl();
+    if (this.connection) {
+      assertBaseUrlAllowedForConnection(
+        nativeBaseUrl(this.connection),
+        this.connection,
+      );
+    } else {
+      assertBaseUrlAllowed(this.baseUrl);
+    }
+    if (this.ssrfGuard) {
+      await this.ssrfGuard.assertUrlAllowed(url);
+    }
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (this.apiKey) {
+      headers.Authorization = `Bearer ${this.apiKey}`;
+    }
+    const res = await httpRequest(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => '')).slice(0, 300);
+      throw new HttpError(
+        res.status,
+        `Native /api/chat one-shot call failed (${res.status} ${res.statusText}): ${detail}`,
+      );
+    }
+    const raw = await res.text();
+    let json: { message?: { content?: unknown }; error?: unknown };
+    try {
+      json = JSON.parse(raw) as { message?: { content?: unknown } };
+    } catch (error) {
+      logger.warn(
+        'Native /api/chat one-shot call returned a non-JSON body.',
+        raw.slice(0, 200),
+        error,
+      );
+      throw new Error(
+        'Native /api/chat one-shot call returned a non-JSON body.',
+      );
+    }
+    if (typeof json.error === 'string' && json.error) {
+      throw new MidStreamError(json.error);
+    }
+    const content = json.message?.content;
+    if (typeof content !== 'string' || content.length === 0) {
+      throw new Error(
+        'Native /api/chat one-shot call returned no message.content.',
+      );
+    }
+    return content;
   }
 }
 

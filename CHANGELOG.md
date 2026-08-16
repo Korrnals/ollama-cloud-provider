@@ -6,6 +6,28 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 ## [Unreleased]
 
 ### Added
+- **Context compaction production wiring** (v0.13.0 Slice 2 per
+  `docs/compaction-spec.md`, default OFF) — settings
+  `ollamaCloud.compaction.enabled` (default `false`) and
+  `ollamaCloud.compaction.model` (default `gpt-oss:20b`, used ONLY for
+  context summarization, never for chat); `src/compactionStore.ts` —
+  content-addressed evicted-block store under
+  `<globalStorage>/compaction/<sha256>.txt` with `ocp-compaction://`
+  pointers, traversal-proof `resolve` (hash validated as
+  `^[0-9a-f]{64}$` before any filesystem access) and mtime-based
+  `prune(keep 200)` called opportunistically after each store;
+  `src/compactionSummarizer.ts` — single-call, 60s-timeout
+  (AbortController + local race), never-retries summarizer wrapper;
+  `OllamaClient.nativeChatOnce` — one-shot non-streaming native
+  `/api/chat` transport reusing the client's URL/auth/whitelist/SSRF
+  path; provider wiring — per-model compaction state map,
+  `maybeCompact` runs BEFORE the ADR 0007 context filter and endpoint
+  dispatch (the filter then operates on the COMPACTED list; the
+  injected `role:'system'` summary message flows through all three
+  endpoints unchanged), logs the before/after/evicted/capped/pointer
+  stats line and reports ONE `🧠 Context compacted X→Y tokens`
+  annotation; summarizer failure logs a warning and proceeds with the
+  uncompacted history (accepted degradation). 18 tests added (611 → 629).
 - **Context compaction core module** (`src/compaction.ts`, v0.13.0 Slice 1 per
   `docs/compaction-spec.md`) — pure, DI-only module: token estimation,
   hysteresis state machine (compact at 75% of the model window, re-arm at the

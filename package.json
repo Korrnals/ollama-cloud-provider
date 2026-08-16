@@ -285,6 +285,18 @@
           "description": "Context filtering level (ADR 0007). `off` (default) sends the payload as-is. `safe` removes duplicate messages, empty content parts, and redundant tool definitions, and compacts system-prompt whitespace. `aggressive` adds context-window truncation, similar-message merging, and metadata stripping. Per-connection `contextFilter.level` in `ollamaCloud.connections` overrides this global setting (`off`/`safe`/`aggressive` override; `auto` inherits).",
           "scope": "application"
         },
+        "ollamaCloud.compaction.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable context compaction (v0.13.0). When the conversation approaches the model's context window (75%), older turns are summarized into a compact checkpoint by a cheap model; the full evicted history is kept locally and referenced by an `ocp-compaction://` pointer. Compaction never fails the chat — on any failure the request proceeds uncompacted. Off by default.",
+          "scope": "application"
+        },
+        "ollamaCloud.compaction.model": {
+          "type": "string",
+          "default": "gpt-oss:20b",
+          "description": "Cheap model used ONLY for context summarization when compaction fires, not for chat. Called once per compaction event (at most once per 5 minutes) on the same connection as the primary model.",
+          "scope": "application"
+        },
         "ollamaCloud.debug": {
           "type": "boolean",
           "default": false,
