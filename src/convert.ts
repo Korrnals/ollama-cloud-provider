@@ -111,15 +111,16 @@ export function convertMessagesToOpenAI(
     } else {
       // Issue #41 — Strand 3.1 audit / Strand 1 diagnostic: a user
       // or system message with no text and no images is dropped.
-      // Correct behaviour (OpenAI rejects empty `content`), but a
-      // signal worth surfacing — a chat client emitting empty user
-      // turns is likely a bug. Tool messages are exempt: they are
-      // emitted above from `toolResults` regardless of `text`.
-      // v0.11.0 Task 1 — DEBUG, not INFO: see note above (fires per
-      // empty message in every multi-turn conversation).
-      logger.debug(
-        `convert: dropped empty ${role} message (parts=${message.content.length})`,
-      );
+      // Correct behaviour (OpenAI rejects empty `content`). Tool
+      // messages are exempt: they are emitted below from `toolResults`
+      // regardless of `text`.
+      //
+      // The drop is silent — no DEBUG log. In agent sessions with ~300
+      // tool results, each is a user message with only a
+      // LanguageModelToolResultPart (text=''); logging per drop
+      // produced ~300 lines/request and drowned the log (Issue #41
+      // follow-up, 2026-08-17). The drop itself is correct; the log
+      // was the problem.
     }
 
     for (const toolResult of toolResults) {
@@ -342,10 +343,11 @@ export function convertMessagesToNative(
       // native accepts `content: ""` + `images: [...]`.
       if (!text && images.length === 0) {
         if (toolResults.length === 0) {
-          // v0.11.0 Task 1 — DEBUG for parity with the compat converter.
-          logger.debug(
-            `convertNative: dropped empty ${role} message (parts=${message.content.length})`,
-          );
+          // Silent drop — no DEBUG log. Parity with the compat converter
+          // (Issue #41 follow-up, 2026-08-17): in agent sessions each
+          // tool result is a user message with text='' and only a
+          // LanguageModelToolResultPart; logging per drop produced
+          // ~300 lines/request. The drop is correct; the log was noise.
           continue;
         }
         // Tool-result-only user message (P0 fix): do NOT push an empty
