@@ -273,9 +273,32 @@ export function splitZones<T extends { role: string }>(
     }
   }
 
-  const count = Math.min(candidates.length, Math.max(byTokens, byTurns));
-  const recency = candidates.slice(candidates.length - count);
-  const evictable = candidates.slice(0, candidates.length - count);
+  // Cap the turn floor so it cannot dominate when tokens are the binding
+  // constraint. In agent sessions with few user turns but many tool
+  // results (e.g. 5 user + 300 tool, 129K tokens), the 6-turn floor
+  // would otherwise span ALL candidates → evictable empty → compaction
+  // no-ops → 400 context-too-long from the server. The token-based
+  // quota wins when 6 turns = the whole conversation and it's over
+  // budget; turns may extend the token floor up to 2× for safety, but
+  // never dominate it.
+  const cappedByTurns = Math.min(byTurns, byTokens * 2);
+  let count = Math.min(candidates.length, Math.max(byTokens, cappedByTurns));
+  let recency = candidates.slice(candidates.length - count);
+  let evictable = candidates.slice(0, candidates.length - count);
+
+  // Emergency fallback: if nothing is evictable but the conversation is
+  // over the hard window limit, force-evict the oldest 10% of candidates
+  // regardless. This prevents the "nothing to evict but context too
+  // long" deadlock — a last-resort truncation that lets compaction
+  // proceed instead of no-oping into a server 400.
+  if (evictable.length === 0 && candidates.length > 0) {
+    const totalUsed = candidates.reduce((s, m) => s + estimate(m), 0);
+    if (totalUsed > windowTokens) {
+      const evictCount = Math.max(1, Math.floor(candidates.length * 0.1));
+      evictable = candidates.slice(0, evictCount);
+      recency = candidates.slice(evictCount);
+    }
+  }
 
   // Tool-pair repair: never split an assistant tool_call from its results.
   // While the first recency message is a tool result, absorb the preceding
