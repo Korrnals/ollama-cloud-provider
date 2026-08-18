@@ -1575,6 +1575,8 @@ export class OllamaCloudChatProvider
       const summarizerWindowTokens = this.modelCatalog
         .list()
         .find((m) => m.apiModel === summarizerModel)?.maxInputTokens;
+      const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(JSON.stringify(m).length / charsPerToken), 0);
+      logger.info(`Compaction DEBUG: enabled=true windowTokens=${model.maxInputTokens} usedTokens=${usedTokensDebug} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${state.armed}`);
       const result = await compactIfNeeded<OpenAICompatibleMessage>({
         messages: openaiMessages,
         windowTokens: model.maxInputTokens,

@@ -240,6 +240,7 @@ export function splitZones<T extends { role: string }>(
   windowTokens: number,
   estimate: (m: T) => number,
   isPinned: (m: T) => boolean = () => false,
+  usedTokens?: number,
 ): ContextZones<T> {
   const system: T[] = [];
   const pinned: T[] = [];
@@ -292,8 +293,14 @@ export function splitZones<T extends { role: string }>(
   // long" deadlock — a last-resort truncation that lets compaction
   // proceed instead of no-oping into a server 400.
   if (evictable.length === 0 && candidates.length > 0) {
-    const totalUsed = candidates.reduce((s, m) => s + estimate(m), 0);
-    if (totalUsed > windowTokens) {
+    // Fix 2026-08-18: shouldCompact already determined compaction is needed
+    // (usedTokens >= 75% of window). If splitZones put everything in recency
+    // (because candidates are small relative to the 25% quota), force-evict
+    // the oldest 10% anyway — the alternative is a 400 from the server.
+    // Use the passed-in usedTokens (includes system messages) — if not
+    // available, calculate from all messages.
+    const totalUsed = usedTokens ?? messages.reduce((s, m) => s + estimate(m), 0);
+    if (totalUsed >= COMPACT_AT_RATIO * windowTokens) {
       const evictCount = Math.max(1, Math.floor(candidates.length * 0.1));
       evictable = candidates.slice(0, evictCount);
       recency = candidates.slice(evictCount);
@@ -447,7 +454,7 @@ export async function compactIfNeeded<T extends { role: string }>(
 
   if (!shouldCompact(state, usedTokens, windowTokens, nowMs)) return passthrough();
 
-  const zones = splitZones(messages, windowTokens, estimate, isPinned);
+  const zones = splitZones(messages, windowTokens, estimate, isPinned, usedTokens);
   if (zones.evictable.length === 0) return passthrough();
 
   const evictedText = zones.evictable.map(render).join('\n\n');
@@ -467,7 +474,12 @@ export async function compactIfNeeded<T extends { role: string }>(
       capped = cap.capped;
     }
     summary = await summarize(buildSummaryPrompt(previousSummary, promptBlock));
-  } catch {
+  } catch (error) {
+    // Log the error so compaction failures are visible — the silent
+    // passthrough was hiding summarizer/store failures (2026-08-18
+    // incident: gpt-oss:20b summarizer call failed, compaction
+    // silently cancelled, 400 from server with no diagnostic).
+    console.warn('Compaction: summarizer/store failed — proceeding uncompacted.', error);
     return passthrough();
   }
 

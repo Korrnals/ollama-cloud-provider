@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-cloud-provider-icon.png",
@@ -125,7 +125,7 @@
           "default": 60,
           "minimum": 1,
           "maximum": 1440,
-          "markdownDescription": "**Advanced** — Hard ceiling on total stream duration in **minutes**. Single timer (ADR 0012) — protects from forgotten tabs / hung connections. Default 60 min. No reasoning request takes 60 min; if it fires, something is genuinely hung.",
+          "markdownDescription": "**Advanced** \u2014 Hard ceiling on total stream duration in **minutes**. Single timer (ADR 0012) \u2014 protects from forgotten tabs / hung connections. Default 60 min. No reasoning request takes 60 min; if it fires, something is genuinely hung.",
           "scope": "application"
         },
         "ollamaCloud.maxRetries": {
@@ -204,7 +204,7 @@
                     ],
                     "enumDescriptions": [
                       "Disable context filtering for this connection (overrides the global setting).",
-                      "Structural cleanup only — drop duplicate messages, empty content parts, redundant tool definitions; compact system-prompt whitespace.",
+                      "Structural cleanup only \u2014 drop duplicate messages, empty content parts, redundant tool definitions; compact system-prompt whitespace.",
                       "safe + context-window truncation, similar-message merging, and metadata stripping.",
                       "Inherit the global `ollamaCloud.contextFilter.level` setting (default)."
                     ],
@@ -212,7 +212,7 @@
                     "description": "Per-connection context-filter override. `auto` (default) inherits the global `ollamaCloud.contextFilter.level`; `off`/`safe`/`aggressive` override it for this connection. See ADR 0007."
                   }
                 },
-                "description": "ADR 0007 — per-connection context-filter override."
+                "description": "ADR 0007 \u2014 per-connection context-filter override."
               }
             },
             "required": [
@@ -230,7 +230,7 @@
             "type": "string"
           },
           "default": [],
-          "description": "Mark custom models as image-capable. Add wildcard patterns (e.g. 'my-vision-model:*', '*-vl:*') to tell the extension which models can process images. The built-in catalog already knows most Ollama Cloud vision models — use this only for custom or local models the catalog does not recognize. Example: [\"gemma3:*\", \"my-model:*\"].",
+          "description": "Mark custom models as image-capable. Add wildcard patterns (e.g. 'my-vision-model:*', '*-vl:*') to tell the extension which models can process images. The built-in catalog already knows most Ollama Cloud vision models \u2014 use this only for custom or local models the catalog does not recognize. Example: [\"gemma3:*\", \"my-model:*\"].",
           "scope": "application"
         },
         "ollamaCloud.visionFallback.enabled": {
@@ -248,7 +248,7 @@
         "ollamaCloud.visionFallback.connection": {
           "type": "string",
           "default": "",
-          "description": "**Advanced** — which connection hosts the vision model, for multi-connection setups (e.g. primary on Cloud, vision model on Local). Leave empty to use the primary connection. Only set this if your primary connection has no vision-capable models. Set via the command palette (Ollama Cloud: Set Vision Fallback Connection).",
+          "description": "**Advanced** \u2014 which connection hosts the vision model, for multi-connection setups (e.g. primary on Cloud, vision model on Local). Leave empty to use the primary connection. Only set this if your primary connection has no vision-capable models. Set via the command palette (Ollama Cloud: Set Vision Fallback Connection).",
           "scope": "application"
         },
         "ollamaCloud.preferredEndpoint": {
@@ -261,8 +261,8 @@
           ],
           "enumDescriptions": [
             "Automatically select endpoint with auto-recovery (switches on 3 consecutive 404s, returns after 5 min).",
-            "Use the native Ollama /api/chat endpoint (ndjson wire format, object tool arguments, images[] for vision). Phase 1 opt-in — falls back to /chat/completions on HTTP 404 only in auto mode. Use this to bypass the OpenAI-compat translation layer.",
-            "Use /v1/responses as primary (structured reasoning, typed events, first-class tool calling). Falls back to /chat/completions on HTTP 404. Recommended — newest and most advanced endpoint.",
+            "Use the native Ollama /api/chat endpoint (ndjson wire format, object tool arguments, images[] for vision). Phase 1 opt-in \u2014 falls back to /chat/completions on HTTP 404 only in auto mode. Use this to bypass the OpenAI-compat translation layer.",
+            "Use /v1/responses as primary (structured reasoning, typed events, first-class tool calling). Falls back to /chat/completions on HTTP 404. Recommended \u2014 newest and most advanced endpoint.",
             "Use /chat/completions as primary (classic OpenAI-compatible). Falls back to /v1/responses on HTTP 404. Use this if you encounter issues with /v1/responses."
           ],
           "default": "auto",
@@ -278,8 +278,8 @@
           ],
           "enumDescriptions": [
             "No filtering. Payload sent as-is (default).",
-            "Structural cleanup only — drop duplicate messages, empty content parts, and redundant tool definitions; compact system-prompt whitespace. No message removal, no truncation.",
-            "safe + context-window truncation, similar-message merging, and metadata stripping. Can drop context the user wanted — see the per-request log line."
+            "Structural cleanup only \u2014 drop duplicate messages, empty content parts, and redundant tool definitions; compact system-prompt whitespace. No message removal, no truncation.",
+            "safe + context-window truncation, similar-message merging, and metadata stripping. Can drop context the user wanted \u2014 see the per-request log line."
           ],
           "default": "off",
           "description": "Context filtering level (ADR 0007). `off` (default) sends the payload as-is. `safe` removes duplicate messages, empty content parts, and redundant tool definitions, and compacts system-prompt whitespace. `aggressive` adds context-window truncation, similar-message merging, and metadata stripping. Per-connection `contextFilter.level` in `ollamaCloud.connections` overrides this global setting (`off`/`safe`/`aggressive` override; `auto` inherits).",
@@ -288,7 +288,7 @@
         "ollamaCloud.compaction.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable context compaction (v0.13.0). When the conversation approaches the model's context window (75%), older turns are summarized into a compact checkpoint by a cheap model; the full evicted history is kept locally and referenced by an `ocp-compaction://` pointer. Compaction never fails the chat — on any failure the request proceeds uncompacted. Off by default.",
+          "description": "Enable context compaction (v0.13.0). When the conversation approaches the model's context window (75%), older turns are summarized into a compact checkpoint by a cheap model; the full evicted history is kept locally and referenced by an `ocp-compaction://` pointer. Compaction never fails the chat \u2014 on any failure the request proceeds uncompacted. Off by default.",
           "scope": "application"
         },
         "ollamaCloud.compaction.model": {
