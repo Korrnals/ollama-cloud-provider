@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { createHash } from 'node:crypto';
 import { AuthManager } from './auth.js';
 import {
   countOpenAIRequestChars,
@@ -188,7 +189,7 @@ export function classifyStreamError(error: unknown): Error {
     // the connect boundary; if it escaped retry (retries exhausted or
     // maxRetries=0), surface a clean message naming the failure mode.
     return vscode.LanguageModelError.Blocked(
-      'Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов).',
+      `Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов). [ref ${ref}]`,
     );
   }
   if (error instanceof ConnectionInterruptedError) {
@@ -196,7 +197,7 @@ export function classifyStreamError(error: unknown): Error {
     // (tokens already billed). Surface a clean message instead of the
     // raw `aborted at TLSSocket.socketCloseListener` stack trace.
     return vscode.LanguageModelError.Blocked(
-      'Ollama Cloud: соединение прервано в середине ответа. Сервер закрыл сокет после начала стрима — частичный ответ утерян.',
+      `Ollama Cloud: соединение прервано в середине ответа. Сервер закрыл сокет после начала стрима — частичный ответ утерян. [ref ${ref}]`,
     );
   }
   if (error instanceof HttpError) {
@@ -212,14 +213,14 @@ export function classifyStreamError(error: unknown): Error {
       case 402:
         return vscode.LanguageModelError.Blocked(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст.',
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
+            : `Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст. [ref ${ref}]`,
         );
       case 403:
         return vscode.LanguageModelError.Blocked(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером.',
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
+            : `Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером. [ref ${ref}]`,
         );
       case 429: {
         // ArchCom 0011c (PA finding — 429 Retry-After): surface the
@@ -233,27 +234,27 @@ export function classifyStreamError(error: unknown): Error {
             : undefined;
         return vscode.LanguageModelError.Blocked(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
             : retryAfterSeconds !== undefined
-              ? `Ollama Cloud: Rate limit exceeded (HTTP 429) — повторите через ~${retryAfterSeconds} сек.`
-              : 'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
+              ? `Ollama Cloud: Rate limit exceeded (HTTP 429) — повторите через ~${retryAfterSeconds} сек. [ref ${ref}]`
+              : `Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже. [ref ${ref}]`,
         );
       }
       case 404:
         return vscode.LanguageModelError.NotFound(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен.',
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
+            : `Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен. [ref ${ref}]`,
         );
       default:
         if (error.status >= 500) {
           return new Error(
             serverMsg
-              ? `Ollama Cloud: Server error (HTTP ${error.status}) — ${serverMsg}`
-              : `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud.`,
+              ? `Ollama Cloud: Server error (HTTP ${error.status}) — ${serverMsg} [ref ${ref}]`
+              : `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud. [ref ${ref}]`,
           );
         }
-        return new Error(`Ollama Cloud: HTTP ${error.status} — ${error.message}`);
+        return new Error(`Ollama Cloud: HTTP ${error.status} — ${error.message} [ref ${ref}]`);
     }
   }
   // ADR 0008 Phase 2 level-4 — unclassified socket/network error that
@@ -265,10 +266,32 @@ export function classifyStreamError(error: unknown): Error {
   // caller (runStream onError handler) BEFORE reaching here.
   if (isSocketCloseError(error)) {
     return vscode.LanguageModelError.Blocked(
-      'Ollama Cloud: соединение прервано. Сервер или сеть закрыли соединение до завершения ответа.',
+      `Ollama Cloud: соединение прервано. Сервер или сеть закрыли соединение до завершения ответа. [ref ${ref}]`,
     );
   }
-  return error instanceof Error ? error : new Error(String(error));
+  // v0.12.0 Item 2 — unclassified error (the catch-all). Append a ref
+  // id so even an unexpected failure is correlatable to the logged
+  // stack trace. Without this, the user sees a raw
+  // `provideLanguageModelChatResponse failed` with no way to report it.
+  if (error instanceof Error) {
+    return new Error(`Ollama Cloud: ${error.message} [ref ${ref}]`);
+  }
+  return new Error(`Ollama Cloud: ${String(error)} [ref ${ref}]`);
+}
+
+/**
+ * v0.12.0 Item 2 — generates a stable 8-hex-char ref id from an
+ * error's message + stack. The ref is deterministic: the same error
+ * (same message + same stack) yields the same ref, so a repeated
+ * mid-stream failure produces a stable ref for trend analysis. The
+ * ref is NOT a security-sensitive value — it is a truncated hash of
+ * publicly-visible error text. Uses Node's `createHash` (already a
+ * dependency via `compactionStore.ts`); no new deps.
+ */
+export function errorRefId(error: unknown): string {
+  const msg = error instanceof Error ? `${error.message}|${error.stack ?? ''}` : String(error);
+  const hash = createHash('sha256').update(msg, 'utf8').digest('hex');
+  return hash.slice(0, 8);
 }
 
 /**
