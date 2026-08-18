@@ -383,8 +383,36 @@ export class OllamaCloudChatProvider
    * v0.13.0 Slice 2 — per-conversation compaction hysteresis state,
    * keyed by model id (per-model windows differ; spec:
    * docs/compaction-spec.md § Slice 2). Constructor-created.
+   *
+   * v0.12.0 oscillation fix (2026-08-18): VS Code fires
+   * `provideLanguageModelChatResponse` TWICE per turn (two parallel
+   * `POST /api/chat`). The state Map is shared per-model across both
+   * calls — call #1 disarms and fires compaction, call #2 reads the
+   * now-disarmed state and passes through uncompacted. A Map<modelId,
+   * CompactionState> alone does NOT survive the turn boundary, so the
+   * compacted snapshot is rebuilt from scratch each turn via
+   * `convertMessagesToOpenAI` → oscillation (3K → 100K → 3K).
+   *
+   * Fix: persist the LAST compacted message array per model so the
+   * next turn reuses it verbatim instead of rebuilding full history.
+   * The store is invalidated when the incoming VS Code messages change
+   * (different length/content hash) — otherwise the compacted snapshot
+   * is the input to the next turn by construction.
    */
   private readonly compactionStates = new Map<string, CompactionState>();
+  /**
+   * v0.12.0 oscillation fix — last compacted snapshot per model. Keyed
+   * by model id; value is the compacted `OpenAICompatibleMessage[]`
+   * produced by `maybeCompact`. The NEXT turn's
+   * `convertMessagesToOpenAI(messages)` rebuilds full history, but
+   * `maybeCompact` detects the rebuild (input length exceeds the
+   * stored snapshot's "applied-to" length) and reuses the snapshot
+   * instead of recomputing. Cleared on `CompactionState` reset.
+   */
+  private readonly lastCompactedSnapshot = new Map<
+    string,
+    { messages: OpenAICompatibleMessage[]; appliedToInputLength: number }
+  >();
   /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
@@ -1504,6 +1532,26 @@ export class OllamaCloudChatProvider
       OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
     this.charsPerTokenEMA.set(apiModel, prev * 0.7 + observed * 0.3);
   }
+
+  /**
+   * v0.12.0 oscillation fix — in-flight compaction guard per model.
+   * VS Code fires `provideLanguageModelChatResponse` TWICE per turn
+   * (two parallel `POST /api/chat` within ~2ms). Without a guard,
+   * both calls enter `maybeCompact` concurrently against the SAME
+   * shared `compactionStates` entry: call #1 reads `armed:true` and
+   * fires; call #2 reads the SAME `armed:true` (call #1 has not yet
+   * written the disarmed state) and ALSO fires → two summarizer
+   * calls, two store writes, two bills, and a torn state write.
+   *
+   * The guard deduplicates: the first call owns the compaction; the
+   * second awaits its result and reuses the compacted snapshot. The
+   * promise is keyed by model id and cleared when the owning call
+   * settles (success OR failure — the fallback contract still holds).
+   */
+  private readonly compactionInFlight = new Map<
+    string,
+    Promise<OpenAICompatibleMessage[]>
+  >();
 
   /**
    * v0.13.0 Slice 2 — returns the evicted-block store, creating it on
