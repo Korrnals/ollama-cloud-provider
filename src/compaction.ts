@@ -179,11 +179,20 @@ export function shouldCompact(
 /**
  * Re-evaluates the hysteresis after a compaction result has been applied.
  *
- * A discharged (disarmed) machine re-arms only when the post-compaction
- * usage dropped to the 40% target — that is the completion of one
- * hysteresis cycle (75% fire → 40% land). A compaction that could not
- * reach the target leaves the machine disarmed; the caller falls back
- * to truncation rather than compacting again immediately.
+ * A discharged (disarmed) machine re-arms when the post-compaction
+ * usage is at or below the fire threshold (75%). The original spec
+ * required reaching the 40% target, but that created a
+ * stuck-disarmed failure mode: if a compaction could not reach 40%
+ * (e.g. the summarizer returned a long summary, or the recency tail
+ * itself is large), the machine stayed disarmed forever and
+ * compaction never fired again — context grew unbounded.
+ *
+ * Fix 2026-08-19 (Bug 1 RCA): re-arm when `usedTokensAfter <=
+ * COMPACT_AT_RATIO * windowTokens` (75%). This still prevents
+ * immediate re-fire (the cooldown guard in `shouldCompact` enforces
+ * the 5-minute gap), but allows recovery from a partial compaction.
+ * Reaching the 40% target is the happy path; the 75% threshold is the
+ * recovery path.
  *
  * Evaluating an armed machine never disarms it — only a fire discharges.
  *
@@ -196,7 +205,11 @@ export function applyCompacted(
   windowTokens: number,
 ): CompactionState {
   if (state.armed) return { ...state };
-  return { ...state, armed: usedTokensAfter <= COMPACT_TARGET_RATIO * windowTokens };
+  // Bug 1 fix — re-arm at the fire threshold (75%), not just the
+  // target (40%). A partial compaction that did not reach 40% but
+  // dropped below 75% should re-arm so the next fire can attempt
+  // another compaction (with the cooldown guard preventing loops).
+  return { ...state, armed: usedTokensAfter <= COMPACT_AT_RATIO * windowTokens };
 }
 
 // ---------------------------------------------------------------------------

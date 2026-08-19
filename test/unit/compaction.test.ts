@@ -140,12 +140,16 @@ describe('compaction (v0.13.0 slice 1)', () => {
     });
   });
 
-  describe('applyCompacted (re-arm at 40%)', () => {
-    it('re-arms a discharged machine only at or below the 40% target', () => {
+  describe('applyCompacted (re-arm at 75% fire threshold — Bug 1 fix)', () => {
+    it('re-arms a discharged machine at or below the 75% fire threshold', () => {
       const discharged: CompactionState = { armed: false };
       const window = 1000;
-      assert.deepStrictEqual(applyCompacted(discharged, 500, window), { armed: false });
-      assert.deepStrictEqual(applyCompacted(discharged, 410, window), { armed: false });
+      // Bug 1 fix — re-arm at 75% (COMPACT_AT_RATIO), not 40% (target).
+      // A partial compaction that did not reach 40% but dropped below 75%
+      // should re-arm so the next fire (after cooldown) can try again.
+      assert.deepStrictEqual(applyCompacted(discharged, 800, window), { armed: false });
+      assert.deepStrictEqual(applyCompacted(discharged, 760, window), { armed: false });
+      assert.deepStrictEqual(applyCompacted(discharged, 750, window), { armed: true });
       assert.deepStrictEqual(applyCompacted(discharged, 400, window), { armed: true });
       assert.deepStrictEqual(applyCompacted(discharged, 200, window), { armed: true });
     });
@@ -304,7 +308,8 @@ describe('compaction (v0.13.0 slice 1)', () => {
 
     it('compacts: assembles [system, pinned, summary-inject, recency], returns pointer, discharges state', async () => {
       // window 1500: fire at 1125; used = 2050. Recency = 6 turns = 600
-      // tokens; post-compaction usage ≈ 816 > 600 (40%) → stays disarmed.
+      // tokens; post-compaction usage ≈ 816 < 1125 (75% fire threshold)
+      // → re-arms (Bug 1 fix: was 40%, now 75% for recovery from partial compaction).
       const s1 = sys('s1');
       const pin = asr('PIN');
       const history = turns(20);
@@ -349,15 +354,16 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(result.pointer, 'ptr-1');
       assert.strictEqual(result.summary, 'GOAL: keep the goal. DONE: work.');
       // Slice 1.1 (additive): the fire stamps the summary chain onto the state.
+      // Bug 1 fix: 816 < 1125 (75% of 1500) → re-arms (was: stays disarmed at 40%).
       assert.deepStrictEqual(result.state, {
-        armed: false,
+        armed: true,
         lastSummary: 'GOAL: keep the goal. DONE: work.',
         lastPointer: 'ptr-1',
         lastFiredAt: 123_456,
       });
     });
 
-    it('re-arms when the compaction result lands at or below the 40% target', async () => {
+    it('re-arms when the compaction result lands at or below the 75% fire threshold (Bug 1 fix)', async () => {
       // window 4000: fire at 3000; used = 4050. Recency = quota 1000
       // (20 messages = 10 turns); post-compaction usage ≈ 1166 <= 1600.
       const messages = [sys('s1'), ...turns(40)];
@@ -490,7 +496,7 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(first.pointer, 'ptr-1');
       assert.ok(!summarize.calls[0]!.includes('PREVIOUS CHECKPOINT')); // first: no chain yet
       assert.deepStrictEqual(first.state, {
-        armed: false,
+        armed: true,
         lastSummary: 'SUMMARY-ONE',
         lastPointer: 'ptr-1',
         lastFiredAt: 1_000_000,
@@ -498,7 +504,8 @@ describe('compaction (v0.13.0 slice 1)', () => {
       const firstInjected = first.messages[1] as Msg;
       assert.ok(!firstInjected.content.includes('previous pointer'));
 
-      // Caller re-arms after observing the result at <= 40% (applyCompacted contract).
+      // Caller re-arms after observing the result at <= 75% fire threshold
+      // (applyCompacted contract — Bug 1 fix: was 40%, now 75%).
       const second = await compactIfNeeded({
         messages: history(),
         windowTokens: 1400,
@@ -514,7 +521,7 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.ok(summarize.calls[1]!.includes('PREVIOUS CHECKPOINT'));
       assert.ok(summarize.calls[1]!.includes('SUMMARY-ONE')); // folded into the prompt
       assert.deepStrictEqual(second.state, {
-        armed: false,
+        armed: true,
         lastSummary: 'SUMMARY-TWO',
         lastPointer: 'ptr-2',
         lastFiredAt: 2_000_000,
