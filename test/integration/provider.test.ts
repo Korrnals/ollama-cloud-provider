@@ -342,6 +342,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
       ],
       'visionFallback.enabled': true,
       'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.mode': 'pass-through',
     });
 
     global.fetch = (async (input: string | URL, init?: RequestInit) => {
@@ -868,6 +869,7 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
       ],
       'visionFallback.enabled': true,
       'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.mode': 'pass-through',
     });
 
     const chunks = [
@@ -954,6 +956,7 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
       ],
       'visionFallback.enabled': true,
       'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.mode': 'pass-through',
     });
 
     let callCount = 0;
