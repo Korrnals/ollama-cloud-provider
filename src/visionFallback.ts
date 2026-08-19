@@ -77,10 +77,21 @@ export function shouldFallback(
   );
 }
 
+/**
+ * Returns true when ANY user message in the conversation carries image
+ * parts. All user messages are checked — not just the last one — because
+ * convertMessagesToOpenAI emits image parts from the full history into
+ * the request payload, and the server rejects them if the model doesn't
+ * support images.
+ */
 function hasImagePartsMessages(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
 ): boolean {
-  return messages.some((message) => hasImageParts(message.content));
+  return messages.some(
+    (message) =>
+      message.role === vscode.LanguageModelChatMessageRole.User &&
+      hasImageParts(message.content),
+  );
 }
 
 /**

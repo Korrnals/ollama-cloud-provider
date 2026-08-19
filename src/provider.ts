@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { createHash } from 'node:crypto';
 import { AuthManager } from './auth.js';
 import {
   countOpenAIRequestChars,
@@ -70,6 +71,7 @@ import {
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
+import { executeTwoPhaseVision } from './visionTwoPhase.js';
 import type {
   NativeChatMessage,
   NativeChatTool,
@@ -166,14 +168,61 @@ function endpointExplicitUnavailableError(
 }
 
 /**
+ * v0.12.0 Item 2 — generates a stable 8-hex-char ref id from an
+ * error's message + stack. The ref is deterministic: the same error
+ * (same message + same stack) yields the same ref, so a repeated
+ * mid-stream failure produces a stable ref for trend analysis. The
+ * ref is NOT a security-sensitive value — it is a truncated hash of
+ * publicly-visible error text. Uses Node's `createHash` (already a
+ * dependency via `compactionStore.ts`); no new deps.
+ */
+export function errorRefId(error: unknown): string {
+  const msg = error instanceof Error ? `${error.message}|${error.stack ?? ''}` : String(error);
+  const hash = createHash('sha256').update(msg, 'utf8').digest('hex');
+  return hash.slice(0, 8);
+}
+
+/**
  * Phase 2 — classifies an error from `runStream` into a human-readable
  * `vscode.LanguageModelError` so VS Code shows the user a clear message,
  * not a raw stack trace. The raw error (with stack) is logged in
  * `runStream`'s `onError` handler before it reaches here.
+ *
+ * v0.12.0 Item 2 (ADR 0008, ADR 0011) — every classified error carries
+ * a short ref id (`ref-<8hex>`) so the user can quote it in a bug
+ * report and we can correlate it to the logged stack trace. The ref is
+ * generated from the error's message+stack hash so the same error
+ * yields a stable ref (a repeated mid-stream failure produces the same
+ * ref, making trend analysis possible). The ref is appended to the
+ * user-facing message in brackets and logged alongside the stack.
  */
 export function classifyStreamError(error: unknown): Error {
+  const ref = errorRefId(error);
+  // v0.12.0 Item 2 — preserve `LanguageModelError` type when the error
+  // is already a `LanguageModelError` (e.g. thrown by
+  // `endpointExplicitUnavailableError`). The catch-all below would wrap
+  // it in a plain `Error`, losing the `LanguageModelError` type that
+  // tests and VS Code rely on. Instead, re-create with the same code +
+  // message + ref id appended. This keeps `err instanceof
+  // LanguageModelError` true downstream.
+  if (error instanceof vscode.LanguageModelError) {
+    const code = (error as vscode.LanguageModelError).code;
+    const baseMsg = (error as Error).message;
+    const refSuffix = baseMsg.includes(`[ref ${ref}]`) ? '' : ` [ref ${ref}]`;
+    if (code === 'NotFound') {
+      return vscode.LanguageModelError.NotFound(`${baseMsg}${refSuffix}`);
+    }
+    if (code === 'Blocked') {
+      return vscode.LanguageModelError.Blocked(`${baseMsg}${refSuffix}`);
+    }
+    // Unknown code — fall through to catch-all (safer than guessing).
+  }
   if (error instanceof MidStreamError) {
-    return new Error(`Ollama Cloud: ${error.serverMessage}`);
+    // ADR 0008 Phase 1 — server-sent mid-stream error. Terminal (POST
+    // is non-idempotent, no mid-stream retry per ADR 0005). Surface the
+    // server's message verbatim + a ref id so the user can report it.
+    // The raw stack is already logged by `runStream`'s onError handler.
+    return new Error(`Ollama Cloud: ${error.serverMessage} [ref ${ref}]`);
   }
   // v0.12.0 ADR 0012 — SSRF guard blocked the URL. Surface a clean,
   // actionable message. The raw `SsrfBlockedError` already carries a
@@ -181,14 +230,14 @@ export function classifyStreamError(error: unknown): Error {
   // Blocked — the request was rejected by the extension's own security
   // policy, not by the server.
   if (error instanceof SsrfBlockedError) {
-    return vscode.LanguageModelError.Blocked(error.message);
+    return vscode.LanguageModelError.Blocked(`${error.message} [ref ${ref}]`);
   }
   if (error instanceof ZeroByteSocketCloseError) {
     // ADR 0008 Phase 3 — server closed before any chunk. Retryable at
     // the connect boundary; if it escaped retry (retries exhausted or
     // maxRetries=0), surface a clean message naming the failure mode.
     return vscode.LanguageModelError.Blocked(
-      'Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов).',
+      `Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов). [ref ${ref}]`,
     );
   }
   if (error instanceof ConnectionInterruptedError) {
@@ -196,7 +245,7 @@ export function classifyStreamError(error: unknown): Error {
     // (tokens already billed). Surface a clean message instead of the
     // raw `aborted at TLSSocket.socketCloseListener` stack trace.
     return vscode.LanguageModelError.Blocked(
-      'Ollama Cloud: соединение прервано в середине ответа. Сервер закрыл сокет после начала стрима — частичный ответ утерян.',
+      `Ollama Cloud: соединение прервано в середине ответа. Сервер закрыл сокет после начала стрима — частичный ответ утерян. [ref ${ref}]`,
     );
   }
   if (error instanceof HttpError) {
@@ -212,14 +261,14 @@ export function classifyStreamError(error: unknown): Error {
       case 402:
         return vscode.LanguageModelError.Blocked(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст.',
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
+            : `Ollama Cloud: Payment Required (HTTP 402) — проверьте, что модель доступна на вашем тарифе, либо уменьшите контекст. [ref ${ref}]`,
         );
       case 403:
         return vscode.LanguageModelError.Blocked(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером.',
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
+            : `Ollama Cloud: Forbidden (HTTP 403) — авторизация отклонена сервером. [ref ${ref}]`,
         );
       case 429: {
         // ArchCom 0011c (PA finding — 429 Retry-After): surface the
@@ -233,27 +282,34 @@ export function classifyStreamError(error: unknown): Error {
             : undefined;
         return vscode.LanguageModelError.Blocked(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
             : retryAfterSeconds !== undefined
-              ? `Ollama Cloud: Rate limit exceeded (HTTP 429) — повторите через ~${retryAfterSeconds} сек.`
-              : 'Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже.',
+              ? `Ollama Cloud: Rate limit exceeded (HTTP 429) — повторите через ~${retryAfterSeconds} сек. [ref ${ref}]`
+              : `Ollama Cloud: Rate limit exceeded (HTTP 429) — попробуйте позже. [ref ${ref}]`,
         );
       }
       case 404:
         return vscode.LanguageModelError.NotFound(
           serverMsg
-            ? `Ollama Cloud: ${serverMsg}`
-            : 'Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен.',
+            ? `Ollama Cloud: ${serverMsg} [ref ${ref}]`
+            : `Ollama Cloud: Not Found (HTTP 404) — модель или эндпоинт недоступен. [ref ${ref}]`,
         );
       default:
         if (error.status >= 500) {
-          return new Error(
+          // CR #7 — preserve LanguageModelError type for unknown 5xx
+          // codes too (consistent with the 4xx branches above that
+          // wrap as LanguageModelError.Blocked).
+          return vscode.LanguageModelError.Blocked(
             serverMsg
-              ? `Ollama Cloud: Server error (HTTP ${error.status}) — ${serverMsg}`
-              : `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud.`,
+              ? `Ollama Cloud: Server error (HTTP ${error.status}) — ${serverMsg} [ref ${ref}]`
+              : `Ollama Cloud: Server error (HTTP ${error.status}) — проблема на стороне Ollama Cloud. [ref ${ref}]`,
           );
         }
-        return new Error(`Ollama Cloud: HTTP ${error.status} — ${error.message}`);
+        // CR #7 — unknown 4xx → Blocked, not plain Error (preserves
+        // the LanguageModelError type VS Code surfaces consistently).
+        return vscode.LanguageModelError.Blocked(
+          `Ollama Cloud: HTTP ${error.status} — ${error.message} [ref ${ref}]`,
+        );
     }
   }
   // ADR 0008 Phase 2 level-4 — unclassified socket/network error that
@@ -265,10 +321,24 @@ export function classifyStreamError(error: unknown): Error {
   // caller (runStream onError handler) BEFORE reaching here.
   if (isSocketCloseError(error)) {
     return vscode.LanguageModelError.Blocked(
-      'Ollama Cloud: соединение прервано. Сервер или сеть закрыли соединение до завершения ответа.',
+      `Ollama Cloud: соединение прервано. Сервер или сеть закрыли соединение до завершения ответа. [ref ${ref}]`,
     );
   }
-  return error instanceof Error ? error : new Error(String(error));
+  // v0.12.0 Item 2 — unclassified error (the catch-all). Append a ref
+  // id so even an unexpected failure is correlatable to the logged
+  // stack trace. CR #7 — preserve the LanguageModelError type when the
+  // source error already carries it (was already handled at the top
+  // of this function, so this branch is only reached for non-LME
+  // errors); wrap as Blocked so VS Code surfaces it consistently with
+  // the rest of the classification.
+  if (error instanceof Error) {
+    return vscode.LanguageModelError.Blocked(
+      `Ollama Cloud: ${error.message} [ref ${ref}]`,
+    );
+  }
+  return vscode.LanguageModelError.Blocked(
+    `Ollama Cloud: ${String(error)} [ref ${ref}]`,
+  );
 }
 
 /**
@@ -385,6 +455,12 @@ export class OllamaCloudChatProvider
    * docs/compaction-spec.md § Slice 2). Constructor-created.
    */
   private readonly compactionStates = new Map<string, CompactionState>();
+  /**
+   * v0.12.1 — tracks model ids for which the context-inflation warning
+   * has already fired this session. Prevents spamming the user on every
+   * turn once the threshold is crossed and compaction is disabled.
+   */
+  private readonly contextInflationWarned = new Set<string>();
   /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
@@ -683,11 +759,16 @@ export class OllamaCloudChatProvider
 
   async provideLanguageModelChatResponse(
     modelInfo: vscode.LanguageModelChatInformation,
-    messages: readonly vscode.LanguageModelChatRequestMessage[],
+    incomingMessages: readonly vscode.LanguageModelChatRequestMessage[],
     options: vscode.ProvideLanguageModelChatResponseOptions,
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
     token: vscode.CancellationToken,
   ): Promise<void> {
+    // `messages` is mutable so the two-phase vision fallback can
+    // shadow it with the rewritten history (image parts replaced by
+    // the vision model's text description). Pass-through does not
+    // reassign — it returns before the primary dispatch.
+    let messages: vscode.LanguageModelChatRequestMessage[] = [...incomingMessages];
     const model = this.modelCatalog.get(modelInfo.id);
     if (!model) {
       throw new Error(`Unknown Ollama Cloud model: ${modelInfo.id}`);
@@ -743,7 +824,21 @@ export class OllamaCloudChatProvider
       //   - Fallback DISABLED: throw a clear error so the user sees why
       //     the request failed and can switch to a vision-capable model
       //     (constraint 9 — no silent degradation; current behaviour).
-      const requestHasImages = messages.some((m) => hasImageParts(m.content));
+      // v0.12.1 — vision gate. `requestHasImages` is true only when
+    // Copilot Chat actually passed image parts. For text-only models
+    // Copilot Chat clips image attachments UNLESS the model advertised
+    // `imageInput: true` in `toChatInformation`. When `visionFallback.enabled`
+    // is on, `toChatInformation` advertises `imageInput: true` for
+    // text-only models so the image reaches this gate, where the
+    // existing ADR 0004 fallback routing takes over. When fallback is
+    // off, the advertised capability stays `false` and no image arrives
+    // (the pre-v0.12.1 behaviour).
+    // Check ALL user messages for image parts — not just the last one.
+    // Images in history still trigger the vision gate because
+    // convertMessagesToOpenAI emits them into the request payload.
+    const requestHasImages = messages.some(
+      (m) => m.role === vscode.LanguageModelChatMessageRole.User && hasImageParts(m.content),
+    );
       const connectionVisionPatterns = connection?.visionModels ?? [];
       const supportsImages = resolveVisionSupport(model, connectionVisionPatterns);
       if (requestHasImages && !supportsImages) {
@@ -751,10 +846,33 @@ export class OllamaCloudChatProvider
           .getConfiguration('ollamaCloud')
           .get<boolean>('visionFallback.enabled', false);
         if (fallbackEnabled && shouldFallback(model, messages)) {
-          // ADR 0004 — pass-through. The vision model streams to the
-          // user via the same progress reporter + CancellationToken.
-          // Returns from here; the primary path below is not reached.
-          return await executePassThrough({
+          // ADR 0004 (superseded 2026-08-19) — vision fallback. Two
+          // modes, selected by `ollamaCloud.visionFallback.mode`:
+          //   - `two-phase` (default): vision model describes the
+          //     image, then the primary model answers using the
+          //     description. Falls through to the normal primary
+          //     dispatch below with the rewritten history.
+          //   - `pass-through`: vision model answers the user directly.
+          //     Returns from here; the primary path is not reached.
+          const fallbackMode = vscode.workspace
+            .getConfiguration('ollamaCloud')
+            .get<'two-phase' | 'pass-through'>('visionFallback.mode', 'two-phase');
+          if (fallbackMode === 'pass-through') {
+            return await executePassThrough({
+              primaryModel: model,
+              primaryConnection: connection ?? cloudConnection,
+              messages,
+              options,
+              progress,
+              token,
+              authManager: this.authManager,
+              catalog: this.modelCatalog.list(),
+              connections,
+            });
+          }
+          // two-phase — phase 1: vision describes the image, rewrite
+          // history, then fall through to the primary dispatch below.
+          const twoPhaseResult = await executeTwoPhaseVision({
             primaryModel: model,
             primaryConnection: connection ?? cloudConnection,
             messages,
@@ -765,10 +883,17 @@ export class OllamaCloudChatProvider
             catalog: this.modelCatalog.list(),
             connections,
           });
+          // Shadow the original messages with the rewritten history.
+          // All downstream usages (`convertMessagesToOpenAI`,
+          // `convertToResponsesInput`, `convertMessagesToNative`) now
+          // see the text description instead of the image parts.
+          messages = twoPhaseResult.messages;
+          // Fall through to the normal primary-model dispatch below.
+        } else {
+          throw new Error(
+            `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
+          );
         }
-        throw new Error(
-          `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
-        );
       }
 
       const clientBaseUrl = connection
@@ -1496,7 +1621,30 @@ export class OllamaCloudChatProvider
       return;
     }
 
+    // Bug 2 fix (2026-08-19 RCA) — skip the EMA update when the request
+    // contains image data URLs. `countOpenAIRequestChars` counts the
+    // full base64 payload of every image part (1M+ chars per image),
+    // but the server counts image tokens correctly (~1K per image).
+    // The ratio `requestChars / usage.inputTokens` becomes ~1000+
+    // instead of ~4, poisoning the EMA: after a few vision requests
+    // `charsPerToken` drops to ~0.47, making every token estimate
+    // explode (e.g. `usedTokens=2.3M` for a 750K-window model).
+    //
+    // The EMA is only meaningful for text-only requests where
+    // `requestChars` is a reasonable proxy for token count. Vision
+    // requests are excluded entirely — the default (4 chars/token)
+    // is a better estimate for vision than the poisoned EMA.
+    //
+    // Heuristic: if `requestChars / usage.inputTokens` exceeds 20
+    // (i.e. >5x the default density), the request likely contained
+    // images or other binary payloads — skip the update.
     const observed = requestChars / usage.inputTokens;
+    if (observed > 20) {
+      logger.debug(
+        `updateTokenEstimate: skipping EMA update — observed=${observed.toFixed(1)} chars/token exceeds 20 (likely image data in request), keeping current EMA.`,
+      );
+      return;
+    }
     // Fix 3 — EMA is tracked PER MODEL so switching models does not
     // contaminate one model's density estimate with another's.
     const prev =
@@ -1541,6 +1689,15 @@ export class OllamaCloudChatProvider
   ): Promise<OpenAICompatibleMessage[]> {
     const config = vscode.workspace.getConfiguration('ollamaCloud');
     if (!config.get<boolean>('compaction.enabled', false)) {
+      // v0.12.1 — context-inflation warning (RCA 2026-08-19):
+      // compaction is opt-in (ADR: default off). When the conversation
+      // exceeds 75% of the model's window but compaction is disabled,
+      // surface a ONE-TIME-per-session warning so the user knows their
+      // context is growing unbounded and can enable compaction. The
+      // warning uses `progress.report` (visible in the chat UI) + a
+      // `logger.warn` line (visible in diagnostics). It fires at most
+      // once per modelId per session to avoid spamming.
+      this.warnContextInflationIfNeeded(model, modelId, openaiMessages, progress);
       return openaiMessages;
     }
     const store = this.getOrCreateCompactionStore();
@@ -1575,6 +1732,8 @@ export class OllamaCloudChatProvider
       const summarizerWindowTokens = this.modelCatalog
         .list()
         .find((m) => m.apiModel === summarizerModel)?.maxInputTokens;
+      const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(JSON.stringify(m).length / charsPerToken), 0);
+      logger.debug(`Compaction DEBUG: enabled=true windowTokens=${model.maxInputTokens} usedTokens=${usedTokensDebug} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${state.armed}`);
       const result = await compactIfNeeded<OpenAICompatibleMessage>({
         messages: openaiMessages,
         windowTokens: model.maxInputTokens,
@@ -1608,6 +1767,59 @@ export class OllamaCloudChatProvider
       );
       return openaiMessages;
     }
+  }
+
+  /**
+   * v0.12.1 — context-inflation warning (RCA 2026-08-19, ADR 0007
+   * complement). When `compaction.enabled` is `false` (the default)
+   * and the conversation exceeds 75% of the model's window, surface a
+   * one-time-per-session warning so the user knows their context is
+   * growing unbounded and can enable compaction before hitting the
+   * provider's hard context-window ceiling.
+   *
+   * The warning fires at most once per `modelId` per session (tracked
+   * in {@link contextInflationWarned}) to avoid spamming on every turn.
+   * It uses `progress.report` (visible in the chat UI as a streaming
+   * annotation) + `logger.warn` (visible in diagnostics). It does NOT
+   * enable compaction — that remains a deliberate user opt-in per the
+   * compaction spec's "default off" decision.
+   *
+   * Token estimate mirrors `compaction.ts`: `charsPerToken` from the
+   * EMA (or the 4-char default), applied to the OpenAI-format request
+   * char count. The 75% threshold matches `COMPACT_AT_RATIO`.
+   */
+  private warnContextInflationIfNeeded(
+    model: ModelDefinition,
+    modelId: string,
+    openaiMessages: OpenAICompatibleMessage[],
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+  ): void {
+    if (this.contextInflationWarned.has(modelId)) {
+      return;
+    }
+    const windowTokens = model.maxInputTokens;
+    if (!windowTokens || windowTokens <= 0) {
+      return;
+    }
+    const charsPerToken =
+      this.charsPerTokenEMA.get(model.apiModel ?? model.id) ??
+      OllamaCloudChatProvider.CHARS_PER_TOKEN_DEFAULT;
+    const requestChars = countOpenAIRequestChars(openaiMessages);
+    const usedTokens = Math.ceil(requestChars / charsPerToken);
+    const fireThreshold = Math.floor(0.75 * windowTokens);
+    if (usedTokens < fireThreshold) {
+      return;
+    }
+    this.contextInflationWarned.add(modelId);
+    const pct = Math.round((usedTokens / windowTokens) * 100);
+    const warning =
+      `⚠️ Context at ${pct}% of the ${model.name} window (${usedTokens.toLocaleString()}/${windowTokens.toLocaleString()} tokens). ` +
+      'Enable \"Ollama Cloud: Compaction\" (ollamaCloud.compaction.enabled) to summarize older turns and stay under the limit. ' +
+      'Without compaction, long conversations may hit the provider hard ceiling.';
+    logger.warn(
+      `Context inflation: ${modelId} at ${pct}% of window (${usedTokens}/${windowTokens} tokens, ${openaiMessages.length} messages) — compaction disabled. Run 'Ollama Cloud: Set Compaction' or set ollamaCloud.compaction.enabled=true.`,
+    );
+    progress.report(new vscode.LanguageModelTextPart(warning));
   }
 
   /**
@@ -1801,11 +2013,18 @@ ${errorLines}
           // Issue #41 — Strand 1: log stream error with the error
           // class + status (if HttpError) + duration. One line per
           // failed stream — not per retry (retries log in retry.ts).
+          // v0.12.0 Item 2 — append the stable ref id so the logged
+          // stack trace can be correlated to the user-facing message
+          // (which carries the same ref via `classifyStreamError`).
+          // The ref is generated here (not in `classifyStreamError`)
+          // so it is available in the log even when the error is later
+          // re-classified or re-wrapped by the caller.
           const durationMs = Date.now() - startedAt;
           const status =
             error instanceof HttpError ? ` status=${error.status}` : '';
+          const ref = errorRefId(error);
           logger.error(
-            `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name}`,
+            `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name} ref=${ref}`,
             error,
           );
           reject(error);
@@ -1847,6 +2066,32 @@ function toChatInformation(
     : `${PROVIDER_TOOLTIP}\n${AUTH_REQUIRED_DETAIL}`;
   const tooltip = `${baseTooltip}\nEndpoint: ${endpointLabel}`;
 
+  // v0.12.1 — vision fallback capability advertisement (RCA 2026-08-19,
+  // ADR 0004). Copilot Chat pre-filters image attachments by the
+  // declared `imageInput` capability: a model that declares `false`
+  // never receives image parts — the extension cannot detect them,
+  // and ADR 0004 vision fallback becomes architecturally impossible.
+  //
+  // Fix: when `visionFallback.enabled` is true, advertise `imageInput:
+  // true` for text-only models so Copilot Chat passes the image
+  // through. The internal `ModelDefinition.capabilities.imageInput`
+  // (used by `resolveVisionSupport` + `shouldFallback`) stays `false`,
+  // so the vision gate in `provideLanguageModelChatResponse` still
+  // detects the mismatch and routes to the vision model via
+  // `executePassThrough`. This is a capability ADVERTISEMENT change,
+  // not a model capability change — the primary model still cannot
+  // handle images; the extension intercepts before the primary is
+  // called.
+  //
+  // When fallback is disabled, the advertised capability stays `false`
+  // (pre-v0.12.1 behaviour): Copilot Chat clips images, and the gate
+  // never fires. The user sees no error because no image arrives.
+  const fallbackEnabled = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<boolean>('visionFallback.enabled', false);
+  const advertisedImageInput =
+    model.capabilities.imageInput || fallbackEnabled;
+
   return {
     id: model.id,
     name,
@@ -1857,7 +2102,7 @@ function toChatInformation(
     maxInputTokens: model.maxInputTokens,
     maxOutputTokens: model.maxOutputTokens,
     capabilities: {
-      imageInput: model.capabilities.imageInput,
+      imageInput: advertisedImageInput,
       toolCalling: model.capabilities.toolCalling,
     },
     isUserSelectable: true,

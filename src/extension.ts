@@ -97,6 +97,16 @@ export function activate(context: vscode.ExtensionContext): void {
     .getConfiguration('ollamaCloud')
     .get<boolean>('debug', false);
   logger.setDebugMode(debugEnabled);
+  // v0.12.0 — file-based debug log in globalStorage so logs are
+  // readable from a terminal (OutputChannel is not readable from
+  // shell, and distrobox/sandbox isolates the extension host process).
+  // The file path is `<globalStorageUri>/debug.log` — stable, easily
+  // found, and accessible across sessions. When debug logging is on,
+  // ALL log levels (DEBUG/INFO/WARN/ERROR) append to this file.
+  const debugLogPath = context.globalStorageUri?.fsPath
+    ? `${context.globalStorageUri.fsPath}/debug.log`
+    : undefined;
+  logger.setDebugLogPath(debugLogPath);
   logger.info(`Activating Ollama Cloud extension (debug=${debugEnabled}).`);
 
   // Auto-show the Output panel when the user enables debug logging
