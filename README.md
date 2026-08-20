@@ -49,6 +49,7 @@ The default endpoint (`auto`, which resolves to `native` `/api/chat` for cloud) 
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
 - **Context filtering (token savings)** — optional pre-processing that drops duplicate messages, empty content parts, and redundant tool definitions, and compacts the system prompt — reducing token cost without touching semantic content. Tool-call integrity is guaranteed; vision content is never filtered. Three levels (`off` / `safe` / `aggressive`), `off` by default. See [Context filtering](#context-filtering).
 - **Structured error surfacing** — server-sent mid-stream errors (`{"error":"..."}`) are caught as `MidStreamError` and shown with the real server message. HTTP 402/403/429/5xx are classified into human-readable `LanguageModelError` messages (including the server's actual reason, e.g. "this model uses extra usage only"). Raw Node socket-close errors (the `aborted at TLSSocket.socketCloseListener` / `socket hang up` / `ECONNRESET` family) are reclassified by `isSocketCloseError()` into `ConnectionInterruptedError` (mid-stream, terminal) or `ZeroByteSocketCloseError` (connect-phase, retryable) — shown as a clean message instead of a raw stack (v0.9.2, see ADR 0008).
+- **Mid-stream retry (v0.13.0)** — when the Ollama Cloud server closes the stream mid-generation (ECONNRESET after 2–9 chunks), `readStream` now retries up to 3 attempts with exponential backoff (1 s / 2 s / 4 s), bounded to ≤ 50 chunks already received. This resolves the subagent crash loop where `ConnectionInterruptedError` killed `runSubagent` calls. ADR 0005 previously stated "no mid-stream retry"; this is updated — with up to 50 chunks, the server bills for the partial generation regardless, but the retry produces a complete answer.
 - **Proxy-aware networking** — a native HTTP client bypasses VS Code's `global.fetch()` interception, fixing connect-timeout issues under `chat.agent.sandbox.enabled: "on"`. Respects the `http.proxy` VS Code setting.
 - **Tool calling** — fully supported on `/v1/responses` (top-level `function_call` / `function_call_output` items) and on native `/api/chat` (object tool args). Handled natively by VS Code, with no shell execution from the extension.
 - **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
@@ -175,6 +176,7 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.visionFallback.enabled` | `false` | Enable Vision Fallback. Opt-in. |
 | `ollamaCloud.visionFallback.model` | `""` | Vision-capable model id for fallback. If empty, auto-searches the primary connection's catalog for the first vision-capable model. |
 | `ollamaCloud.visionFallback.connection` | `""` | Connection id for the vision model. If empty, uses the primary connection. |
+| `ollamaCloud.visionFallback.mode` | `"two-phase"` | Vision fallback mode (v0.13.0+, ADR 0013): `two-phase` (vision model describes image → primary model answers) or `pass-through` (vision model answers directly). See [Vision fallback](#️-vision-fallback). |
 | `ollamaCloud.contextFilter.level` | `"off"` | Context filtering level (ADR 0007): `off` (no filtering), `safe` (structural cleanup — duplicate messages, empty parts, redundant tools, system-prompt whitespace), `aggressive` (safe + context-window truncation + similar-message merging + metadata stripping). See [Context filtering](#context-filtering). Per-connection `contextFilter.level` overrides this global (`auto` inherits). |
 
 All settings are `scope: "application"` — workspace folders cannot override them.
@@ -312,6 +314,19 @@ To enable:
 2. Run `Ollama Cloud: Set Vision Fallback Model` to pick a vision-capable model from the catalog.
 3. Optionally run `Ollama Cloud: Set Vision Fallback Connection` if the vision model lives on a different connection.
 4. Send an image to a non-vision model — the extension swaps to the vision model for that turn and notifies.
+
+### Two-phase vs pass-through (v0.13.0+)
+
+Starting from **v0.13.0**, the vision fallback has two modes, selected by `ollamaCloud.visionFallback.mode`:
+
+| Mode | How it works | When to use |
+|---|---|---|
+| **`two-phase`** (default, ADR 0013) | Phase 1: vision model describes the image (non-streaming). Phase 2: primary model answers using the text description. | You want the primary model's reasoning style and chain-of-thought preserved. The vision model only translates the image to text. |
+| **`pass-through`** (ADR 0004) | The vision model answers directly, streaming its own response to the user. | You want the vision model's answer directly, without the primary model in the loop. |
+
+Two-phase is the default because it preserves the primary model's reasoning style — the vision model only converts the image to a text description, then the primary model produces the final answer using that description. Pass-through remains available for users who want the vision model to answer directly.
+
+See [ADR 0013](docs/adr/0013-two-phase-vision-fallback.md) for the full rationale.
 
 ## 🤖 VS Code Agents window
 

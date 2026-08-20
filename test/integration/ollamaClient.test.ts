@@ -725,6 +725,9 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
     this.timeout(5000);
 
     const originalFetch = global.fetch;
+    // Retry-safe mock: create a fresh ReadableStream per fetch call. A
+    // ReadableStream cannot be reused after it errors or closes, and the
+    // mid-stream retry wrapper re-invokes fetch on each attempt.
     global.fetch = (async () => {
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
@@ -755,30 +758,36 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
 
     const recorder = makeCallbacks();
     const client = new OllamaClient(BASE_URL, 'sk-test-key');
-    await client.streamChat(
-      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
-      recorder,
+    // Mid-stream retry: streamChat throws ConnectionInterruptedError after
+    // MID_STREAM_RETRY_MAX_ATTEMPTS retries fail (all 3 attempts hit the
+    // same socket close).
+    await assert.rejects(
+      async () =>
+        client.streamChat(
+          { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+          recorder,
+        ),
+      (error: unknown) => {
+        assert.equal(
+          (error as Error).constructor.name,
+          'ConnectionInterruptedError',
+          'mid-stream socket close must be ConnectionInterruptedError, not raw',
+        );
+        assert.match(
+          (error as Error).message,
+          /connection interrupted after \d+ chunk/,
+        );
+        assert.doesNotMatch(
+          (error as Error).message,
+          /socketCloseListener|node:_http_client/,
+          'message must be clean, not the raw stack trace',
+        );
+        return true;
+      },
     );
-
-    assert.equal(recorder.errors.length, 1, 'onError must fire once');
-    assert.equal(recorder.doneCount, 0, 'onDone must NOT fire');
-    assert.equal(
-      recorder.errors[0]!.constructor.name,
-      'ConnectionInterruptedError',
-      'mid-stream socket close must be ConnectionInterruptedError, not raw',
-    );
-    assert.match(
-      recorder.errors[0]!.message,
-      /connection interrupted after \d+ chunk/,
-    );
-    // The user-facing message must NOT contain the raw Node stack trace.
-    assert.doesNotMatch(
-      recorder.errors[0]!.message,
-      /socketCloseListener|node:_http_client/,
-      'message must be clean, not the raw stack trace',
-    );
-    // The partial text was delivered before the socket closed.
-    assert.equal(recorder.text.join(''), 'hello');
+    // The partial text was delivered before the socket closed (on each
+    // attempt — the retry re-streams it).
+    assert.ok(recorder.text.length > 0, 'partial text was delivered');
 
     global.fetch = originalFetch;
   });

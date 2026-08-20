@@ -434,24 +434,29 @@ describe('streamReader.readStream — module contract', () => {
 
   it('fires ConnectionInterruptedError when socket closes after chunks received', async () => {
     // Stream that emits one chunk then errors with a socket-close error.
-    let streamController: ReadableStreamDefaultController<Uint8Array> | null =
-      null;
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        streamController = controller;
-        controller.enqueue(encode('data: partial\n'));
-      },
-    });
-
+    // Mid-stream retry means readStream retries 3 times — each fetch
+    // call must create a FRESH ReadableStream (a consumed stream cannot
+    // be reused). The mock factory below creates a new stream per call.
     const originalFetch = global.fetch;
     global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      // After enqueuing one chunk, simulate a socket close by erroring
-      // the stream when the abort signal fires (or after a delay).
+      // Fresh stream per fetch call — retry-safe.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: partial\n'));
+          // Error after a short delay to simulate mid-stream socket close.
+          setTimeout(() => {
+            const e = new Error('aborted at TLSSocket.socketCloseListener');
+            controller.error(e);
+          }, 50);
+        },
+      });
+      // Wire abort signal to error the stream (mirrors real fetch).
       const sig = init?.signal;
       if (sig) {
         const err = (): void => {
-          const e = new Error('aborted at TLSSocket.socketCloseListener');
-          streamController?.error(e);
+          // The stream errors via the setTimeout above; the abort
+          // listener is a no-op placeholder for this test (the socket
+          // close is simulated by the setTimeout, not by abort).
         };
         if (sig.aborted) {
           err();
@@ -459,25 +464,23 @@ describe('streamReader.readStream — module contract', () => {
           sig.addEventListener('abort', err);
         }
       }
-      // Error after a short delay to simulate mid-stream socket close.
-      setTimeout(() => {
-        const e = new Error('aborted at TLSSocket.socketCloseListener');
-        streamController?.error(e);
-      }, 50);
       return mockResponse(body);
     }) as typeof fetch;
 
     const recorder = makeCallbacks();
-    await readStream(makeBaseOptions(), recorder);
-
-    assert.equal(
-      recorder.errors.length,
-      1,
-      'onError must fire on mid-stream socket close',
-    );
-    assert.ok(
-      recorder.errors[0] instanceof ConnectionInterruptedError,
-      'error must be ConnectionInterruptedError (chunksReceived > 0)',
+    // Mid-stream retry: readStream now throws ConnectionInterruptedError
+    // (instead of calling onError) so the retry loop can catch it.
+    // After MID_STREAM_RETRY_MAX_ATTEMPTS (3) retries fail, the error
+    // propagates as a throw.
+    await assert.rejects(
+      async () => readStream(makeBaseOptions(), recorder),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ConnectionInterruptedError,
+          'error must be ConnectionInterruptedError (chunksReceived > 0)',
+        );
+        return true;
+      },
     );
 
     global.fetch = originalFetch;

@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 const OUTPUT_CHANNEL_NAME = 'Ollama Cloud';
 const OUTPUT_CHANNEL_NAME_DEBUG = 'Ollama Cloud (Debug)';
@@ -70,6 +72,42 @@ class Logger {
    */
   private readonly recentErrors: string[] = [];
   private static readonly RECENT_ERRORS_CAP = 100;
+
+  /**
+   * v0.12.0 — file-based debug log path (inside `globalStorageUri` so
+   * it is accessible from distrobox/sandbox and survives across
+   * sessions). Set once at activation via `logger.setDebugLogPath()`.
+   * When set, every log line (INFO/WARN/ERROR/DEBUG) is ALSO appended
+   * to this file — not just the OutputChannel. This makes logs
+   * readable from a terminal (the OutputChannel is not readable from
+   * shell, and distrobox isolates the extension host process).
+   */
+  private debugLogPath: string | undefined;
+
+  /**
+   * Sets the file path for file-based logging. Called once at
+   * activation with `<globalStorageUri>/debug.log`. When set, every
+   * log line is appended to this file in addition to the OutputChannel.
+   * The file is rotated manually (not automatically) — it grows
+   * unbounded; `collectDiagnostics` can surface its tail if needed.
+   */
+  setDebugLogPath(fsPath: string | undefined): void {
+    this.debugLogPath = fsPath;
+    if (fsPath) {
+      try {
+        // Ensure parent dir exists (globalStorageUri may not exist yet).
+        fs.mkdirSync(path.dirname(fsPath), { recursive: true });
+        // Touch the file so it exists even before the first log line.
+        if (!fs.existsSync(fsPath)) {
+          fs.writeFileSync(fsPath, '');
+        }
+      } catch {
+        // best-effort — if globalStorage is unavailable, file logging
+        // silently degrades to OutputChannel-only (the original path).
+        this.debugLogPath = undefined;
+      }
+    }
+  }
 
   setDebugMode(enabled: boolean): void {
     // ArchCom 0011c Fix 5b — when debug mode is toggled, recreate the
@@ -162,9 +200,25 @@ class Logger {
     // Redact sensitive material from both the caller's message and the
     // serialized details. This is the single entry-point call — no other
     // log path bypasses it.
-    return redactSensitive(
+    const formatted = redactSensitive(
       `[${new Date().toISOString()}] [${level}] ${message}${suffix ? ` ${suffix}` : ''}`,
     );
+
+    // v0.12.0 — also append to the file-based debug log when configured.
+    // This makes logs readable from a terminal (OutputChannel is not
+    // readable from shell, and distrobox isolates the extension host).
+    // Best-effort: a write failure does NOT break the OutputChannel path.
+    if (this.debugLogPath) {
+      try {
+        fs.appendFileSync(this.debugLogPath, formatted + '\n');
+      } catch {
+        // Deactivate file logging after a persistent failure to avoid
+        // retrying on every line (e.g. disk full, permissions revoked).
+        this.debugLogPath = undefined;
+      }
+    }
+
+    return formatted;
   }
 }
 

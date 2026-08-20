@@ -2,7 +2,7 @@
   "name": "ollama-cloud-provider",
   "displayName": "Ollama Cloud Provider",
   "description": "Security-hardened Ollama Cloud language model provider for VS Code Copilot Chat.",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "type": "module",
   "publisher": "Korrnals",
   "icon": "media/ollama-cloud-provider-icon.png",
@@ -239,6 +239,20 @@
           "description": "Enable automatic image fallback. When you attach an image to a text-only model (like glm-5.2), the extension routes the image to a vision-capable model automatically, then returns to your primary model. Off by default.",
           "scope": "application"
         },
+        "ollamaCloud.visionFallback.mode": {
+          "type": "string",
+          "enum": [
+            "two-phase",
+            "pass-through"
+          ],
+          "enumDescriptions": [
+            "Two-phase (default): the vision model describes the image, then your primary model answers using that description. Your primary model's reasoning stays intact.",
+            "Pass-through: the vision model answers your question directly. Your primary model is not involved in that turn."
+          ],
+          "default": "two-phase",
+          "description": "How the vision fallback handles an image attached to a text-only model. Two-phase describes the image via a vision model, then your primary model answers — keeping your primary model's reasoning. Pass-through lets the vision model answer directly.",
+          "scope": "application"
+        },
         "ollamaCloud.visionFallback.model": {
           "type": "string",
           "default": "",
@@ -315,7 +329,7 @@
     "test": "mocha --config .mocharc.json",
     "test:unit": "mocha --config .mocharc.json out/test/unit/**/*.test.js",
     "test:integration": "mocha --config .mocharc.json out/test/integration/**/*.test.js",
-    "package": "vsce package",
+    "package": "vsce package --out releases/",
     "verify": "npm run lint && npm run compile && npm test"
   },
   "devDependencies": {

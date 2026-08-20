@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { logger } from './logger.js';
+import { setVisionCachePath } from './visionTwoPhase.js';
 import { OllamaCloudChatProvider } from './provider.js';
 import { pickVisionFallbackModel, pickVisionFallbackConnection } from './visionFallbackCommands.js';
 
@@ -97,6 +98,24 @@ export function activate(context: vscode.ExtensionContext): void {
     .getConfiguration('ollamaCloud')
     .get<boolean>('debug', false);
   logger.setDebugMode(debugEnabled);
+  // v0.12.0 — file-based debug log in globalStorage so logs are
+  // readable from a terminal (OutputChannel is not readable from
+  // shell, and distrobox/sandbox isolates the extension host process).
+  // The file path is `<globalStorageUri>/debug.log` — stable, easily
+  // found, and accessible across sessions. When debug logging is on,
+  // ALL log levels (DEBUG/INFO/WARN/ERROR) append to this file.
+  const debugLogPath = context.globalStorageUri?.fsPath
+    ? `${context.globalStorageUri.fsPath}/debug.log`
+    : undefined;
+  logger.setDebugLogPath(debugLogPath);
+  // v0.13.0 — persistent vision description cache in globalStorage.
+  // Survives window reloads: on the first post-reload turn the images
+  // in the re-sent conversation history are matched against the file
+  // instead of being re-described by the vision model.
+  const visionCachePath = context.globalStorageUri?.fsPath
+    ? `${context.globalStorageUri.fsPath}/vision-description-cache.json`
+    : null;
+  setVisionCachePath(visionCachePath);
   logger.info(`Activating Ollama Cloud extension (debug=${debugEnabled}).`);
 
   // Auto-show the Output panel when the user enables debug logging

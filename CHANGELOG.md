@@ -5,7 +5,41 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-20
+
+Vision two-phase fallback, mid-stream retry on ConnectionInterruptedError, persistent image-description cache (survives window reload), compaction oscillation + EMA poisoning fixes, Code Review findings applied, release-pipeline hardening.
+
 ### Added
+- **Mid-stream retry on ConnectionInterruptedError** — `readStream` now wraps `readStreamOnce` in a retry loop (up to 3 attempts, ≤50 chunks, exponential backoff 1s/2s/4s). The Ollama Cloud server regularly closes streams mid-generation after 2-9 chunks (ECONNRESET). Previously this was a terminal error (ADR 0005 "no mid-stream retry" — 0 chunks = 0 billed tokens). With up to 50 chunks already received, retrying is safe (the partial output is discarded on the client; the server bills for the partial generation regardless, but the retry produces a complete answer). This is a fundamental change from ADR 0005: mid-stream socket closes are now retried, not terminal. Resolves the subagent crash loop (`ConnectionInterruptedError` → subagent reports failure → orchestrator retries → same crash). Constants: `MID_STREAM_RETRY_MAX_CHUNKS=50`, `MID_STREAM_RETRY_MAX_ATTEMPTS=3`, `MID_STREAM_RETRY_BASE_DELAY_MS=1000`.
+- **Two-phase vision fallback (ADR 0013)** — new default vision
+  fallback path. When a text-only primary model receives an image,
+  the vision model describes the image (phase 1, non-streaming), then
+  the primary model answers using the description (phase 2, normal
+  stream). Preserves the user's chosen primary model's reasoning.
+  Pass-through (ADR 0004) remains available via
+  `ollamaCloud.visionFallback.mode: 'pass-through'`. New file
+  `src/visionTwoPhase.ts`; new setting
+  `ollamaCloud.visionFallback.mode` (enum: `'two-phase' |
+  'pass-through'`, default `'two-phase'`). Image data URLs never
+  logged (SHA-256 short hash only); hardcoded describe prompt
+  (prompt-injection defence).
+- **Persistent image-description cache (v0.13.0 final)** — the
+  in-memory description cache (`imageDescriptionCache`, max 100
+  entries) is now backed by
+  `<globalStorage>/vision-description-cache.json`. VS Code re-sends
+  the full conversation history (including image parts) on every
+  turn and after every window reload; without persistence, the
+  in-memory cache died on reload and every image in history was
+  re-described by the vision model on the first post-reload turn.
+  The file is written atomically (temp file + `renameSync`) so an
+  interrupted write cannot leave a truncated JSON that would
+  silently wipe the cache on the next hydration. Cache key is the
+  SHA-256 short hash of the image bytes; a hit substitutes the
+  stored text description SILENTLY — zero vision-model calls, zero
+  "Describing image" annotations. ADR 0013 documents the full
+  processed-image lifecycle (marker + cache + substitution). 4 tests
+  in `test/unit/visionTwoPhaseCache.test.ts` cover: first describe,
+  silent repeat, two distinct images, reload persistence.
 - **Context compaction production wiring** (v0.13.0 Slice 2 per
   `docs/compaction-spec.md`, default OFF) — settings
   `ollamaCloud.compaction.enabled` (default `false`) and
@@ -41,6 +75,56 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
   provider integration) is Slice 2. 21 unit tests added (582 → 603).
 
 ### Fixed
+- **Compaction stuck-disarmed (Bug 1)** — `applyCompacted` re-armed
+  only at the 40% target. A partial compaction that did not reach 40%
+  left the machine disarmed forever, so compaction never fired again
+  and context grew unbounded (log: `armed=false` at `usedTokens=2.3M`
+  on a 750K-window model). Re-arm now happens at the 75% fire
+  threshold (with the 5-minute cooldown guard preventing loops).
+- **EMA poisoned by image data URLs (Bug 2)** —
+  `updateTokenEstimate` computed `observed = requestChars /
+  usage.inputTokens`. `requestChars` includes base64 image data URLs
+  (1M+ chars per image), but the server counts image tokens correctly
+  (~1K per image), so the ratio became ~1000+ and the EMA dropped to
+  `charsPerToken=0.47` after a few vision requests, making every
+  token estimate explode. The EMA update is now skipped when
+  `observed > 20 chars/token` (text-only requests give `observed≈4`;
+  vision requests are excluded entirely).
+- **CR #1 (security) — raw response body not redacted** —
+  `extractErrorMessage` in `streamReader.ts` logged
+  `rawBodyPreview=${body.slice(0, 500)}` without redaction. Server
+  error bodies may echo request headers or query params. Now wrapped
+  in `redactSensitive()`.
+- **CR #2/#14 — HOTFIX_CHAR_CAP block removed** — the
+  `ollamaCloud.hotfix.charCap` setting and its 70-line bruteforce
+  truncation block in `provider.ts` were a temporary workaround that
+  trimmed context instead of using compaction properly. Removed
+  entirely; compaction is the correct path.
+- **CR #3 — vision-gate DIAG log removed** — the diagnostic log line
+  (`vision-gate DIAG: requestHasImages=...`) was added for v0.12.1
+- **Release pipeline fail-fast on missing COSIGN_PASSWORD** —
+  `scripts/local-ci/run-release-local.sh` step 4 (sigstore cosign)
+  now hard-fails when `cosign.key` exists but `COSIGN_PASSWORD` is
+  unset, instead of hanging indefinitely on a TTY-less passphrase
+  prompt (observed 33-min hang in a background run). Both
+  `cosign sign-blob` invocations now read from `/dev/null` as
+  defence-in-depth — even a cosign that ignores the env var gets
+  EOF on the prompt and fails fast.
+  investigation. The investigation is closed; the log is noise in
+  production. Removed.
+- **CR #4 — Compaction DEBUG log moved to debug level** — was
+  `logger.info` (visible in production output); now `logger.debug`
+  (visible only when `ollamaCloud.debug` is enabled).
+- **CR #6 — duplicate doc-block for `errorRefId` removed** — two
+  adjacent JSDoc blocks were merged into one.
+- **CR #7 — `classifyStreamError` catch-all preserves
+  `LanguageModelError`** — the default HTTP branch and the
+  unclassified error branch returned `new Error(...)`, losing the
+  `LanguageModelError` type VS Code surfaces consistently. Both now
+  return `LanguageModelError.Blocked(...)`.
+- **CR #12 — stale "EXPECTED TO FAIL" comment updated** — the
+  oscillation test passes since v0.12.0; the comment now reflects
+  that it is a regression guard, not an expected failure.
 - **Context filter now applies to the native `/api/chat` path (ADR 0007 gap)** — native (the cloud default, `auto` → native) silently bypassed the filter: default cloud users got zero filtering and the `Context filter:` log line never fired. The filtered OpenAI payload now converts via the new `convertOpenAIMessagesToNative` / `convertOpenAIToolsToNative` (no VS Code ↔ OpenAI round-trip); the raw conversion path is preserved when the filter is `off`. `requestChars` is now accurate on the native path too. 12 tests added.
 - **P1 (review) — SSRF guard closed IPv4-embedded IPv6 bypass** — `::ffff:169.254.169.254`, NAT64 (`64:ff9b::/96`) and IPv4-compatible (`::a.b.c.d`) forms were never classified against the embedded IPv4 address; all three now run the low 32 bits through the shared IPv4 classifier (mapped loopback respects `allowLoopback`). Unspecified `::` is blocked as well.
 - **P1 (review) — LAN-hosted Ollama unblocked on local connections** — RFC 1918 ranges were hard-blocked even for `type:'local'` connections, and the block error promised a non-existent "explicit override". Local connections now set `allowPrivateRanges` (10/8, 172.16/12, 192.168/16 allowed); cloud metadata (169.254/16), CGNAT and all IPv6-sensitive ranges never relax. Error message rewritten; cloud errors point at `ollamaCloud.allowedBaseUrls`.

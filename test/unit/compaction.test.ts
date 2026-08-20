@@ -140,12 +140,16 @@ describe('compaction (v0.13.0 slice 1)', () => {
     });
   });
 
-  describe('applyCompacted (re-arm at 40%)', () => {
-    it('re-arms a discharged machine only at or below the 40% target', () => {
+  describe('applyCompacted (re-arm at 75% fire threshold — Bug 1 fix)', () => {
+    it('re-arms a discharged machine at or below the 75% fire threshold', () => {
       const discharged: CompactionState = { armed: false };
       const window = 1000;
-      assert.deepStrictEqual(applyCompacted(discharged, 500, window), { armed: false });
-      assert.deepStrictEqual(applyCompacted(discharged, 410, window), { armed: false });
+      // Bug 1 fix — re-arm at 75% (COMPACT_AT_RATIO), not 40% (target).
+      // A partial compaction that did not reach 40% but dropped below 75%
+      // should re-arm so the next fire (after cooldown) can try again.
+      assert.deepStrictEqual(applyCompacted(discharged, 800, window), { armed: false });
+      assert.deepStrictEqual(applyCompacted(discharged, 760, window), { armed: false });
+      assert.deepStrictEqual(applyCompacted(discharged, 750, window), { armed: true });
       assert.deepStrictEqual(applyCompacted(discharged, 400, window), { armed: true });
       assert.deepStrictEqual(applyCompacted(discharged, 200, window), { armed: true });
     });
@@ -182,14 +186,16 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(zones.recency[0], msgs[6]);
     });
 
-    it('applies the 6-turn floor when the token quota is met sooner', () => {
-      // 8 turns × 200 tokens = 1600; window 1000 → quota 250, met by
-      // 3 messages — but the floor forces the last 6 turns (12 messages).
+    it('caps the 6-turn floor at 2× tokens when the token quota is met sooner', () => {
+      // 8 turns × 100 tokens/msg = 1600; window 1000 → quota 250, met by
+      // 3 messages (byTokens=3). The 6-turn floor would take 12 messages,
+      // but the cap limits it to byTokens×2 = 6 — so recency = 6, not 12.
+      // This is the fix: turns cannot dominate when tokens are binding.
       const msgs = turns(8, 100);
       const zones = splitZones(msgs, 1000, est);
-      assert.strictEqual(zones.recency.length, 12);
-      assert.strictEqual(zones.recency[0], msgs[4]); // user of turn 3
-      assert.strictEqual(zones.evictable.length, 4);
+      assert.strictEqual(zones.recency.length, 6);
+      assert.strictEqual(zones.recency[0], msgs[10]); // user of turn 6
+      assert.strictEqual(zones.evictable.length, 10);
     });
 
     it('never splits an assistant tool_call from its tool results at the boundary', () => {
@@ -302,7 +308,8 @@ describe('compaction (v0.13.0 slice 1)', () => {
 
     it('compacts: assembles [system, pinned, summary-inject, recency], returns pointer, discharges state', async () => {
       // window 1500: fire at 1125; used = 2050. Recency = 6 turns = 600
-      // tokens; post-compaction usage ≈ 816 > 600 (40%) → stays disarmed.
+      // tokens; post-compaction usage ≈ 816 < 1125 (75% fire threshold)
+      // → re-arms (Bug 1 fix: was 40%, now 75% for recovery from partial compaction).
       const s1 = sys('s1');
       const pin = asr('PIN');
       const history = turns(20);
@@ -347,15 +354,16 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(result.pointer, 'ptr-1');
       assert.strictEqual(result.summary, 'GOAL: keep the goal. DONE: work.');
       // Slice 1.1 (additive): the fire stamps the summary chain onto the state.
+      // Bug 1 fix: 816 < 1125 (75% of 1500) → re-arms (was: stays disarmed at 40%).
       assert.deepStrictEqual(result.state, {
-        armed: false,
+        armed: true,
         lastSummary: 'GOAL: keep the goal. DONE: work.',
         lastPointer: 'ptr-1',
         lastFiredAt: 123_456,
       });
     });
 
-    it('re-arms when the compaction result lands at or below the 40% target', async () => {
+    it('re-arms when the compaction result lands at or below the 75% fire threshold (Bug 1 fix)', async () => {
       // window 4000: fire at 3000; used = 4050. Recency = quota 1000
       // (20 messages = 10 turns); post-compaction usage ≈ 1166 <= 1600.
       const messages = [sys('s1'), ...turns(40)];
@@ -488,7 +496,7 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(first.pointer, 'ptr-1');
       assert.ok(!summarize.calls[0]!.includes('PREVIOUS CHECKPOINT')); // first: no chain yet
       assert.deepStrictEqual(first.state, {
-        armed: false,
+        armed: true,
         lastSummary: 'SUMMARY-ONE',
         lastPointer: 'ptr-1',
         lastFiredAt: 1_000_000,
@@ -496,7 +504,8 @@ describe('compaction (v0.13.0 slice 1)', () => {
       const firstInjected = first.messages[1] as Msg;
       assert.ok(!firstInjected.content.includes('previous pointer'));
 
-      // Caller re-arms after observing the result at <= 40% (applyCompacted contract).
+      // Caller re-arms after observing the result at <= 75% fire threshold
+      // (applyCompacted contract — Bug 1 fix: was 40%, now 75%).
       const second = await compactIfNeeded({
         messages: history(),
         windowTokens: 1400,
@@ -512,7 +521,7 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.ok(summarize.calls[1]!.includes('PREVIOUS CHECKPOINT'));
       assert.ok(summarize.calls[1]!.includes('SUMMARY-ONE')); // folded into the prompt
       assert.deepStrictEqual(second.state, {
-        armed: false,
+        armed: true,
         lastSummary: 'SUMMARY-TWO',
         lastPointer: 'ptr-2',
         lastFiredAt: 2_000_000,
@@ -582,6 +591,72 @@ describe('compaction (v0.13.0 slice 1)', () => {
       });
       assert.strictEqual(idle.compacted, false);
       assert.strictEqual(idle.stats, null);
+    });
+  });
+
+  describe('splitZones recency cap (P0 — few turns, many tools)', () => {
+    it('caps turns at 2× tokens so few-user-turns-many-tools still evicts', () => {
+      // Simulate: 5 user turns, ~300 tool/assistant messages, window 131072.
+      // Estimate ~400 tokens/msg → ~120000 tokens of candidates, way over
+      // budget. The 6-turn floor would scan ALL candidates (only 5 users)
+      // → without the cap, evictable would be empty. With the cap,
+      // byTurns is capped at byTokens × 2, so evictable is non-empty.
+      const msgs: Msg[] = [];
+      // 5 user turns, each followed by ~30 [assistant, tool] pairs.
+      for (let u = 1; u <= 5; u++) {
+        msgs.push(usr(`u${u}`, 400));
+        for (let t = 1; t <= 30; t++) {
+          msgs.push(asr(`a${u}-${t}`, 400));
+          msgs.push(tol(`r${u}-${t}`, 400));
+        }
+      }
+      // 5 + 5*60 = 305 messages, ~122000 tokens. window 131072.
+      const window = 131072;
+      const zones = splitZones(msgs, window, est);
+      // Evictable MUST be non-empty — the whole point of the fix.
+      assert.ok(zones.evictable.length > 0, 'evictable empty: byTurns dominated byTokens');
+      // Recency must not exceed byTokens × 2 (the cap).
+      const quota = 0.25 * window; // 32768
+      const byTokens = Math.ceil(quota / 400); // ~82 messages to reach quota
+      assert.ok(
+        zones.recency.length <= byTokens * 2,
+        `recency ${zones.recency.length} > byTokens*2 ${byTokens * 2}`,
+      );
+      // Recency still covers the token quota (floor is byTokens).
+      const recencyTokens = zones.recency.reduce((s, m) => s + est(m), 0);
+      assert.ok(recencyTokens >= quota, `recency ${recencyTokens} < quota ${quota}`);
+    });
+
+    it('emergency fallback evicts oldest 10% when over-window and nothing evictable', () => {
+      // A tiny conversation (1 user + 1 assistant) that is OVER the hard
+      // window limit. The capped path produces evictable=0 (only 1 user
+      // turn → byTurns = all candidates = 2, and byTokens×2 = 2 ≥ 2 →
+      // count = 2 → evictable = 0). But totalUsed (6000) > windowTokens
+      // (4000) → emergency fallback force-evicts the oldest 10%.
+      // 2 messages × 3000 tokens = 6000 tokens, window 4000.
+      const msgs = [usr('t01u', 3000), asr('t01a', 3000)];
+      const zones = splitZones(msgs, 4000, est);
+      // The capped path gives evictable=0; emergency fallback fires.
+      assert.ok(zones.evictable.length > 0, 'emergency fallback did not fire');
+      // Evicted = oldest 10% = max(1, floor(2 * 0.1)) = max(1, 0) = 1.
+      assert.strictEqual(zones.evictable.length, 1);
+      assert.strictEqual(zones.recency.length, 1);
+      // The evicted message is the oldest candidate (first user).
+      assert.strictEqual(zones.evictable[0], msgs[0]);
+    });
+
+    it('normal case still works — many turns, recency non-empty, evictable non-empty', () => {
+      // Existing behavior preserved: 20 turns, window 1000, quota 250.
+      // byTokens ≈ 5 messages (5 × 50 = 250); byTurns = 12 (6 turns × 2 msg).
+      // cappedByTurns = min(12, 5*2=10) = 10; count = max(5, 10) = 10.
+      // evictable = 40 - 10 = 30; recency = 10.
+      const msgs = turns(20);
+      const zones = splitZones(msgs, 1000, est);
+      assert.ok(zones.evictable.length > 0);
+      assert.ok(zones.recency.length > 0);
+      // Recency covers the token quota.
+      const recencyTokens = zones.recency.reduce((s, m) => s + est(m), 0);
+      assert.ok(recencyTokens >= 250, `recency ${recencyTokens} < quota 250`);
     });
   });
 });

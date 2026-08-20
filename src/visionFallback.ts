@@ -66,21 +66,34 @@ export interface VisionTarget {
 
 /**
  * Returns true when the primary model cannot handle images AND the
- * request carries image parts. Pure — no I/O, no side effects.
+ * request carries image parts in ANY user message.
+ *
+ * ALL user messages are checked — not just the last one — because
+ * VS Code owns the conversation history and re-sends it on every
+ * turn: image parts from earlier turns are still in the payload even
+ * on text-only turns, and the primary model cannot read them. The
+ * two-phase fallback replaces those stale images with their CACHED
+ * descriptions (see `imageDescriptionCache` in visionTwoPhase.ts) —
+ * no re-description, no vision call, but the gate must still fire so
+ * the replacement happens instead of raw images reaching the primary
+ * model (or the gate's `else` throwing "does not support image
+ * input").
+ *
+ * The redundant vision call on text-only turns is prevented by the
+ * DESCRIPTION CACHE, not by narrowing this check.
  */
 export function shouldFallback(
   primaryModel: ModelDefinition,
   messages: readonly vscode.LanguageModelChatRequestMessage[],
 ): boolean {
-  return (
-    !primaryModel.capabilities.imageInput && hasImagePartsMessages(messages)
+  if (primaryModel.capabilities.imageInput) {
+    return false;
+  }
+  return messages.some(
+    (message) =>
+      message.role === vscode.LanguageModelChatMessageRole.User &&
+      hasImageParts(message.content),
   );
-}
-
-function hasImagePartsMessages(
-  messages: readonly vscode.LanguageModelChatRequestMessage[],
-): boolean {
-  return messages.some((message) => hasImageParts(message.content));
 }
 
 /**

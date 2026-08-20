@@ -74,6 +74,27 @@ import {
   withRetry,
 } from './retry.js';
 
+/**
+ * Mid-stream retry threshold. When a `ConnectionInterruptedError`
+ * occurs with `chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS`, the
+ * entire `readStream` (fetch + stream body) is retried from scratch.
+ * Already-streamed tokens are lost (the caller receives them again on
+ * retry), but this is far better than crashing subagents on every
+ * server-side socket reset.
+ *
+ * Ollama Cloud regularly closes streams after 2-9 chunks (ECONNRESET
+ * during generation). Without mid-stream retry, every long subagent
+ * request that hits this server instability fails terminally.
+ *
+ * 50 chunks is a conservative threshold: long reasoning model outputs
+ * (hundreds of chunks) are NOT retried (too much lost); short tool-call
+ * responses (1-10 chunks) ARE retried (minimal loss, high recovery
+ * rate). Subagent tool-call streams are the primary beneficiary.
+ */
+const MID_STREAM_RETRY_MAX_CHUNKS = 50;
+const MID_STREAM_RETRY_MAX_ATTEMPTS = 3;
+const MID_STREAM_RETRY_BASE_DELAY_MS = 1000;
+
 // -------------------------------------------------------------------------
 // ADR 0012 (revised) — single-timer architecture. The connect timer
 // (60s default) and the inactivity timer were removed: production
@@ -185,9 +206,68 @@ export interface StreamReaderOptions {
  * Behavior-preserving relative to the former inline implementations in
  * `ollamaClient.streamChat` and `responsesClient.streamResponses`.
  */
+/**
+ * Mid-stream retry wrapper around `readStreamOnce`. When the server
+ * closes the stream mid-generation (`ConnectionInterruptedError`)
+ * with a small number of chunks, the entire fetch+stream is retried.
+ * Already-streamed tokens are lost (caller receives them again), but
+ * this prevents subagent crashes on server-side socket resets.
+ *
+ * Retry conditions:
+ *   - Error is `ConnectionInterruptedError`
+ *   - `chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS` (50)
+ *   - Caller has NOT cancelled
+ *   - Attempt < `MID_STREAM_RETRY_MAX_ATTEMPTS` (3)
+ *
+ * Non-retryable errors (MidStreamError, HttpError, MaxDurationError,
+ * ZeroByteSocketCloseError, cancel, buffer overrun) pass through
+ * unchanged — they are either retried by `withRetry` (connect phase)
+ * or genuinely terminal (server error, user cancel).
+ */
 export async function readStream(
   options: StreamReaderOptions,
   callbacks: StreamCallbacks,
+): Promise<void> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < MID_STREAM_RETRY_MAX_ATTEMPTS; attempt++) {
+    // Track chunks received THIS attempt — readStreamOnce updates
+    // a local copy; we read it via a shared object.
+    const attemptState = { chunksReceived: 0 };
+    try {
+      await readStreamOnce(options, callbacks, attemptState);
+      return; // success
+    } catch (error) {
+      lastError = error;
+      // Retry only on ConnectionInterruptedError with few chunks.
+      const isCIE =
+        error instanceof ConnectionInterruptedError &&
+        attemptState.chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS;
+      const cancelled = options.cancellationToken?.isCancellationRequested === true;
+      logger.warn(`Mid-stream retry eval: attempt=${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS} isCIE=${isCIE} chunks=${attemptState.chunksReceived} cancelled=${cancelled} errorClass=${(error as Error)?.constructor?.name}`);
+      if (!isCIE || cancelled || attempt >= MID_STREAM_RETRY_MAX_ATTEMPTS - 1) {
+        throw error;
+      }
+      // Exponential backoff: 1s, 2s, 4s...
+      const delay = MID_STREAM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      logger.warn(
+        `Mid-stream retry: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks (attempt ${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS}). Retrying in ${delay}ms.`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Single attempt of `readStream`. This is the original `readStream`
+ * body, extracted so the retry wrapper can call it multiple times.
+ * `attemptState.chunksReceived` is updated so the caller can decide
+ * whether to retry.
+ */
+async function readStreamOnce(
+  options: StreamReaderOptions,
+  callbacks: StreamCallbacks,
+  attemptState: { chunksReceived: number },
 ): Promise<void> {
   const { logTag, url, headers, body, cancellationToken } = options;
 
@@ -220,8 +300,13 @@ export async function readStream(
   // Count of chunks received — condition #3: incremented by this module,
   // NOT by the callback. Used by the catch block to distinguish
   // connect/first-token (0 chunks) from mid-stream (>0 chunks) for
-  // error messages. NOT used for retry decisions (no retry regardless).
+  // error messages. Also tracked in `attemptState` for the retry
+  // wrapper to decide whether to retry.
   let chunksReceived = 0;
+  const trackChunks = (n: number): void => {
+    chunksReceived = n;
+    attemptState.chunksReceived = n;
+  };
   // ArchCom 0011c (SSE finding #1): track parsed (meaningful) chunks
   // separately from raw bytes received. If bytes arrive but none parse
   // (e.g. HTML captive portal at 200), parsedChunks stays 0 → we surface
@@ -406,7 +491,7 @@ export async function readStream(
     // reality (used by the empty-stream + captive-portal detection
     // below).
     let buffer = decoder.decode(response.firstChunk, { stream: true });
-    chunksReceived += 1;
+    trackChunks(1); // chunksReceived = 1 (first chunk probed inside withRetry)
     // Fix 6 — the first chunk was probed inside withRetry. Apply the
     // same buffer-cap + line-processing the loop applies to subsequent
     // chunks so a single oversized first chunk is caught and its lines
@@ -442,7 +527,7 @@ export async function readStream(
         break;
       }
 
-      chunksReceived += 1;
+      trackChunks(chunksReceived + 1);
 
       buffer += decoder.decode(chunk.value, { stream: true });
       // MEDIUM-2 — unbounded stream buffer is a DoS vector. Cap at
@@ -540,9 +625,9 @@ export async function readStream(
         return;
       }
       if (abortReason === null && chunksReceived > 0) {
-        // Bare socket close AFTER chunks were received — terminal.
-        callbacks.onError(new ConnectionInterruptedError(chunksReceived));
-        return;
+        // Mid-stream retry: throw instead of callbacks.onError so the
+        // retry wrapper in `readStream` can catch and retry.
+        throw new ConnectionInterruptedError(chunksReceived);
       }
       // Ambiguous AbortError with no tag and no chunks — caller-cancel
       // is the safest default.
@@ -575,7 +660,9 @@ export async function readStream(
       if (chunksReceived === 0) {
         callbacks.onError(new ZeroByteSocketCloseError());
       } else {
-        callbacks.onError(new ConnectionInterruptedError(chunksReceived));
+        // Mid-stream retry: throw instead of callbacks.onError so the
+        // retry wrapper in `readStream` can catch and retry.
+        throw new ConnectionInterruptedError(chunksReceived);
       }
       return;
     }
@@ -641,6 +728,18 @@ function resolveMaxDurationMs(): number {
  */
 async function extractErrorMessage(response: HttpResponseLike): Promise<string> {
   const body = await response.text();
+  // RCA 2026-08-19 — log the RAW response body on non-200 so we can
+  // see EXACTLY what the server says (HTTP 400 with empty body vs
+  // "context length exceeded" vs "invalid request" etc).
+  if (response.status >= 400) {
+    // CR #1 — redact the raw body preview before logging. Server
+    // error bodies may echo request headers, query params, or
+    // custom secret formats the logger's redaction patterns do
+    // not cover. `redactSensitive` is already imported above.
+    logger.warn(
+      `extractErrorMessage: status=${response.status} rawBodyLen=${body.length} rawBodyPreview=${redactSensitive(body.slice(0, 500))}`,
+    );
+  }
   try {
     const parsed = JSON.parse(body) as {
       error?: { message?: string };

@@ -179,11 +179,20 @@ export function shouldCompact(
 /**
  * Re-evaluates the hysteresis after a compaction result has been applied.
  *
- * A discharged (disarmed) machine re-arms only when the post-compaction
- * usage dropped to the 40% target — that is the completion of one
- * hysteresis cycle (75% fire → 40% land). A compaction that could not
- * reach the target leaves the machine disarmed; the caller falls back
- * to truncation rather than compacting again immediately.
+ * A discharged (disarmed) machine re-arms when the post-compaction
+ * usage is at or below the fire threshold (75%). The original spec
+ * required reaching the 40% target, but that created a
+ * stuck-disarmed failure mode: if a compaction could not reach 40%
+ * (e.g. the summarizer returned a long summary, or the recency tail
+ * itself is large), the machine stayed disarmed forever and
+ * compaction never fired again — context grew unbounded.
+ *
+ * Fix 2026-08-19 (Bug 1 RCA): re-arm when `usedTokensAfter <=
+ * COMPACT_AT_RATIO * windowTokens` (75%). This still prevents
+ * immediate re-fire (the cooldown guard in `shouldCompact` enforces
+ * the 5-minute gap), but allows recovery from a partial compaction.
+ * Reaching the 40% target is the happy path; the 75% threshold is the
+ * recovery path.
  *
  * Evaluating an armed machine never disarms it — only a fire discharges.
  *
@@ -196,7 +205,11 @@ export function applyCompacted(
   windowTokens: number,
 ): CompactionState {
   if (state.armed) return { ...state };
-  return { ...state, armed: usedTokensAfter <= COMPACT_TARGET_RATIO * windowTokens };
+  // Bug 1 fix — re-arm at the fire threshold (75%), not just the
+  // target (40%). A partial compaction that did not reach 40% but
+  // dropped below 75% should re-arm so the next fire can attempt
+  // another compaction (with the cooldown guard preventing loops).
+  return { ...state, armed: usedTokensAfter <= COMPACT_AT_RATIO * windowTokens };
 }
 
 // ---------------------------------------------------------------------------
@@ -273,9 +286,32 @@ export function splitZones<T extends { role: string }>(
     }
   }
 
-  const count = Math.min(candidates.length, Math.max(byTokens, byTurns));
-  const recency = candidates.slice(candidates.length - count);
-  const evictable = candidates.slice(0, candidates.length - count);
+  // Cap the turn floor so it cannot dominate when tokens are the binding
+  // constraint. In agent sessions with few user turns but many tool
+  // results (e.g. 5 user + 300 tool, 129K tokens), the 6-turn floor
+  // would otherwise span ALL candidates → evictable empty → compaction
+  // no-ops → 400 context-too-long from the server. The token-based
+  // quota wins when 6 turns = the whole conversation and it's over
+  // budget; turns may extend the token floor up to 2× for safety, but
+  // never dominate it.
+  const cappedByTurns = Math.min(byTurns, byTokens * 2);
+  let count = Math.min(candidates.length, Math.max(byTokens, cappedByTurns));
+  let recency = candidates.slice(candidates.length - count);
+  let evictable = candidates.slice(0, candidates.length - count);
+
+  // Emergency fallback: if nothing is evictable but the conversation is
+  // over the hard window limit, force-evict the oldest 10% of candidates
+  // regardless. This prevents the "nothing to evict but context too
+  // long" deadlock — a last-resort truncation that lets compaction
+  // proceed instead of no-oping into a server 400.
+  if (evictable.length === 0 && candidates.length > 0) {
+    const totalUsed = candidates.reduce((s, m) => s + estimate(m), 0);
+    if (totalUsed > windowTokens) {
+      const evictCount = Math.max(1, Math.floor(candidates.length * 0.1));
+      evictable = candidates.slice(0, evictCount);
+      recency = candidates.slice(evictCount);
+    }
+  }
 
   // Tool-pair repair: never split an assistant tool_call from its results.
   // While the first recency message is a tool result, absorb the preceding
