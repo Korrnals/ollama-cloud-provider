@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-14
+
+Commit-window — silent early-break healing, 50-chunk mid-stream retry threshold abolished (ArchCom 2026-09-14 §3.4) — plus gate M-package hardening of `/api/show` capability probing and the commit-window review remediation (fix-then-ship). Stream breaks inside the first ~5 s now heal invisibly; after the window a break is terminal and honest: visibility, not chunk volume, decides retryability.
+
 ### Security hardening (gate M-package)
 - **M1 — `modified_at` staleness hint**: the capability cache entry now stores the server-reported `modified_at` from `/api/show` (optional date string, kept only when parseable), and each probe batch log line gains `oldestCached=HH:MM:SS` (UTC) — or `oldestCached=-` when the server reports none. Full digest-based invalidation on `modified_at` change is deliberately out of scope (backlog: "M1-full").
 - **M2 — per-connection 429 backoff**: a 429 from `/api/show` benches the connection (Retry-After seconds, 60 s default); while benched, probe batches for that connection are skipped entirely (empty result + warn, snapshot/heuristic fallback) instead of re-hammering the endpoint on every refresh.
