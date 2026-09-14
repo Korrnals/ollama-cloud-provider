@@ -5,6 +5,24 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-14
+
+Live capability probing via `/api/show` (ArchCom 2026-09-14, train B) + review P2 follow-ups. The class of bug "a NEW model misdetects as text-only until the extension ships a snapshot update" is now closed: capabilities are probed live at catalog refresh.
+
+### Added
+- **Live capability probing (`POST /api/show`)** — models discovered on a connection that are MISSING from the hardcoded snapshot are probed against the connection's native `/api/show` endpoint, which returns the authoritative `capabilities` array (e.g. `["completion","thinking","tools","vision"]`). Probed values map to `imageInput`/`reasoning`/`toolCalling` and REPLACE the name-heuristic guess. Works against ollama.com (public, verified live: glm-5.3-flash = vision+tools+thinking) and any self-hosted Ollama ≥ v0.6.4. Capability layers are now: user override (`visionModels`) → snapshot → `api-show` probe → name heuristics.
+- **Capability provenance** — every model records where its capabilities came from (`snapshot` / `api-show` / `inferred`); `Ollama Cloud: Show Registered Models` now prints `imageInput`, `reasoning` and the source per model, and each refresh logs one `capability-probe:` batch line (`probed/ok/fallback`).
+- **`PostBudgetExhaustedError` (typed)** — when the shared POST budget (6 per message, v0.14.0) runs out, the user now sees an honest localized message naming the cap and the last error class, instead of a generic English `Error` (review P2-1).
+- **Integration tests for the v0.14.x invariants** (review P2-2) — the shared POST budget (exactly 6 POSTs, then terminal) and the visible mid-stream retry notice (exactly one notice after already-shown chunks).
+
+### Security (conditions from the architectural contract, all implemented)
+- No `Authorization` header on cloud `/api/show` probes (public endpoint — the key must not tie probe traffic to the account); self-hosted connections with `requiresApiKey` send the key as usual; a 401/403 probe result NEVER escalates to a keyed retry.
+- One attempt per model (no `withRetry`); 429 cancels the remaining batch (already-collected results kept); response size cap 64 KiB; strict schema validation (`capabilities` must be an array of strings); concurrency ≤ 4; 24 h cache per `(connection, model)`; DNS-rebinding SSRF guard runs before every probe (blocks throw terminally and are logged — never silently degraded).
+- Trust rules: probe results only ELEVATE over name heuristics (server-true wins); a server-false never silently demotes a heuristic-true — the disagreement is logged and the heuristic kept; the user's `visionModels` override stays senior at runtime.
+
+### Changed
+- Model catalog refresh now probes only snapshot-unknown models (typically 1–3 requests on a warm refresh — snapshot-known models cost nothing extra).
+
 ## [0.14.0] - 2026-09-14
 
 Stream reliability under long thinking + vision capability fixes (ArchCom 2026-09-14, train A).

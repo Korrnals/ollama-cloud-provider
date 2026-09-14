@@ -67,6 +67,7 @@ import type { StreamCallbacks } from './protocolTypes.js';
 import {
   ConnectionInterruptedError,
   MaxDurationError,
+  PostBudgetExhaustedError,
   UpstreamIdleTimeoutError,
   ZeroByteSocketCloseError,
   defaultRetryOn,
@@ -372,6 +373,9 @@ async function readStreamOnce(
   // after a long silent thinking phase).
   let headersAt: number | undefined;
   let lastChunkAt: number | undefined;
+  // Review P2-1 — class name of the most recent failed attempt, so the
+  // typed budget-exhausted error can name what the budget was spent on.
+  let lastAttemptErrorClass: string | undefined;
 
   // Tagged abort reason — the catch block routes by this tag to emit
   // the right user-facing message and to decide onDone vs onError.
@@ -460,11 +464,11 @@ async function readStreamOnce(
         // ArchCom 2026-09-14 (train A) — shared POST budget. Every
         // connect attempt (including retries inside withRetry)
         // consumes from the same counter the mid-stream loop uses.
-        // Exhausted budget fails the attempt without retrying.
+        // Exhausted budget fails the attempt without retrying, as a
+        // typed error (review P2-1) so classifyStreamError can show an
+        // honest localized message naming the cap.
         if (budget.remaining <= 0) {
-          throw new Error(
-            `${logTag}: POST budget of ${MAX_POST_BUDGET_PER_MESSAGE} attempts exhausted — not retrying.`,
-          );
+          throw new PostBudgetExhaustedError(lastAttemptErrorClass);
         }
         budget.remaining -= 1;
 
@@ -583,6 +587,7 @@ async function readStreamOnce(
         } catch (error) {
           // ADR 0012 (revised) — connect timer removed. Rethrow all
           // errors unchanged; defaultRetryOn decides retryability.
+          lastAttemptErrorClass = (error as Error)?.constructor?.name;
           throw error;
         } finally {
           // Do NOT remove the listener here on a successful fetch —

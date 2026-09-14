@@ -15,6 +15,11 @@ import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
 import { isModelKnownRetired } from './capabilityCache.js';
 import { createProductionSsrfGuard, type SsrfGuard } from './ssrfGuard.js';
+import {
+  probeCapabilities,
+  type ProbedCapabilities,
+  type ProbeContext,
+} from './capabilityProbe.js';
 
 const MODELS_ENDPOINT_SUFFIX = '/models';
 const TAGS_ENDPOINT_SUFFIX = '/api/tags';
@@ -52,6 +57,13 @@ export interface ModelDefinition {
     imageInput: boolean;
     toolCalling: boolean | number;
   };
+  /**
+   * ArchCom 2026-09-14 (train B) — where this model's capabilities came
+   * from, for diagnostics: 'snapshot' (hardcoded table), 'api-show'
+   * (live POST /api/show probing), 'inferred' (name heuristics).
+   * Absent on legacy definitions means 'snapshot'.
+   */
+  capabilitySource?: 'snapshot' | 'api-show' | 'inferred';
 }
 
 interface SnapshotModelDefinition {
@@ -520,6 +532,21 @@ export class ModelCatalog {
     const nextModels = ids.map(
       (id) => KNOWN_MODEL_MAP.get(id) || inferModel(id),
     );
+
+    // ArchCom 2026-09-14 (train B) — live capability probing for models
+    // MISSING from the snapshot. Cloud context: public /api/show, no
+    // Authorization (Security condition — the key must not tie probe
+    // traffic to the account); strict SSRF profile (cloud allows no
+    // private ranges).
+    await applyCapabilityProbing(
+      nextModels,
+      {
+        connectionId: 'cloud',
+        rootUrl: this.authManager.getRootUrl(),
+      },
+      createProductionSsrfGuard(),
+    );
+
     const changed = !sameModelIds(this.models, nextModels);
     this.models = nextModels;
 
@@ -554,17 +581,43 @@ export class ModelCatalog {
     for (const connection of connections) {
       try {
         const ids = await this.fetchModelIdsForConnection(connection);
+        const connectionModels: ModelDefinition[] = [];
         for (const apiModel of ids) {
           const known = KNOWN_MODEL_MAP.get(apiModel);
           const model = known
             ? withConnection(known, connection)
             : inferModelForConnection(apiModel, connection);
+          connectionModels.push(model);
           // Dedupe by id — if two connections expose the same apiModel,
           // the connectionId segment in the id makes them distinct.
           if (!nextModels.some((m) => m.id === model.id)) {
             nextModels.push(model);
           }
         }
+
+        // ArchCom 2026-09-14 (train B) — probe capabilities for models
+        // the snapshot does not know, on THIS connection's own /api/show
+        // (per-connection auth: key only when requiresApiKey — local
+        // keyless Ollama stays keyless).
+        if (connectionModels.some((m) => !KNOWN_MODEL_MAP.has(m.apiModel))) {
+          const apiKey = connection.requiresApiKey
+            ? await this.authManager.getApiKeyForConnection(connection)
+            : undefined;
+          await applyCapabilityProbing(
+            connectionModels,
+            {
+              connectionId: connection.id,
+              rootUrl: rootUrlForConnection(connection),
+              apiKey,
+            },
+            createProductionSsrfGuard(
+              connection.type === 'local'
+                ? { allowLoopback: true, allowPrivateRanges: true }
+                : undefined,
+            ),
+          );
+        }
+
         // Issue #41 — Strand 1: per-connection sync result so the
         // audit can see which connections contributed how many models
         // (and which contributed zero). One line per connection per
@@ -682,6 +735,7 @@ function defineModel(model: SnapshotModelDefinition): ModelDefinition {
       imageInput: model.imageInput ?? inferImageInput(model.apiModel),
       toolCalling: model.toolCalling ?? inferToolCalling(model.apiModel),
     },
+    capabilitySource: 'snapshot',
   };
 }
 
@@ -719,6 +773,7 @@ function inferModel(id: string): ModelDefinition {
       imageInput: inferImageInput(id),
       toolCalling: inferToolCalling(id),
     },
+    capabilitySource: 'inferred',
   };
 }
 
@@ -785,6 +840,96 @@ function inferModelForConnection(
       imageInput,
       toolCalling: inferToolCalling(apiModel),
     },
+    capabilitySource: 'inferred',
+  };
+}
+
+/**
+ * ArchCom 2026-09-14 (train B) — applies live `/api/show` probe results
+ * to a freshly built model list IN PLACE. Only models the snapshot does
+ * not know are probed; each result REPLACES the model entry (elevate-only
+ * merge — see `mergeProbed`). One summary log line per batch; probe
+ * failures degrade silently to the inferred entry with the batch log
+ * accounting the fallback count.
+ */
+async function applyCapabilityProbing(
+  models: ModelDefinition[],
+  ctx: ProbeContext,
+  ssrfGuard?: SsrfGuard,
+): Promise<void> {
+  const unknown = models.filter((m) => !KNOWN_MODEL_MAP.has(m.apiModel));
+  if (unknown.length === 0) {
+    return;
+  }
+  try {
+    const probed = await probeCapabilities(
+      unknown.map((m) => m.apiModel),
+      ssrfGuard ? { ...ctx, ssrfGuard } : ctx,
+    );
+    for (let i = 0; i < models.length; i++) {
+      const caps = probed.get(models[i].apiModel);
+      if (!caps) {
+        continue;
+      }
+      models[i] = mergeProbed(models[i], caps);
+    }
+    logger.info(
+      `capability-probe: connection='${ctx.connectionId}' probed=${unknown.length} ok=${probed.size} fallback=${unknown.length - probed.size}`,
+    );
+  } catch (error) {
+    // Terminal probe failure (e.g. SsrfBlockedError) — the refresh must
+    // survive with snapshot/heuristic fallbacks, but the cause is loud.
+    logger.warn(
+      `capability-probe: connection='${ctx.connectionId}' aborted (${(error as Error)?.constructor?.name ?? 'unknown'}) — falling back to snapshot/heuristics`,
+      error,
+    );
+  }
+}
+
+/**
+ * Elevate-only merge of a live probe result over the inferred baseline
+ * (ArchCom trust-rules): server-true WINS over heuristic-false; a
+ * server-false NEVER silently demotes a heuristic-true — the
+ * disagreement is logged and the heuristic value kept. The runtime user
+ * override (`visionModels`) stays senior to both via resolveVisionSupport.
+ */
+function mergeProbed(
+  model: ModelDefinition,
+  probed: ProbedCapabilities,
+): ModelDefinition {
+  const disagreements: string[] = [];
+  const elevate = (heuristic: boolean, server: boolean, label: string): boolean => {
+    if (server) {
+      return true;
+    }
+    if (heuristic) {
+      disagreements.push(`${label}: heuristic=true server=false — kept heuristic (no silent demotion)`);
+    }
+    return heuristic;
+  };
+  const imageInput = elevate(
+    model.capabilities.imageInput,
+    probed.imageInput,
+    'vision',
+  );
+  const reasoning = elevate(model.reasoning, probed.reasoning, 'thinking');
+  // toolCalling may be numeric (tool-choice cap) — never touch a numeric
+  // value; boolean false elevates to true on server 'tools'.
+  const rawToolCalling = model.capabilities.toolCalling;
+  const toolCalling =
+    typeof rawToolCalling === 'number'
+      ? rawToolCalling
+      : rawToolCalling || probed.toolCalling;
+  if (disagreements.length > 0) {
+    logger.warn(
+      `capability-probe: '${model.apiModel}' disagrees with name heuristics — ${disagreements.join('; ')}`,
+    );
+  }
+  return {
+    ...model,
+    reasoning,
+    capabilities: { ...model.capabilities, imageInput, toolCalling },
+    capabilitySource: 'api-show',
   };
 }
 

@@ -109,6 +109,26 @@ export class ConnectionInterruptedError extends Error {
 }
 
 /**
+ * Shared POST budget exhausted — the per-message cap on total POST
+ * attempts (connect-phase + mid-stream combined, ArchCom 2026-09-14
+ * train A: MAX_POST_BUDGET_PER_MESSAGE=6) ran out before the request
+ * succeeded. Terminal, NOT retried. Carries the class name of the last
+ * underlying error for diagnostics (review P2-1: the budget cap must
+ * not replace the failure story with an untyped English Error).
+ */
+export class PostBudgetExhaustedError extends Error {
+  readonly lastErrorClass: string | undefined;
+
+  constructor(lastErrorClass?: string) {
+    super(
+      `Ollama Cloud: POST budget exhausted (${lastErrorClass ? `last error: ${lastErrorClass}` : 'no further attempts allowed'})`,
+    );
+    this.name = 'PostBudgetExhaustedError';
+    this.lastErrorClass = lastErrorClass;
+  }
+}
+
+/**
  * Upstream idle-timeout kill — the server (or an intermediary proxy)
  * closed the stream after a long period with NO data while the model
  * was thinking. Signature of the known Ollama Cloud issue
@@ -174,7 +194,8 @@ export function isSocketCloseError(error: unknown): boolean {
     error instanceof ConnectionInterruptedError ||
     error instanceof MaxDurationError ||
     error instanceof MidStreamError ||
-    error instanceof UpstreamIdleTimeoutError
+    error instanceof UpstreamIdleTimeoutError ||
+    error instanceof PostBudgetExhaustedError
   ) {
     return false;
   }
@@ -363,6 +384,9 @@ export function defaultRetryOn(error: unknown): boolean {
   if (error instanceof UpstreamIdleTimeoutError) {
     // ArchCom 2026-09-14 — deterministic idle kill: identical retry →
     // identical silence → identical failure. Never auto-retry.
+    return false;
+  }
+  if (error instanceof PostBudgetExhaustedError) {
     return false;
   }
   if (error instanceof MaxDurationError) {

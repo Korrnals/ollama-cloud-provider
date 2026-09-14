@@ -58,6 +58,7 @@ import {
   ZeroByteSocketCloseError,
   ConnectionInterruptedError,
   UpstreamIdleTimeoutError,
+  PostBudgetExhaustedError,
   isSocketCloseError,
 } from './retry.js';
 import {
@@ -239,6 +240,14 @@ export function classifyStreamError(error: unknown): Error {
     // maxRetries=0), surface a clean message naming the failure mode.
     return vscode.LanguageModelError.Blocked(
       `Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов). [ref ${ref}]`,
+    );
+  }
+  if (error instanceof PostBudgetExhaustedError) {
+    // Review P2-1 (2026-09-14) — the shared POST budget ran out before
+    // the request succeeded. Honest localized message naming the cap and
+    // the last error class, instead of a raw English Error.
+    return vscode.LanguageModelError.Blocked(
+      `Ollama Cloud: исчерпан лимит попыток запроса (6 POST на сообщение${error.lastErrorClass ? `, последняя ошибка: ${error.lastErrorClass}` : ''}). Сеть нестабильна — повторите запрос. [ref ${ref}]`,
     );
   }
   if (error instanceof UpstreamIdleTimeoutError) {
@@ -641,7 +650,7 @@ export class OllamaCloudChatProvider
     );
     for (const model of models) {
       logger.info(
-        `model name="${model.name}" id="${model.id}" apiModel="${model.apiModel}" maxInputTokens=${model.maxInputTokens} maxOutputTokens=${model.maxOutputTokens}`,
+        `model name="${model.name}" id="${model.id}" apiModel="${model.apiModel}" maxInputTokens=${model.maxInputTokens} maxOutputTokens=${model.maxOutputTokens} imageInput=${model.capabilities.imageInput} reasoning=${model.reasoning} capabilities=${model.capabilitySource ?? 'snapshot'}`,
       );
     }
     logger.show();
