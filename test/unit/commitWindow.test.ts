@@ -23,9 +23,14 @@
  *   plus: zero-byte close after connect-phase retries → exactly ONE
  *       additional VISIBLE attempt (onNotice), then terminal.
  *
+ * Boundary races (review P3-3, 2026-09-15 stream-stabilization):
+ *   - break racing the window flush at the exact boundary (both
+ *     outcomes legal, dup/loss/quiet-success never);
+ *   - user cancellation landing exactly at the flush moment.
+ *
  * Timings: the window is constructed with tens of milliseconds (the
  * test seam `windowMs` parameter); only the hidden-retry backoff
- * (~1 s ± jitter) is real time.
+ * (exactly 1 s — Math.random pinned) is real time.
  */
 
 import { strict as assert } from 'node:assert';
@@ -36,7 +41,7 @@ import {
   createCommitWindow,
   type CommitWindowedCallbacks,
 } from '../../src/commitWindow.js';
-import { readStream } from '../../src/streamReader.js';
+import { readStream, type StreamLineProcessor } from '../../src/streamReader.js';
 import type { StreamCallbacks, ToolCallEvent } from '../../src/protocolTypes.js';
 import { logger } from '../../src/logger.js';
 import { ConnectionInterruptedError, ZeroByteSocketCloseError } from '../../src/retry.js';
@@ -484,5 +489,323 @@ describe('commitWindow + readStream integration (ArchCom §3.4)', () => {
     assert.equal(recorded.error, undefined, 'a cancel is not an error');
     assert.equal(fetchCalls, 1, 'no second POST after cancellation');
     assert.equal(win.controller.hiddenRetryCount(), 1, 'the hidden retry was scheduled');
+  });
+});
+
+describe('commit-window boundary races (review P3-3)', () => {
+  // The race under test: the window flush timer (armed on the first
+  // delta, fires at windowMs) vs the mid-stream socket break. The
+  // readStream decision `commitWindow.isOpen()` at the moment the CIE
+  // propagates decides silent-retry vs terminal — when the two timers
+  // coincide, EITHER outcome is legal, but three things never are:
+  //   1. duplicated text (a retried attempt re-showing the prefix);
+  //   2. buffer loss on the terminal path (prefix received and billed,
+  //      then silently swallowed);
+  //   3. quiet success on a break (done=true without a COMPLETED retry
+  //      behind it — fetchCalls must be 2 whenever done is true).
+  //
+  // Construction notes (why four tests): in a single process the
+  // "simultaneous" ordering of two same-delay timers is resolved by
+  // ARMING ORDER, not by chance. The tie test arms the break in the
+  // same synchronous block that arms the window (µs-level expiry gap —
+  // the tightest controlled tie the platform allows) and accepts both
+  // outcomes; the two margin tests pin each branch deterministically
+  // (break 15 ms before / 25 ms after the flush); the fourth test puts
+  // a user cancellation exactly on the flush instant.
+  const WINDOW_MS = 60;
+  const TARGET_URL = 'https://ollama.com/v1/test-cw-boundary';
+  const ORIGINAL_RANDOM = Math.random;
+
+  beforeEach(() => {
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      requestMaxDurationMin: 60,
+      maxRetries: 0, // one POST per readStreamOnce round
+    });
+    // Pin the hidden-retry jitter factor to exactly 1.0
+    // (0.75 + 0.5 * 0.5) → the backoff is exactly 1000 ms.
+    Math.random = () => 0.5;
+  });
+  afterEach(() => {
+    globalThis.fetch = ORIGINAL_FETCH;
+    Math.random = ORIGINAL_RANDOM;
+  });
+
+  /**
+   * Installs the boundary-scenario fetch mock: attempt 1 enqueues two
+   * deltas (the buffered prefix) and breaks the socket after
+   * `breakAfterMs` (or whenever `breakNow` is called when
+   * `breakAfterMs` is omitted); attempt 2 — reached only via a hidden
+   * retry — completes with `retryDelta` + [DONE]. URL-tagged: foreign
+   * callers get a non-retriable 400 and never move the counter.
+   */
+  function installBoundaryMock(
+    breakAfterMs: number | undefined,
+    retryDelta: string,
+  ): { fetchCalls: () => number; breakNow: () => void } {
+    let calls = 0;
+    let attempt1Controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      calls += 1;
+      if (calls === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            attempt1Controller = controller;
+            controller.enqueue(encode('data: {"delta":"prefix-1"}\n\n'));
+            controller.enqueue(encode('data: {"delta":"prefix-2"}\n\n'));
+            if (breakAfterMs !== undefined) {
+              setTimeout(() => controller.error(socketCloseError()), breakAfterMs);
+            }
+          },
+        });
+        return new Response(body, { status: 200 });
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode(`data: {"delta":"${retryDelta}"}\n\n`));
+          controller.enqueue(encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+    return {
+      fetchCalls: () => calls,
+      breakNow: () => attempt1Controller?.error(socketCloseError()),
+    };
+  }
+
+  /**
+   * sseProcessLine variant with an `onFirstDelta` hook: invoked in the
+   * SAME synchronous block, immediately AFTER the first delta reached
+   * the wrapped callbacks (i.e. after the window timer was armed).
+   */
+  function boundaryProcessLine(
+    callbacks: StreamCallbacks,
+    onFirstDelta?: () => void,
+  ): StreamLineProcessor {
+    let firstDeltaSeen = false;
+    return (line, ctx) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        return false;
+      }
+      ctx.markParsed();
+      const payload = trimmed.slice('data:'.length).trim();
+      if (payload === '[DONE]') {
+        callbacks.onDone();
+        return true;
+      }
+      try {
+        const parsed = JSON.parse(payload) as { delta?: string };
+        if (parsed.delta) {
+          callbacks.onText(parsed.delta);
+          if (!firstDeltaSeen) {
+            firstDeltaSeen = true;
+            onFirstDelta?.();
+          }
+        }
+      } catch {
+        // ignore non-JSON
+      }
+      return false;
+    };
+  }
+
+  it('break 15ms before the flush → silent retry, prefix never shown (pinned branch)', async function () {
+    this.timeout(10000); // exact 1000ms hidden-retry backoff + stream time
+    const mock = installBoundaryMock(WINDOW_MS - 15, 'retry-full');
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'cw-boundary-before',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        processLine: boundaryProcessLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(mock.fetchCalls(), 2, 'exactly one hidden retry');
+    assert.deepStrictEqual(
+      recorded.events,
+      ['text:retry-full'],
+      'prefix discarded on the hidden retry, retry text shown exactly once',
+    );
+    assert.equal(recorded.done, true, 'the retry attempt completed the stream');
+    assert.equal(recorded.error, undefined);
+    assert.equal(recorded.notices.length, 0, 'no visible notice');
+    assert.equal(win.controller.hiddenRetryCount(), 1);
+  });
+
+  it('break 25ms after the flush → terminal CIE, prefix shown exactly once (pinned branch)', async function () {
+    this.timeout(5000);
+    const mock = installBoundaryMock(WINDOW_MS + 25, 'retry-full');
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await assert.rejects(
+      readStream(
+        {
+          logTag: 'cw-boundary-after',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          processLine: boundaryProcessLine(wrapped),
+        },
+        wrapped,
+      ),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ConnectionInterruptedError,
+          `terminal CIE expected, got ${(error as Error)?.constructor?.name}`,
+        );
+        return true;
+      },
+    );
+
+    assert.equal(mock.fetchCalls(), 1, 'NO retry after the window closed');
+    assert.deepStrictEqual(
+      recorded.events,
+      ['text:prefix-1', 'text:prefix-2'],
+      'flushed prefix delivered exactly once, in order — no buffer loss',
+    );
+    assert.equal(recorded.done, false, 'no quiet success on a terminal break');
+    assert.equal(recorded.notices.length, 0);
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+  });
+
+  it('break SIMULTANEOUS with the flush → either outcome, never dup/loss/quiet-success', async function () {
+    this.timeout(10000);
+    // The break is armed inside the SAME synchronous block that armed
+    // the window timer (immediately after the first delta), with the
+    // SAME delay — the expiry gap is sub-millisecond, so which timer
+    // wins is a platform implementation detail. Both outcomes are
+    // legal; the three forbidden outcomes are asserted unconditionally.
+    const mock = installBoundaryMock(undefined, 'retry-full');
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    let outcome: 'retried' | 'terminal';
+    try {
+      await readStream(
+        {
+          logTag: 'cw-boundary-tie',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          processLine: boundaryProcessLine(wrapped, () => {
+            // Same tick as the window arming, same delay → the tie.
+            setTimeout(() => mock.breakNow(), WINDOW_MS);
+          }),
+        },
+        wrapped,
+      );
+      if (!recorded.done) {
+        assert.fail(
+          `resolved without done (error=${String(recorded.error?.constructor?.name)})`,
+        );
+      }
+      outcome = 'retried';
+    } catch (error) {
+      assert.ok(
+        error instanceof ConnectionInterruptedError,
+        `terminal CIE expected on the closed-window branch, got ${(error as Error)?.constructor?.name}`,
+      );
+      outcome = 'terminal';
+    }
+
+    if (outcome === 'retried') {
+      assert.equal(mock.fetchCalls(), 2, 'the retry issued exactly one more POST');
+      assert.deepStrictEqual(
+        recorded.events,
+        ['text:retry-full'],
+        'discarded prefix never shown, retry text exactly once',
+      );
+      assert.equal(win.controller.hiddenRetryCount(), 1);
+      assert.equal(recorded.error, undefined);
+    } else {
+      assert.equal(mock.fetchCalls(), 1, 'terminal branch issues no retry');
+      assert.deepStrictEqual(
+        recorded.events,
+        ['text:prefix-1', 'text:prefix-2'],
+        'flushed prefix shown exactly once',
+      );
+      assert.equal(recorded.done, false);
+      assert.equal(win.controller.hiddenRetryCount(), 0);
+    }
+
+    // Cross-outcome invariants (review P3-3) — must hold in BOTH branches.
+    assert.equal(
+      new Set(recorded.events).size,
+      recorded.events.length,
+      'no duplicated text in any outcome',
+    );
+    const mixed =
+      recorded.events.some((e) => e.includes('prefix')) &&
+      recorded.events.some((e) => e.includes('retry-full'));
+    assert.equal(mixed, false, 'never a mixed prefix+retry stream (double flush)');
+    if (recorded.done) {
+      assert.equal(
+        mock.fetchCalls(),
+        2,
+        'quiet success forbidden: done requires the completed retry behind it',
+      );
+    }
+  });
+
+  it('user cancel exactly at the flush moment → no retry, no dup, prefix intact', async function () {
+    this.timeout(5000);
+    // Cancel is armed at WINDOW_MS — the same instant the flush fires;
+    // the break lands 25 ms later (after the flush). `cancelled` forces
+    // the CIE terminal even though the window state alone might have
+    // allowed a retry: a cancelled request must never issue another
+    // POST, must not duplicate the prefix, and must not report a quiet
+    // success.
+    const mock = installBoundaryMock(WINDOW_MS + 25, 'retry-full');
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+    const source = new vscode.CancellationTokenSource();
+    setTimeout(() => source.cancel(), WINDOW_MS);
+
+    await assert.rejects(
+      readStream(
+        {
+          logTag: 'cw-boundary-cancel',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          cancellationToken: source.token,
+          processLine: boundaryProcessLine(wrapped),
+        },
+        wrapped,
+      ),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ConnectionInterruptedError,
+          `CIE expected (cancel forces terminal), got ${(error as Error)?.constructor?.name}`,
+        );
+        return true;
+      },
+    );
+
+    assert.equal(mock.fetchCalls(), 1, 'NO POST after cancellation');
+    assert.deepStrictEqual(
+      recorded.events,
+      ['text:prefix-1', 'text:prefix-2'],
+      'prefix flushed exactly once — no loss, no duplication',
+    );
+    assert.equal(recorded.done, false, 'a cancelled break is not a quiet success');
+    assert.equal(recorded.notices.length, 0);
+    assert.equal(win.controller.hiddenRetryCount(), 0, 'no hidden retry after cancel');
   });
 });
