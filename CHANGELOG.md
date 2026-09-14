@@ -12,6 +12,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 - **M4 — louder SSRF probe aborts**: an `SsrfBlockedError` during capability probing now logs at error level (security-relevant block); other probe aborts keep the operational warn.
 - **P3-2-DI — injectable SSRF guard factory**: `ModelCatalog` takes an optional `ssrfGuardFactory` (default `createProductionSsrfGuard`); unit tests inject a permissive fake and no longer resolve real DNS.
 
+### Fixed (commit-window review remediation — fix-then-ship)
+- **Hidden retry no longer corrupts tool calls (P1-1)** — the compat parser's `pendingToolCalls` accumulation lived once per message, so a silent in-window retry concatenated the discarded attempt's partial tool-call arguments onto the retry's (`{"ci` + `{"city":"Paris"}` → invalid JSON → empty input `{}`). Every attempt now starts with clean protocol state (`onAttemptStart` hook: `pendingToolCalls.clear()` in `ollamaClient`, `pendingEvent = null` in `responsesClient`). "No duplicates by construction" now covers protocol structures, not only visible text.
+- **Vision pass-through regained the silent early-break retry (P2-1)** — the vision fallback streams used bare callbacks, losing the commit-window boundary (a mid-stream break became terminal on the first attempt, in silence). Both pass-through runners now wrap their callbacks in a commit window exactly like the primary path, and the zero-byte extra-attempt notice is surfaced inline.
+- **Cancellation interrupts the hidden-retry backoff (P2-2)** — a cancelled request used to stay pending for the full backoff delay (up to 10 s) before the next attempt noticed the token; cancellation now resolves the backoff immediately with a quiet completion (`onDone`), without another POST.
+- **Thrown terminal stream errors are logged (P3-1)** — a terminal `ConnectionInterruptedError` (thrown after the window closed) bypassed the `Stream error` diagnostics line entirely; it now leaves exactly one line (class + ref + `commitWindowHiddenRetries`), duplicate-guarded against the `onError` path.
+
 ### Commit-window — silent early-break healing, 50-chunk threshold abolished (ArchCom 2026-09-14 §3.4)
 
 ArchCom decision `f8ecfff4`.
