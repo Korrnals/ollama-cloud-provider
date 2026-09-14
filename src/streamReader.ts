@@ -333,7 +333,12 @@ export async function readStream(
   const budget = { remaining: MAX_POST_BUDGET_PER_MESSAGE };
   const commitWindow = getAttachedCommitWindow(callbacks);
   let zeroByteExtraAttemptUsed = false;
-  let hiddenRetryCount = 0;
+  // P3-4a (2026-09-15 review) — the hidden-retry counter has ONE owner:
+  // the commit-window controller (`onHiddenRetry()` increments,
+  // `hiddenRetryCount()` reads). No local mirror — the retry ordinal for
+  // the backoff schedule is read from the controller right after the
+  // increment, so diagnostics (provider `commitWindowHiddenRetries=`,
+  // the warn lines here) and the schedule can never diverge.
   // Each attempt consumes ≥1 budget unit, so the loop is finite.
   for (;;) {
     // Review fix P1-1 — reset client-owned protocol state (pending
@@ -357,15 +362,18 @@ export async function readStream(
         // a visibility owner there is no silent-retry boundary.
         const windowOpen = commitWindow !== undefined && commitWindow.isOpen();
         logger.warn(
-          `Mid-stream retry eval: chunks=${attemptState.chunksReceived} windowOpen=${windowOpen} hiddenRetry=${hiddenRetryCount} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${error.constructor.name}`,
+          `Mid-stream retry eval: chunks=${attemptState.chunksReceived} windowOpen=${windowOpen} hiddenRetry=${commitWindow?.hiddenRetryCount() ?? 0} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${error.constructor.name}`,
         );
         if (!windowOpen || cancelled || budget.remaining <= 0) {
           throw error;
         }
-        hiddenRetryCount += 1;
         // Reset the buffer BEFORE the retry so the discarded attempt's
-        // deltas can never leak into the user-visible stream.
+        // deltas can never leak into the user-visible stream. The same
+        // call increments the controller-owned hidden-retry counter
+        // (P3-4a single source of truth) — read it back for the retry
+        // ordinal driving the backoff schedule below.
         commitWindow.onHiddenRetry();
+        const retryOrdinal = commitWindow.hiddenRetryCount();
         // Exponential backoff: 1s, 2s, 4s... capped, with ±25% jitter
         // (ArchCom 2026-09-14, Security condition): a systemic cloud
         // incident would otherwise synchronize retries across requests.
@@ -373,13 +381,13 @@ export async function readStream(
         const delay = Math.round(
           Math.min(
             COMMIT_WINDOW_RETRY_BASE_DELAY_MS *
-              Math.pow(2, hiddenRetryCount - 1) *
+              Math.pow(2, retryOrdinal - 1) *
               jitter,
             COMMIT_WINDOW_RETRY_MAX_DELAY_MS,
           ),
         );
         logger.warn(
-          `Commit-window hidden retry ${hiddenRetryCount}: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks inside the window — buffer reset, user sees nothing. Retrying in ${delay}ms.`,
+          `Commit-window hidden retry ${retryOrdinal}: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks inside the window — buffer reset, user sees nothing. Retrying in ${delay}ms.`,
         );
         // Review fix P2-2 — the backoff is interruptible: race the
         // delay against caller cancellation (same pattern as the
@@ -394,8 +402,13 @@ export async function readStream(
           options.cancellationToken,
         );
         if (!slept) {
+          // P3-4b — the controller counter (incremented by
+          // onHiddenRetry above) counts SCHEDULED retries. Cancellation
+          // killed this one BEFORE its POST was issued (no budget
+          // burned); the log states that explicitly so the
+          // diagnostics number is never misread as "POSTs issued".
           logger.warn(
-            'Commit-window hidden retry backoff interrupted by caller cancellation — completing quietly (onDone).',
+            `Commit-window hidden retry ${commitWindow.hiddenRetryCount()} was scheduled but cancelled before the POST was issued (no budget burned) — completing quietly (onDone).`,
           );
           callbacks.onDone();
           return;
