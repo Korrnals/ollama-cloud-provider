@@ -263,6 +263,19 @@ export interface StreamReaderOptions {
    * about the protocol.
    */
   onAttemptStart?: () => void;
+  /**
+   * TEST SEAM (2026-09-15, stream-stabilization review) — base delay
+   * for the CONNECT-phase `withRetry` backoff inside each attempt.
+   * Production callers NEVER set it: `withRetry`'s own default
+   * (1000 ms) applies. Unit tests inject 0 so a full 6-attempt
+   * budget-exhaustion scenario runs in ~1.3 s of wall-clock instead
+   * of ~31 s of REAL exponential sleeps — removing the 60 s mocha
+   * timeout margin that made the budget test flake on loaded CI
+   * runners (review finding: budgetAndNotice flake audit).
+   * The retry LOGIC (attempt count, budget accounting, error
+   * classes) is unchanged; only the inter-attempt waiting shrinks.
+   */
+  connectRetryBaseDelayMs?: number;
 }
 
 /**
@@ -733,7 +746,16 @@ async function readStreamOnce(
           }
         }
       },
-      { retryOn },
+      // Test seam (see StreamReaderOptions.connectRetryBaseDelayMs):
+      // forwarded only when the caller set it, so the production
+      // default (withRetry's own 1000 ms) stays the single source of
+      // truth for the backoff schedule.
+      {
+        retryOn,
+        ...(options.connectRetryBaseDelayMs !== undefined && {
+          baseDelayMs: options.connectRetryBaseDelayMs,
+        }),
+      },
     );
 
     // Fix 6 — withRetry now returns the response PLUS the first chunk

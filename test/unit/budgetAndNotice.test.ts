@@ -13,6 +13,15 @@
  *      gone by design: a break after the window is terminal (see
  *      commitWindow.test.ts), so there is no post-shown retry left to
  *      announce.
+ *
+ * Flake audit (2026-09-15, stream-stabilization): the caps test
+ * previously ran ~31 s of real withRetry backoff inside a 60 s mocha
+ * timeout and used an untagged global fetch mock. Both timing pressure
+ * and cross-test fetch-mock pollution were removed: the
+ * `connectRetryBaseDelayMs` test seam (src/streamReader.ts) shrinks
+ * the schedule to a deterministic ~1.25 s, and every mock in this file
+ * counts only its own URL (foreign callers get a non-retriable 400).
+ * The strict fetchCalls === MAX_POST_BUDGET_PER_MESSAGE assert is kept.
  */
 
 import { strict as assert } from 'node:assert';
@@ -55,16 +64,35 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
     // also caps at 6 — whichever binds first, the invariant is: EXACTLY
     // MAX_POST_BUDGET_PER_MESSAGE POSTs, then a terminal (non-retried)
     // error — ZeroByteSocketCloseError when maxRetries binds, or the
-    // typed PostBudgetExhaustedError when the budget binds. withRetry's
-    // exponential sleeps between 6 attempts (~31s) need headroom.
-    this.timeout(60000);
+    // typed PostBudgetExhaustedError when the budget binds.
+    //
+    // Flake audit (2026-09-15, stream-stabilization): this test used to
+    // burn ~31 s of REAL withRetry sleeps (1+2+4+8+16 s plus 0..500 ms
+    // jitter per gap) inside a 60 s mocha timeout, and its untagged
+    // global fetch mock counted EVERY fetch issued in the process — so
+    // an orphaned retry loop leaked by an earlier test could land one
+    // extra call on the mock and break the strict === 6 assert. Both
+    // nondeterminism sources are removed here:
+    //   1. connectRetryBaseDelayMs=0 (test seam) + pinned Math.random
+    //      make the five backoff gaps EXACTLY 250 ms each (~1.25 s
+    //      total, deterministic; the 15 s timeout is 12x headroom).
+    //   2. the mock counts only OUR url; a foreign caller gets a
+    //      non-retriable 400 so any leaked loop dies fast instead of
+    //      feeding this counter.
+    this.timeout(15000);
+    const TARGET_URL = 'https://ollama.com/v1/test-budget-caps';
     let fetchCalls = 0;
     // Every attempt fails with a retryable connect-phase socket error
     // (reclassified to ZeroByteSocketCloseError inside the probe, which
     // defaultRetryOn retries). withRetry (maxRetries=5) would happily
     // issue 6 attempts; the budget must cut it at exactly 6 and fail
     // with PostBudgetExhaustedError.
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        // Foreign caller (a retry loop leaked from another test):
+        // non-retriable status, do not touch our counter.
+        return new Response('busy', { status: 400 });
+      }
       fetchCalls += 1;
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
@@ -87,36 +115,55 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
       },
     };
 
-    await readStream(
-      {
-        logTag: 'budget-test',
-        url: 'https://ollama.com/v1/test',
-        headers: {},
-        body: '{}',
-        processLine: () => false,
-      },
-      callbacks,
-    );
+    // Pin the jitter: computeDelay = baseDelayMs * 2^attempt +
+    // Math.random() * 500 → with base 0 and random()=0.5 every gap is
+    // exactly 250 ms. Restored in finally so a failing assert cannot
+    // leak the stub into later tests.
+    const originalRandom = Math.random;
+    Math.random = () => 0.5;
+    try {
+      await readStream(
+        {
+          logTag: 'budget-test',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          processLine: () => false,
+          connectRetryBaseDelayMs: 0,
+        },
+        callbacks,
+      );
 
-    assert.equal(done, false, 'no success path');
-    const errorName = (captured as Error)?.name;
-    const isTerminal =
-      captured instanceof PostBudgetExhaustedError ||
-      errorName === 'ZeroByteSocketCloseError';
-    assert.ok(
-      isTerminal,
-      `expected a terminal error, got ${(captured as Error)?.constructor?.name}`,
-    );
-    assert.equal(fetchCalls, MAX_POST_BUDGET_PER_MESSAGE, 'budget is the binding cap');
+      assert.equal(done, false, 'no success path');
+      const errorName = (captured as Error)?.name;
+      const isTerminal =
+        captured instanceof PostBudgetExhaustedError ||
+        errorName === 'ZeroByteSocketCloseError';
+      assert.ok(
+        isTerminal,
+        `expected a terminal error, got ${(captured as Error)?.constructor?.name}`,
+      );
+      // STRICT invariant preserved: exactly MAX_POST_BUDGET_PER_MESSAGE
+      // POSTs — no more (budget), no fewer (every attempt retried).
+      assert.equal(fetchCalls, MAX_POST_BUDGET_PER_MESSAGE, 'budget is the binding cap');
+    } finally {
+      Math.random = originalRandom;
+    }
   });
 
   it('retries an early break SILENTLY inside the commit window (no notice, no duplicate)', async function () {
-    this.timeout(10000); // one hidden-retry backoff (~1s ± jitter) + stream time
+    this.timeout(10000); // one hidden-retry backoff (exactly 1000ms pinned) + stream time
+    // URL-tagged mock (same hardening as the caps test above): only OUR
+    // url moves the counter; foreign callers get a non-retriable 400.
+    const TARGET_URL = 'https://ollama.com/v1/test-silent-retry';
     let fetchCalls = 0;
     const notices: string[] = [];
     const texts: string[] = [];
 
-    globalThis.fetch = (async () => {
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
       fetchCalls += 1;
       if (fetchCalls === 1) {
         // Attempt 1: one data chunk arrives (buffered by the window,
@@ -161,38 +208,46 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
     const win = createCommitWindow(60);
     const callbacks = win.wrap(base);
 
-    await readStream(
-      {
-        logTag: 'silent-retry-test',
-        url: 'https://ollama.com/v1/test',
-        headers: {},
-        body: '{}',
-        processLine: (line, ctx) => {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) {
-            return false;
-          }
-          // Module contract: the callback marks meaningful chunks so the
-          // clean-end path can distinguish data from a captive portal.
-          ctx.markParsed();
-          const payload = trimmed.slice('data:'.length).trim();
-          if (payload === '[DONE]') {
-            callbacks.onDone();
-            return true;
-          }
-          try {
-            const parsed = JSON.parse(payload) as { delta?: string };
-            if (parsed.delta) {
-              callbacks.onText(parsed.delta);
+    // Pin the hidden-retry jitter factor to exactly 1.0 (0.75 + 0.5*0.5):
+    // the backoff is exactly 1000ms instead of 750..1250ms.
+    const originalRandom = Math.random;
+    Math.random = () => 0.5;
+    try {
+      await readStream(
+        {
+          logTag: 'silent-retry-test',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          processLine: (line, ctx) => {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('data:')) {
+              return false;
             }
-          } catch {
-            // ignore non-JSON
-          }
-          return false;
+            // Module contract: the callback marks meaningful chunks so the
+            // clean-end path can distinguish data from a captive portal.
+            ctx.markParsed();
+            const payload = trimmed.slice('data:'.length).trim();
+            if (payload === '[DONE]') {
+              callbacks.onDone();
+              return true;
+            }
+            try {
+              const parsed = JSON.parse(payload) as { delta?: string };
+              if (parsed.delta) {
+                callbacks.onText(parsed.delta);
+              }
+            } catch {
+              // ignore non-JSON
+            }
+            return false;
+          },
         },
-      },
-      callbacks,
-    );
+        callbacks,
+      );
+    } finally {
+      Math.random = originalRandom;
+    }
 
     assert.equal(fetchCalls, 2, 'exactly one hidden retry');
     assert.equal(doneFlag, true, 'second attempt completed the stream');
