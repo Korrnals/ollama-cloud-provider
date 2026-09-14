@@ -243,3 +243,91 @@ describe('capabilityProbe.probeCapabilities — batch semantics', () => {
     assert.ok(maxInFlight <= 4, `maxInFlight=${maxInFlight} must be ≤ 4`);
   });
 });
+
+describe('capabilityProbe — catalog integration auth (Security gate B1 regression)', () => {
+  const ORIGINAL_FETCH = globalThis.fetch;
+
+  beforeEach(() => {
+    clearCapabilityProbeCache();
+  });
+  afterEach(() => {
+    globalThis.fetch = ORIGINAL_FETCH;
+  });
+
+  function conn(overrides: Record<string, unknown>): import('../../src/connections.js').ConnectionConfig {
+    return {
+      id: 'x',
+      label: 'X',
+      type: 'custom',
+      enabled: true,
+      baseUrl: 'https://x.example.com/v1',
+      openaiCompatiblePath: '',
+      allowedBaseUrls: ['https://x.example.com/v1'],
+      visionModels: [],
+      requiresApiKey: false,
+      preferredEndpoint: 'auto',
+      contextFilter: 'auto',
+      ...overrides,
+    } as import('../../src/connections.js').ConnectionConfig;
+  }
+
+  it('cloud probes stay keyless even though cloud requiresApiKey=true; keyed remotes send the key', async () => {
+    const showCalls: Array<{ url: string; authorization: string | undefined; model: string }> = [];
+    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/api/show')) {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        showCalls.push({ url, authorization: headers.Authorization, model: body.model });
+        return jsonResponse({ capabilities: ['completion', 'vision'] });
+      }
+      // Catalog lists per connection host.
+      if (url.startsWith('https://ollama.com/')) {
+        return jsonResponse({ data: [{ id: 'brand-new-cloud-model' }] });
+      }
+      if (url.startsWith('https://example.com/')) {
+        return jsonResponse({ data: [{ id: 'brand-new-vps-model' }] });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    }) as typeof fetch;
+
+    const auth = {
+      getApiKey: async () => 'sk-cloud-key',
+      // IMPORTANT: returns a key for cloud too — the catalog must NOT
+      // use it for cloud probes (gate on type, not on the flag).
+      getApiKeyForConnection: async (c: { id: string }) =>
+        c.id === 'cloud' ? 'sk-cloud-key' : 'sk-vps-key',
+      getBaseUrl: () => 'https://ollama.com/v1',
+      getRootUrl: () => 'https://ollama.com',
+    };
+    const { ModelCatalog } = await import('../../src/modelCatalog.js');
+    const catalog = new ModelCatalog(auth as never);
+
+    await catalog.refreshForConnections([
+      conn({
+        id: 'cloud',
+        type: 'cloud',
+        label: 'Cloud',
+        baseUrl: 'https://ollama.com/v1',
+        allowedBaseUrls: ['https://ollama.com/v1'],
+        requiresApiKey: true,
+      }),
+      conn({
+        id: 'vps',
+        type: 'remote',
+        label: 'VPS',
+        baseUrl: 'https://example.com/v1',
+        allowedBaseUrls: ['https://example.com/v1'],
+        requiresApiKey: true,
+      }),
+    ]);
+
+    const cloudProbe = showCalls.find((c) => c.url.startsWith('https://ollama.com/'));
+    const vpsProbe = showCalls.find((c) => c.url.startsWith('https://example.com/'));
+    assert.ok(cloudProbe, 'cloud model was probed');
+    assert.ok(vpsProbe, 'vps model was probed');
+    assert.equal(cloudProbe.authorization, undefined, 'cloud probe must be keyless (gate B1)');
+    assert.equal(cloudProbe.model, 'brand-new-cloud-model');
+    assert.equal(vpsProbe.authorization, 'Bearer sk-vps-key', 'keyed remote sends its key');
+  });
+});

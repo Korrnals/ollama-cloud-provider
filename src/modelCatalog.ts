@@ -596,13 +596,20 @@ export class ModelCatalog {
         }
 
         // ArchCom 2026-09-14 (train B) — probe capabilities for models
-        // the snapshot does not know, on THIS connection's own /api/show
-        // (per-connection auth: key only when requiresApiKey — local
-        // keyless Ollama stays keyless).
+        // the snapshot does not know, on THIS connection's own /api/show.
+        // Security gate B1 (fix 2026-09-14): the cloud connection has
+        // `requiresApiKey: true` ALWAYS (synthesizeCloudConnection /
+        // connection parsing), but its /api/show is PUBLIC — gating on
+        // the flag alone leaked the cloud key onto the public endpoint.
+        // Gate on connection TYPE: cloud probes are keyless; self-hosted
+        // connections send the key only when they require one.
         if (connectionModels.some((m) => !KNOWN_MODEL_MAP.has(m.apiModel))) {
-          const apiKey = connection.requiresApiKey
-            ? await this.authManager.getApiKeyForConnection(connection)
-            : undefined;
+          const apiKey =
+            connection.type === 'cloud'
+              ? undefined
+              : connection.requiresApiKey
+                ? await this.authManager.getApiKeyForConnection(connection)
+                : undefined;
           await applyCapabilityProbing(
             connectionModels,
             {
