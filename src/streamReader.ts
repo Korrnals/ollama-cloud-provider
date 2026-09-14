@@ -248,6 +248,21 @@ export interface StreamReaderOptions {
    * path); production clients wire `createProductionSsrfGuard()`.
    */
   ssrfGuard?: { assertUrlAllowed(url: string): Promise<void> };
+  /**
+   * Review fix P1-1 (commit-window remediation) — per-attempt protocol
+   * state reset. Called at the START of EVERY `readStream` attempt
+   * (the first one included, where resetting empty state is a no-op).
+   * The clients' line parsers accumulate protocol state in the
+   * `streamChat` / `streamResponses` closure (`pendingToolCalls`,
+   * `pendingEvent`) — state that lives ONCE for the whole message.
+   * Without this hook a hidden commit-window retry would concatenate
+   * the discarded attempt's partial tool-call arguments onto the
+   * retry's arguments (`arguments +=`), producing corrupted JSON that
+   * `safeJsonParse` silently downgrades to `{}`. The hook lets each
+   * client reset its own state without the reader knowing anything
+   * about the protocol.
+   */
+  onAttemptStart?: () => void;
 }
 
 /**
@@ -304,6 +319,11 @@ export async function readStream(
   let hiddenRetryCount = 0;
   // Each attempt consumes ≥1 budget unit, so the loop is finite.
   for (;;) {
+    // Review fix P1-1 — reset client-owned protocol state (pending
+    // tool-call fragments, pending SSE event) before EVERY attempt so
+    // a hidden retry never concatenates the discarded attempt's
+    // partial protocol data onto the fresh one.
+    options.onAttemptStart?.();
     // Track chunks received THIS attempt — readStreamOnce updates
     // a local copy; we read it via a shared object.
     const attemptState = { chunksReceived: 0 };
