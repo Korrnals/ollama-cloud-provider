@@ -236,6 +236,28 @@ describe('capabilityProbe.probeCapabilities — batch semantics', () => {
     assert.ok(result.has('model-b') && result.has('model-c') && result.has('model-d'));
   });
 
+  it('benches the connection after a 429 — the next batch does not fetch (M2)', async () => {
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return jsonResponse({ error: 'rate limited' }, 429, { 'Retry-After': '600' });
+    }) as typeof fetch;
+
+    const ctx: ProbeContext = { connectionId: 'test-429', rootUrl: 'https://ollama.com' };
+    const first = await probeCapabilities(['model-x'], ctx);
+    assert.equal(first.size, 0);
+    assert.equal(fetchCount, 1, 'first batch probed once');
+
+    // Same connection while benched: skipped entirely — no fetch.
+    const second = await probeCapabilities(['model-y', 'model-z'], ctx);
+    assert.equal(second.size, 0);
+    assert.equal(fetchCount, 1, 'benched connection must not fetch again');
+
+    // The bench is per-connection: a different connectionId still probes.
+    await probeCapabilities(['model-w'], { ...ctx, connectionId: 'test-429-other' });
+    assert.equal(fetchCount, 2, 'other connections are not benched');
+  });
+
   it('serves the second batch from cache (no re-probe)', async () => {
     let fetchCount = 0;
     globalThis.fetch = (async () => {

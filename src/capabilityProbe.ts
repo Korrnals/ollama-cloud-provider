@@ -87,9 +87,39 @@ const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
  */
 const cache = new Map<string, { caps: ProbedCapabilities; expiresAt: number }>();
 
+/**
+ * M2 (gate M-package) — per-connection 429 backoff. When a probe batch
+ * hits 429, the connection is benched: `probeCapabilities` skips whole
+ * batches for that connectionId (empty result + warn) until
+ * `notBeforeMs` passes. Without this, every catalog refresh kept
+ * re-hammering a rate-limited endpoint batch after batch.
+ */
+const rateLimitUntil = new Map<string, number>();
+const RETRY_AFTER_DEFAULT_MS = 60_000;
+
+/**
+ * Parses the `Retry-After` response header (delta-seconds form) into a
+ * backoff duration in ms. Anything missing, unparsable or non-positive
+ * falls back to the 60 s default (per gate M-package spec).
+ */
+function parseRetryAfterMs(header: string | null): number {
+  const seconds = header === null ? NaN : Number(header);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return RETRY_AFTER_DEFAULT_MS;
+  }
+  return seconds * 1000;
+}
+
+function benchConnection(ctx: ProbeContext, retryAfterHeader: string | null): void {
+  rateLimitUntil.set(ctx.connectionId, Date.now() + parseRetryAfterMs(retryAfterHeader));
+}
+
 /** Test/config-change hook — mirrors clearCapabilityCache semantics. */
 export function clearCapabilityProbeCache(): void {
   cache.clear();
+  // M2 (gate M-package) — also lifts every per-connection 429 bench, so
+  // tests (and a config change) start from a clean probing posture.
+  rateLimitUntil.clear();
 }
 
 function cacheKey(ctx: ProbeContext, apiModel: string): string {
@@ -148,6 +178,10 @@ export async function probeModelShow(
     });
 
     if (res.status === 429) {
+      // M2 (gate M-package) — bench THIS connection for the next batches
+      // (Retry-After seconds, 60 s default), so the next refresh skips
+      // the endpoint entirely instead of re-hammering it.
+      benchConnection(ctx, res.headers.get('retry-after'));
       return { apiModel, source: 'rate-limited' };
     }
     if (!res.ok) {
@@ -213,7 +247,9 @@ export async function probeModelShow(
  * Probes a batch of unknown models: cache-first, concurrency ≤ 4, and a
  * hard batch-cancel on the first 429 (Security condition — a rate-limited
  * catalog refresh must not hammer the endpoint with the rest of the
- * batch; already-collected results are kept).
+ * batch; already-collected results are kept). M2 (gate M-package): the
+ * 429 also benches the connection (Retry-After, 60 s default) — batches
+ * arriving while benched are skipped entirely (empty result + warn).
  *
  * Returns the map of successfully probed capabilities only (failures are
  * absent — the caller falls back to snapshot/heuristics for those ids).
@@ -225,6 +261,20 @@ export async function probeCapabilities(
   const result = new Map<string, ProbedCapabilities>();
   if (apiModels.length === 0) {
     return result;
+  }
+
+  // M2 (gate M-package) — 429 backoff: while the connection is benched,
+  // skip the whole batch (empty result — the caller falls back to
+  // snapshot/heuristics) instead of re-hammering the endpoint.
+  const notBefore = rateLimitUntil.get(ctx.connectionId);
+  if (notBefore !== undefined) {
+    if (Date.now() < notBefore) {
+      logger.warn(
+        `capability-probe: connection '${ctx.connectionId}' rate-limited until ${new Date(notBefore).toISOString()} — batch skipped (${apiModels.length} models), falling back to snapshot/heuristics`,
+      );
+      return result;
+    }
+    rateLimitUntil.delete(ctx.connectionId);
   }
 
   // Cache pass first — warm refreshes typically re-probe nothing.
