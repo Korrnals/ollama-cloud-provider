@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { createHash } from 'node:crypto';
 import { AuthManager } from './auth.js';
+import { createCommitWindow } from './commitWindow.js';
 import {
   countOpenAIRequestChars,
   convertMessagesToOpenAI,
@@ -262,11 +263,15 @@ export function classifyStreamError(error: unknown): Error {
     );
   }
   if (error instanceof ConnectionInterruptedError) {
-    // ADR 0008 Phase 2 level-4 — mid-stream socket close. Terminal
-    // (tokens already billed). Surface a clean message instead of the
-    // raw `aborted at TLSSocket.socketCloseListener` stack trace.
+    // ADR 0008 Phase 2 level-4 — mid-stream socket close. ArchCom
+    // 2026-09-14 §3.4: with the commit-window shipped, a CIE that
+    // reaches the user is TERMINAL by construction — early breaks are
+    // retried silently inside the window, so this fired after the
+    // window closed (output was shown). The honest message says the
+    // shown fragment may be incomplete and names the manual retry —
+    // auto-retry here would duplicate already-visible text.
     return vscode.LanguageModelError.Blocked(
-      `Ollama Cloud: соединение прервано в середине ответа. Сервер закрыл сокет после начала стрима — частичный ответ утерян. [ref ${ref}]`,
+      `Ollama Cloud: соединение прервано в середине ответа — показанный фрагмент может быть неполным. Автоповтор после начала показа отключён (повтор привёл бы к дублированию текста); повторите запрос. [ref ${ref}]`,
     );
   }
   if (error instanceof HttpError) {
@@ -1952,13 +1957,27 @@ ${errorLines}
     let firstChunkAt: number | undefined;
     let chunkCount = 0;
     const modelLabel = model.apiModel ?? model.id;
+    // ArchCom 2026-09-14 §3.4 — commit-window. The first ~5 s of deltas
+    // are buffered before they reach `progress` (window measured from
+    // the FIRST delta, so slow-TTFT thinking adds no invisible time).
+    // A break inside the window is retried silently by the stream
+    // reader (buffer reset — no duplicate prefix, no flicker); after
+    // the flush the stream is final (terminal CIE). The window wraps
+    // the callbacks HERE because the clients' `processLine` closures
+    // invoke whatever callbacks object this method passes to `invoke`;
+    // the controller rides on the wrapped object and is discovered by
+    // `readStream`. Hidden-retry count goes into the report lines below
+    // (diagnostics disclosure of otherwise-silent retries).
+    const commitWindow = createCommitWindow();
     await new Promise<void>((resolve, reject) => {
-      void invoke({
+      void invoke(commitWindow.wrap({
         onText: (text: string) => {
           if (firstChunkAt === undefined) {
             firstChunkAt = Date.now();
             // Issue #41 — Strand 1: log stream start (first chunk) with
             // time-to-first-token. One line per stream — not per chunk.
+            // Commit-window note: with buffering in place this fires at
+            // FLUSH time, so ttft is time-to-first-VISIBLE-token.
             logger.info(
               `Stream start: model="${modelLabel}" ttft=${firstChunkAt - startedAt}ms`,
             );
@@ -2030,10 +2049,13 @@ ${errorLines}
         onDone: () => {
           // Issue #41 — Strand 1: log stream done with total duration
           // + chunk count. Diagnostics for slow streams and to confirm
-          // a request actually completed (vs silently dropped).
+          // a request actually completed (vs silently dropped). The
+          // commit-window hidden-retry count discloses how many
+          // silent in-window retries the message needed (ArchCom §3.4
+          // diagnostics requirement).
           const durationMs = Date.now() - startedAt;
           logger.info(
-            `Stream done: model="${modelLabel}" duration=${durationMs}ms chunks=${chunkCount}`,
+            `Stream done: model="${modelLabel}" duration=${durationMs}ms chunks=${chunkCount} commitWindowHiddenRetries=${commitWindow.controller.hiddenRetryCount()}`,
           );
           onSuccess?.();
           resolve();
@@ -2053,22 +2075,27 @@ ${errorLines}
             error instanceof HttpError ? ` status=${error.status}` : '';
           const ref = errorRefId(error);
           logger.error(
-            `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name} ref=${ref}`,
+            `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name} commitWindowHiddenRetries=${commitWindow.controller.hiddenRetryCount()} ref=${ref}`,
             error,
           );
           reject(error);
         },
-        // ArchCom 2026-09-14 (train A) — surface mid-stream retry
-        // notices (issued after already-shown output) inline so the
-        // re-shown prefix is explained instead of looking like a
-        // duplication bug.
+        // ArchCom 2026-09-14 — surface VISIBLE stream notices inline:
+        // the zero-byte extra attempt announcement (§3.4; nothing has
+        // been shown yet, but the user must know why they are waiting
+        // longer). In-window hidden retries never call onNotice — they
+        // are disclosed via diagnostics only.
         onNotice: (text: string) => {
           progress.report(new vscode.LanguageModelTextPart(text));
         },
-      }).catch((error: unknown) => {
+      })).catch((error: unknown) => {
         // Safety net: if the client rejects its own promise instead
         // of calling onError (shouldn't happen, but defence-in-depth),
         // surface it as a rejection so the caller's try/catch fires.
+        // Flush the commit-window first: a thrown terminal error (e.g.
+        // CIE after the window, MidStreamError) must not discard
+        // already-received tokens the user was billed for.
+        commitWindow.controller.flush();
         reject(error instanceof Error ? error : new Error(String(error)));
       });
     });
