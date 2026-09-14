@@ -308,7 +308,11 @@ export interface StreamReaderOptions {
  *     nothing shown by construction) → ONE additional VISIBLE attempt
  *     announced via `onNotice`, then terminal (ArchCom design
  *     condition). Connect-phase ZeroByte retries inside `withRetry`
- *     stay silent as before — that is not mid-stream.
+ *     stay silent as before — that is not mid-stream. P3-2 (2026-09-15
+ *     review): 0-chunk closes classified INSIDE `readStreamOnce` (bare
+ *     AbortError / raw socket-close escaping `withRetry`) are re-thrown
+ *     as `ZeroByteSocketCloseError` instead of a direct `onError`, so
+ *     they follow this SAME policy — exactly one retry path per class.
  *
  * All hidden retries draw from the shared POST budget
  * (`MAX_POST_BUDGET_PER_MESSAGE`); the loop terminates because every
@@ -926,8 +930,13 @@ async function readStreamOnce(
           callbacks.onError(idle);
           return;
         }
-        callbacks.onError(new ZeroByteSocketCloseError());
-        return;
+        // P3-2 (2026-09-15 review) — THROW, not callbacks.onError: this
+        // non-idle 0-chunk bare close must follow the same
+        // one-extra-visible-attempt policy in `readStream` as a
+        // ZeroByteSocketCloseError thrown out of `withRetry`. The
+        // pre-fix direct `onError` bypassed the policy (inconsistent
+        // with the probe path). Idle stays terminal here.
+        throw new ZeroByteSocketCloseError();
       }
       if (abortReason === null && chunksReceived > 0) {
         // Mid-stream retry: throw instead of callbacks.onError so the
@@ -983,7 +992,12 @@ async function readStreamOnce(
           callbacks.onError(idle);
           return;
         }
-        callbacks.onError(new ZeroByteSocketCloseError());
+        // P3-2 (2026-09-15 review) — THROW, not callbacks.onError: a
+        // raw 0-chunk socket-close that escaped `withRetry` (retries
+        // exhausted there) must follow the same one-extra-visible-
+        // attempt policy in `readStream` as the probe-path ZeroByte.
+        // The pre-fix direct `onError` bypassed the policy.
+        throw new ZeroByteSocketCloseError();
       } else {
         // ArchCom 2026-09-14 (train A) — long silence before the close
         // means a deterministic idle kill: terminal, not retried.
@@ -999,7 +1013,8 @@ async function readStreamOnce(
         // retry wrapper in `readStream` can catch and retry.
         throw new ConnectionInterruptedError(chunksReceived);
       }
-      return;
+      // P3-2: both chunksReceived branches above now end in
+      // return/throw — nothing reaches past the if/else.
     }
     // ArchCom 2026-09-14 §3.4 — a ZeroByteSocketCloseError reaching this
     // fallthrough means `withRetry` exhausted its connect-phase retries
