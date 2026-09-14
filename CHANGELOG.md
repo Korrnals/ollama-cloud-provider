@@ -12,6 +12,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 - **M4 — louder SSRF probe aborts**: an `SsrfBlockedError` during capability probing now logs at error level (security-relevant block); other probe aborts keep the operational warn.
 - **P3-2-DI — injectable SSRF guard factory**: `ModelCatalog` takes an optional `ssrfGuardFactory` (default `createProductionSsrfGuard`); unit tests inject a permissive fake and no longer resolve real DNS.
 
+### Commit-window — silent early-break healing, 50-chunk threshold abolished (ArchCom 2026-09-14 §3.4)
+
+ArchCom decision `f8ecfff4`.
+
+### Added
+- **Commit-window (~5 s, time-based)** — the first deltas of every stream (`onText`/`onThinking`/`onToolCall`) are buffered before they reach the chat. A stream break INSIDE the window is retried **silently**: the buffer is reset, the user sees neither a duplicated prefix nor flicker — only the final answer. The window is armed by the first delta event (not by connection start), so slow thinking-model TTFT (60–70 s) adds zero extra invisible time. Hidden retries are disclosed in diagnostics only: a `Commit-window hidden retry` warn line plus a `commitWindowHiddenRetries=` field in the `Stream done`/`Stream error` report lines. All hidden retries share the per-message POST budget (6).
+- **One extra visible attempt for zero-chunk closes** — a non-idle 0-chunk close (< 90 s, nothing received) that survives the connect-phase retries now gets exactly ONE additional attempt announced inline via `onNotice` («Ответ так и не начался — делаю последнюю автоматическую попытку»), then fails terminally. Previously it failed terminally right after the silent connect retries, with no visible cue that anything was attempted.
+
+### Changed
+- **The 50-chunk mid-stream retry threshold (`MID_STREAM_RETRY_MAX_CHUNKS`) is abolished** — atomically with the commit-window above. After the window closes (~5 s after the first delta), a mid-stream break is TERMINAL: an honest error («показанный фрагмент может быть неполным… повторите запрос»), manual user retry. Visibility, not chunk volume, now decides retryability; mid-stream text duplication becomes impossible by construction.
+- The former visible mid-stream retry notice (re-shown prefix explanation) is gone together with the retry it announced — there is no post-shown auto-retry left to explain.
+- Window-retry backoff keeps the ±25 % jitter and is capped at 10 s (1 s base, ×2 per retry).
+
+### Upgrade notes
+- Streams that break within the first ~5 s now heal invisibly (covered by the standard VS Code spinner); the visible first token of a healthy stream is unchanged (the buffer flushes after 5 s while tokens keep flowing).
+- Tests calling `readStream` directly without a commit-window attached get terminal `ConnectionInterruptedError` on the first mid-stream break (no threshold fallback).
+
 ## [0.15.0] - 2026-09-14
 
 Live capability probing via `/api/show` (ArchCom 2026-09-14, train B) + review P2 follow-ups. The class of bug "a NEW model misdetects as text-only until the extension ships a snapshot update" is now closed: capabilities are probed live at catalog refresh.
