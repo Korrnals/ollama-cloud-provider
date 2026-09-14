@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { CancellationToken } from 'vscode';
 import { createHash } from 'node:crypto';
 import { AuthManager } from './auth.js';
+import { createCommitWindow } from './commitWindow.js';
 import {
   findConnection,
   openAiBaseUrl,
@@ -346,6 +347,15 @@ export async function executePassThrough(
       visionConnection,
     );
     const { input, instructions } = convertToResponsesInput(params.messages);
+    // Review fix P2-1 (commit-window remediation) — the pass-through
+    // streams used BARE callbacks, so a mid-stream break was terminal
+    // on the first attempt (the window is the only silent-retry
+    // boundary) and the user waited in silence. Wrap in a commit
+    // window exactly like provider.runStream: early breaks heal
+    // silently, post-window breaks fail honestly. Fresh window per
+    // runner — the runners are alternatives (404 fallback), never
+    // concurrent, and each deserves its own retry boundary.
+    const commitWindow = createCommitWindow();
     return new Promise<void>((resolve, reject) => {
       void responsesClient
         .streamResponses(
@@ -359,7 +369,7 @@ export async function executePassThrough(
             // fallback turn — the user asked about an image, not for
             // tool orchestration.
           },
-          {
+          commitWindow.wrap({
             onText: (text: string) => {
               params.progress.report(new vscode.LanguageModelTextPart(text));
             },
@@ -382,10 +392,20 @@ export async function executePassThrough(
               resolve();
             },
             onError: (error: Error) => reject(error),
-          },
+            // Zero-byte extra attempt announcement (ArchCom §3.4) —
+            // same inline visibility as the primary path.
+            onNotice: (text: string) => {
+              params.progress.report(
+                new vscode.LanguageModelTextPart(text),
+              );
+            },
+          }),
           params.token,
         )
         .catch((error: unknown) => {
+          // Flush before rejecting: received (billed) tokens must not
+          // vanish on a thrown terminal error.
+          commitWindow.controller.flush();
           reject(
             error instanceof Error ? error : new Error(String(error)),
           );
@@ -396,6 +416,9 @@ export async function executePassThrough(
   const runChatStream = (): Promise<void> => {
     // Single-hop (constraint 1) — one streamChat call, the same
     // CancellationToken + progress reporter the primary path uses.
+    // Review fix P2-1 — commit-window wrapped, same as
+    // runResponsesStream above (see the comment there).
+    const commitWindow = createCommitWindow();
     return new Promise<void>((resolve, reject) => {
       void client.streamChat(
         {
@@ -407,7 +430,7 @@ export async function executePassThrough(
           // fallback turn — the user asked about an image, not for
           // tool orchestration.
         },
-        {
+        commitWindow.wrap({
           onText: (text: string) => {
             params.progress.report(new vscode.LanguageModelTextPart(text));
           },
@@ -424,9 +447,19 @@ export async function executePassThrough(
             resolve();
           },
           onError: (error: Error) => reject(error),
-        },
+          // Zero-byte extra attempt announcement (ArchCom §3.4).
+          onNotice: (text: string) => {
+            params.progress.report(new vscode.LanguageModelTextPart(text));
+          },
+        }),
         params.token,
-      );
+      ).catch((error: unknown) => {
+        // Flush before rejecting (see runResponsesStream).
+        commitWindow.controller.flush();
+        reject(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      });
     });
   };
 
