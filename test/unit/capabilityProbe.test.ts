@@ -25,6 +25,7 @@ import {
   type ProbeContext,
 } from '../../src/capabilityProbe.js';
 import { logger } from '../../src/logger.js';
+import type { SsrfGuard } from '../../src/ssrfGuard.js';
 
 const CLOUD_CTX: ProbeContext = { connectionId: 'cloud', rootUrl: 'https://ollama.com' };
 
@@ -73,6 +74,17 @@ function stopLogCapture(): void {
     originalCreateOutputChannel = undefined;
   }
   logger.setDebugMode(false);
+}
+
+/**
+ * P3-2-DI (gate M-package) — permissive SSRF guard factory: the tests in
+ * the catalog-integration describe inject it into ModelCatalog so they
+ * never resolve real DNS for ollama.com/example.com (network access is
+ * mocked at the fetch level only).
+ */
+function permissiveSsrfGuardFactory(): () => SsrfGuard {
+  return () =>
+    ({ assertUrlAllowed: async () => undefined }) as unknown as SsrfGuard;
 }
 
 describe('capabilityProbe.probeModelShow (ArchCom 2026-09-14 train B)', () => {
@@ -432,7 +444,16 @@ describe('capabilityProbe — catalog integration auth (Security gate B1 regress
       getRootUrl: () => 'https://ollama.com',
     };
     const { ModelCatalog } = await import('../../src/modelCatalog.js');
-    const catalog = new ModelCatalog(auth as never);
+    // P3-2-DI — permissive factory (fake guard): the test must not hit
+    // real DNS for ollama.com/example.com; only global.fetch (mocked
+    // above) is exercised.
+    let guardChecks = 0;
+    const catalog = new ModelCatalog(auth as never, () =>
+      ({
+        assertUrlAllowed: async () => {
+          guardChecks += 1;
+        },
+      }) as unknown as SsrfGuard);
 
     await catalog.refreshForConnections([
       conn({
@@ -460,6 +481,7 @@ describe('capabilityProbe — catalog integration auth (Security gate B1 regress
     assert.equal(cloudProbe.authorization, undefined, 'cloud probe must be keyless (gate B1)');
     assert.equal(cloudProbe.model, 'brand-new-cloud-model');
     assert.equal(vpsProbe.authorization, 'Bearer sk-vps-key', 'keyed remote sends its key');
+    assert.ok(guardChecks > 0, 'the injected factory guard was actually consulted');
   });
 
   it('batch log carries oldestCached=HH:MM:SS when /api/show reports modified_at (M1)', async () => {
@@ -486,7 +508,7 @@ describe('capabilityProbe — catalog integration auth (Security gate B1 regress
         getRootUrl: () => 'https://ollama.com',
       };
       const { ModelCatalog } = await import('../../src/modelCatalog.js');
-      const catalog = new ModelCatalog(auth as never);
+      const catalog = new ModelCatalog(auth as never, permissiveSsrfGuardFactory());
 
       await catalog.refreshForConnections([
         conn({
@@ -533,7 +555,7 @@ describe('capabilityProbe — catalog integration auth (Security gate B1 regress
         getRootUrl: () => 'https://ollama.com',
       };
       const { ModelCatalog } = await import('../../src/modelCatalog.js');
-      const catalog = new ModelCatalog(auth as never);
+      const catalog = new ModelCatalog(auth as never, permissiveSsrfGuardFactory());
 
       await catalog.refreshForConnections([
         conn({

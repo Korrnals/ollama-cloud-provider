@@ -18,6 +18,7 @@ import {
   createProductionSsrfGuard,
   SsrfBlockedError,
   type SsrfGuard,
+  type SsrfGuardOptions,
 } from './ssrfGuard.js';
 import {
   probeCapabilities,
@@ -513,7 +514,20 @@ const KNOWN_MODEL_MAP = new Map(
 export class ModelCatalog {
   private models: ModelDefinition[] = [...KNOWN_MODELS];
 
-  constructor(private readonly authManager: AuthManager) {}
+  /**
+   * P3-2-DI (gate M-package) — SSRF guard creation seam. Production
+   * defaults to the strict DNS-resolving guard; tests inject a
+   * permissive fake so unit tests never hit real DNS. The factory
+   * receives the per-connection options (LOCAL connections allow
+   * loopback + RFC 1918), so the default maps 1:1 onto
+   * `createProductionSsrfGuard`.
+   */
+  constructor(
+    private readonly authManager: AuthManager,
+    private readonly ssrfGuardFactory: (
+      options?: SsrfGuardOptions,
+    ) => SsrfGuard = createProductionSsrfGuard,
+  ) {}
 
   list(): readonly ModelDefinition[] {
     // ArchCom 0011c Fix 2 — hide retired models from the picker. A model
@@ -548,7 +562,7 @@ export class ModelCatalog {
         connectionId: 'cloud',
         rootUrl: this.authManager.getRootUrl(),
       },
-      createProductionSsrfGuard(),
+      this.ssrfGuardFactory(),
     );
 
     const changed = !sameModelIds(this.models, nextModels);
@@ -621,7 +635,7 @@ export class ModelCatalog {
               rootUrl: rootUrlForConnection(connection),
               apiKey,
             },
-            createProductionSsrfGuard(
+            this.ssrfGuardFactory(
               connection.type === 'local'
                 ? { allowLoopback: true, allowPrivateRanges: true }
                 : undefined,
@@ -671,7 +685,7 @@ export class ModelCatalog {
     // The string whitelist (above) cannot catch rebinding; this guard
     // resolves the hostname right before fetch. Cloud connection =
     // strict profile (no private ranges).
-    const ssrfGuard = createProductionSsrfGuard();
+    const ssrfGuard = this.ssrfGuardFactory();
 
     try {
       return await fetchModelIdsFromOpenAICatalog(baseUrl, apiKey, ssrfGuard);
@@ -705,7 +719,7 @@ export class ModelCatalog {
     // catalog fetches (same gap as the cloud path). Local connections
     // allow loopback + RFC 1918 (LAN-hosted Ollama); everything else
     // uses the strict profile.
-    const ssrfGuard = createProductionSsrfGuard(
+    const ssrfGuard = this.ssrfGuardFactory(
       connection.type === 'local'
         ? { allowLoopback: true, allowPrivateRanges: true }
         : undefined,
