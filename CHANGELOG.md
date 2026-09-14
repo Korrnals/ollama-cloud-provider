@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-09-15
+
+P3 stream polish: every zero-byte close now follows the unified one-extra-visible-attempt policy (P3-2), and the commit-window controller is the single owner of the hidden-retry counter with honest cancelled-retry diagnostics (P3-4) — plus README streaming/model-sync sync with v0.16.0 behavior and deterministic (deflaked) boundary-race test coverage.
+
 ### Fixed
 - **Unified zero-byte retry policy (P3-2)** — a non-idle 0-chunk close classified inside `readStreamOnce` (a bare `AbortError` rejecting the first read, or a raw socket-close error escaping `withRetry` after exhausted connect retries) surfaced via `onError` directly, bypassing the "one extra visible attempt" policy that probe-path zero-byte closes already get. Both paths now re-throw `ZeroByteSocketCloseError`, so every zero-byte terminal follows the same policy: exactly one announced extra attempt, then a terminal error. Cancel / max-duration / idle-kill branches are unchanged.
 
