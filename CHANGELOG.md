@@ -5,6 +5,13 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Security hardening (gate M-package)
+- **M1 — `modified_at` staleness hint**: the capability cache entry now stores the server-reported `modified_at` from `/api/show` (optional date string, kept only when parseable), and each probe batch log line gains `oldestCached=HH:MM:SS` (UTC) — or `oldestCached=-` when the server reports none. Full digest-based invalidation on `modified_at` change is deliberately out of scope (backlog: "M1-full").
+- **M2 — per-connection 429 backoff**: a 429 from `/api/show` benches the connection (Retry-After seconds, 60 s default); while benched, probe batches for that connection are skipped entirely (empty result + warn, snapshot/heuristic fallback) instead of re-hammering the endpoint on every refresh.
+- **M3 — Content-Length pre-check**: probe replies whose declared Content-Length exceeds the 64 KiB cap are rejected before the body is read; the post-read size cap stays as defence-in-depth for lying/absent headers.
+- **M4 — louder SSRF probe aborts**: an `SsrfBlockedError` during capability probing now logs at error level (security-relevant block); other probe aborts keep the operational warn.
+- **P3-2-DI — injectable SSRF guard factory**: `ModelCatalog` takes an optional `ssrfGuardFactory` (default `createProductionSsrfGuard`); unit tests inject a permissive fake and no longer resolve real DNS.
+
 ## [0.15.0] - 2026-09-14
 
 Live capability probing via `/api/show` (ArchCom 2026-09-14, train B) + review P2 follow-ups. The class of bug "a NEW model misdetects as text-only until the extension ships a snapshot update" is now closed: capabilities are probed live at catalog refresh.

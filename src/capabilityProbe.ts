@@ -49,7 +49,22 @@ export interface ProbedCapabilities {
 export interface ProbeOutcome {
   apiModel: string;
   capabilities?: ProbedCapabilities;
+  /**
+   * M1 (gate M-package) — server-reported `modified_at` for the model
+   * (date string), when /api/show carries one. Metadata for cache
+   * staleness diagnostics only.
+   */
+  modifiedAt?: string;
   source: 'api-show' | 'unavailable' | 'invalid' | 'rate-limited';
+}
+
+/**
+ * M1 (gate M-package) — probeCapabilities result entry: the probed
+ * capabilities plus the server-reported `modified_at` (when present).
+ */
+export interface ProbeResult {
+  capabilities: ProbedCapabilities;
+  modifiedAt?: string;
 }
 
 /** Connection-scoped context for a probe batch. */
@@ -84,19 +99,56 @@ const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
  * resets on extension restart — acceptable per contract (capabilities for
  * a fixed model id are near-immutable; the TTL bounds staleness when the
  * upstream ships a new revision under the same id).
+ *
+ * M1 (gate M-package): entries also store the server-reported
+ * `modified_at`. It is recorded for staleness diagnostics ONLY — full
+ * digest-based invalidation (re-probe when `modified_at` changes under
+ * the same model id) is deliberately NOT implemented; see the gate
+ * M-package backlog item "M1-full: digest invalidation on modified_at
+ * change".
  */
-const cache = new Map<string, { caps: ProbedCapabilities; expiresAt: number }>();
+const cache = new Map<string, { result: ProbeResult; expiresAt: number }>();
+
+/**
+ * M2 (gate M-package) — per-connection 429 backoff. When a probe batch
+ * hits 429, the connection is benched: `probeCapabilities` skips whole
+ * batches for that connectionId (empty result + warn) until
+ * `notBeforeMs` passes. Without this, every catalog refresh kept
+ * re-hammering a rate-limited endpoint batch after batch.
+ */
+const rateLimitUntil = new Map<string, number>();
+const RETRY_AFTER_DEFAULT_MS = 60_000;
+
+/**
+ * Parses the `Retry-After` response header (delta-seconds form) into a
+ * backoff duration in ms. Anything missing, unparsable or non-positive
+ * falls back to the 60 s default (per gate M-package spec).
+ */
+function parseRetryAfterMs(header: string | null): number {
+  const seconds = header === null ? NaN : Number(header);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return RETRY_AFTER_DEFAULT_MS;
+  }
+  return seconds * 1000;
+}
+
+function benchConnection(ctx: ProbeContext, retryAfterHeader: string | null): void {
+  rateLimitUntil.set(ctx.connectionId, Date.now() + parseRetryAfterMs(retryAfterHeader));
+}
 
 /** Test/config-change hook — mirrors clearCapabilityCache semantics. */
 export function clearCapabilityProbeCache(): void {
   cache.clear();
+  // M2 (gate M-package) — also lifts every per-connection 429 bench, so
+  // tests (and a config change) start from a clean probing posture.
+  rateLimitUntil.clear();
 }
 
 function cacheKey(ctx: ProbeContext, apiModel: string): string {
   return `${ctx.connectionId}::${apiModel}`;
 }
 
-function readCache(ctx: ProbeContext, apiModel: string): ProbedCapabilities | undefined {
+function readCache(ctx: ProbeContext, apiModel: string): ProbeResult | undefined {
   const entry = cache.get(cacheKey(ctx, apiModel));
   if (!entry) {
     return undefined;
@@ -105,12 +157,12 @@ function readCache(ctx: ProbeContext, apiModel: string): ProbedCapabilities | un
     cache.delete(cacheKey(ctx, apiModel));
     return undefined;
   }
-  return entry.caps;
+  return entry.result;
 }
 
-function writeCache(ctx: ProbeContext, apiModel: string, caps: ProbedCapabilities): void {
+function writeCache(ctx: ProbeContext, apiModel: string, result: ProbeResult): void {
   cache.set(cacheKey(ctx, apiModel), {
-    caps,
+    result,
     expiresAt: Date.now() + PROBE_CACHE_TTL_MS,
   });
 }
@@ -148,6 +200,10 @@ export async function probeModelShow(
     });
 
     if (res.status === 429) {
+      // M2 (gate M-package) — bench THIS connection for the next batches
+      // (Retry-After seconds, 60 s default), so the next refresh skips
+      // the endpoint entirely instead of re-hammering it.
+      benchConnection(ctx, res.headers.get('retry-after'));
       return { apiModel, source: 'rate-limited' };
     }
     if (!res.ok) {
@@ -155,6 +211,20 @@ export async function probeModelShow(
       // retry (contract). 404: model unknown to /api/show — snapshot/
       // heuristic fallback. Other codes: same fallback posture.
       return { apiModel, source: 'unavailable' };
+    }
+
+    // M3 (gate M-package) — Content-Length pre-check BEFORE reading the
+    // body: a declared-oversized reply is discarded without pulling the
+    // payload into memory. The res.text() size cap below stays as
+    // defence-in-depth (a lying or absent Content-Length still gets
+    // caught after the read). Absent/garbage header → NaN → falls
+    // through to the read-path cap.
+    const declaredLength = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > PROBE_MAX_RESPONSE_BYTES) {
+      logger.warn(
+        `capability-probe: ${apiModel} declared Content-Length ${declaredLength} exceeds ${PROBE_MAX_RESPONSE_BYTES} bytes — discarded without reading body`,
+      );
+      return { apiModel, source: 'invalid' };
     }
 
     const text = await res.text();
@@ -165,9 +235,9 @@ export async function probeModelShow(
       return { apiModel, source: 'invalid' };
     }
 
-    let parsed: { capabilities?: unknown };
+    let parsed: { capabilities?: unknown; modified_at?: unknown };
     try {
-      parsed = JSON.parse(text) as { capabilities?: unknown };
+      parsed = JSON.parse(text) as { capabilities?: unknown; modified_at?: unknown };
     } catch {
       return { apiModel, source: 'invalid' };
     }
@@ -183,7 +253,14 @@ export async function probeModelShow(
       reasoning: values.has('thinking'),
       toolCalling: values.has('tools'),
     };
-    return { apiModel, capabilities: caps, source: 'api-show' };
+    // M1 (gate M-package) — `modified_at` is optional; keep it only when
+    // it is a string holding a parseable date (garbage → undefined).
+    const modifiedAt =
+      typeof parsed.modified_at === 'string' &&
+      !Number.isNaN(Date.parse(parsed.modified_at))
+        ? parsed.modified_at
+        : undefined;
+    return { apiModel, capabilities: caps, modifiedAt, source: 'api-show' };
   } catch (error) {
     // Network error / timeout / abort — single attempt, degrade quietly.
     logger.debug(
@@ -199,18 +276,36 @@ export async function probeModelShow(
  * Probes a batch of unknown models: cache-first, concurrency ≤ 4, and a
  * hard batch-cancel on the first 429 (Security condition — a rate-limited
  * catalog refresh must not hammer the endpoint with the rest of the
- * batch; already-collected results are kept).
+ * batch; already-collected results are kept). M2 (gate M-package): the
+ * 429 also benches the connection (Retry-After, 60 s default) — batches
+ * arriving while benched are skipped entirely (empty result + warn).
  *
- * Returns the map of successfully probed capabilities only (failures are
- * absent — the caller falls back to snapshot/heuristics for those ids).
+ * Returns the map of successfully probed results only (failures are
+ * absent — the caller falls back to snapshot/heuristics for those ids);
+ * each entry carries the capabilities plus the server-reported
+ * `modified_at` when present (M1, gate M-package).
  */
 export async function probeCapabilities(
   apiModels: readonly string[],
   ctx: ProbeContext,
-): Promise<Map<string, ProbedCapabilities>> {
-  const result = new Map<string, ProbedCapabilities>();
+): Promise<Map<string, ProbeResult>> {
+  const result = new Map<string, ProbeResult>();
   if (apiModels.length === 0) {
     return result;
+  }
+
+  // M2 (gate M-package) — 429 backoff: while the connection is benched,
+  // skip the whole batch (empty result — the caller falls back to
+  // snapshot/heuristics) instead of re-hammering the endpoint.
+  const notBefore = rateLimitUntil.get(ctx.connectionId);
+  if (notBefore !== undefined) {
+    if (Date.now() < notBefore) {
+      logger.warn(
+        `capability-probe: connection '${ctx.connectionId}' rate-limited until ${new Date(notBefore).toISOString()} — batch skipped (${apiModels.length} models), falling back to snapshot/heuristics`,
+      );
+      return result;
+    }
+    rateLimitUntil.delete(ctx.connectionId);
   }
 
   // Cache pass first — warm refreshes typically re-probe nothing.
@@ -245,8 +340,12 @@ export async function probeCapabilities(
         return;
       }
       if (outcome.capabilities) {
-        result.set(id, outcome.capabilities);
-        writeCache(ctx, id, outcome.capabilities);
+        const entry: ProbeResult = {
+          capabilities: outcome.capabilities,
+          modifiedAt: outcome.modifiedAt,
+        };
+        result.set(id, entry);
+        writeCache(ctx, id, entry);
       }
     }
   };

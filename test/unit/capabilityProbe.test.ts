@@ -17,12 +17,15 @@
  */
 
 import { strict as assert } from 'node:assert';
+import * as vscode from 'vscode';
 import {
   clearCapabilityProbeCache,
   probeCapabilities,
   probeModelShow,
   type ProbeContext,
 } from '../../src/capabilityProbe.js';
+import { logger } from '../../src/logger.js';
+import type { SsrfGuard } from '../../src/ssrfGuard.js';
 
 const CLOUD_CTX: ProbeContext = { connectionId: 'cloud', rootUrl: 'https://ollama.com' };
 
@@ -31,8 +34,57 @@ interface FetchCall {
   init?: RequestInit;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status });
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  headers?: Record<string, string>,
+): Response {
+  return new Response(JSON.stringify(body), { status, headers });
+}
+
+/**
+ * Log capture — same seam as compactionOscillation.test.ts: replace the
+ * vscode OutputChannel factory, force the logger singleton to re-grab its
+ * channel (`setDebugMode(true)` → dispose + re-create via the patched
+ * factory), and collect every appended line. `stopLogCapture` restores
+ * the factory and the default channel.
+ */
+let capturedLogLines: string[] = [];
+let originalCreateOutputChannel: typeof vscode.window.createOutputChannel | undefined;
+
+function startLogCapture(): void {
+  capturedLogLines = [];
+  const capturingChannel = {
+    name: 'Ollama Cloud (Debug)',
+    appendLine: (line: string) => {
+      capturedLogLines.push(line);
+    },
+    show: () => undefined,
+    dispose: () => undefined,
+  };
+  originalCreateOutputChannel = vscode.window.createOutputChannel;
+  vscode.window.createOutputChannel = (() =>
+    capturingChannel) as unknown as typeof vscode.window.createOutputChannel;
+  logger.setDebugMode(true);
+}
+
+function stopLogCapture(): void {
+  if (originalCreateOutputChannel) {
+    vscode.window.createOutputChannel = originalCreateOutputChannel;
+    originalCreateOutputChannel = undefined;
+  }
+  logger.setDebugMode(false);
+}
+
+/**
+ * P3-2-DI (gate M-package) — permissive SSRF guard factory: the tests in
+ * the catalog-integration describe inject it into ModelCatalog so they
+ * never resolve real DNS for ollama.com/example.com (network access is
+ * mocked at the fetch level only).
+ */
+function permissiveSsrfGuardFactory(): () => SsrfGuard {
+  return () =>
+    ({ assertUrlAllowed: async () => undefined }) as unknown as SsrfGuard;
 }
 
 describe('capabilityProbe.probeModelShow (ArchCom 2026-09-14 train B)', () => {
@@ -148,6 +200,55 @@ describe('capabilityProbe.probeModelShow (ArchCom 2026-09-14 train B)', () => {
     assert.equal(outcome.source, 'invalid');
   });
 
+  it('captures modified_at when /api/show reports it (M1)', async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({
+        capabilities: ['completion'],
+        modified_at: '2026-09-01T10:20:30.000Z',
+      })) as typeof fetch;
+
+    const outcome = await probeModelShow('dated-model', CLOUD_CTX);
+    assert.equal(outcome.source, 'api-show');
+    assert.equal(outcome.modifiedAt, '2026-09-01T10:20:30.000Z');
+  });
+
+  it('ignores a non-date modified_at value (M1)', async () => {
+    globalThis.fetch = (async () =>
+      jsonResponse({
+        capabilities: ['completion'],
+        modified_at: 'not-a-date',
+      })) as typeof fetch;
+
+    const outcome = await probeModelShow('garbage-date-model', CLOUD_CTX);
+    assert.equal(outcome.source, 'api-show');
+    assert.equal(outcome.modifiedAt, undefined);
+  });
+
+  it('rejects an oversized Content-Length WITHOUT reading the body (M3)', async () => {
+    let bodyReads = 0;
+    globalThis.fetch = (async () => {
+      const res = jsonResponse({ capabilities: ['completion'] }, 200, {
+        // Small actual body, oversized DECLARED size — proves the pre-check
+        // fires on the header alone.
+        'Content-Length': String(70_000),
+      });
+      // Response#text is typed read-only; shadow it via defineProperty so
+      // the spy only fires if the probe actually reads the body.
+      const originalText = res.text.bind(res);
+      Object.defineProperty(res, 'text', {
+        value: async () => {
+          bodyReads += 1;
+          return originalText();
+        },
+      });
+      return res;
+    }) as typeof fetch;
+
+    const outcome = await probeModelShow('declared-huge-model', CLOUD_CTX);
+    assert.equal(outcome.source, 'invalid');
+    assert.equal(bodyReads, 0, 'body must not be read when Content-Length is oversized');
+  });
+
   it('propagates an SSRF guard block as a throw (terminal, not a fallback)', async () => {
     globalThis.fetch = (async () => {
       throw new Error('fetch must not be called when the guard blocks');
@@ -207,6 +308,28 @@ describe('capabilityProbe.probeCapabilities — batch semantics', () => {
     assert.ok(result.has('model-b') && result.has('model-c') && result.has('model-d'));
   });
 
+  it('benches the connection after a 429 — the next batch does not fetch (M2)', async () => {
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return jsonResponse({ error: 'rate limited' }, 429, { 'Retry-After': '600' });
+    }) as typeof fetch;
+
+    const ctx: ProbeContext = { connectionId: 'test-429', rootUrl: 'https://ollama.com' };
+    const first = await probeCapabilities(['model-x'], ctx);
+    assert.equal(first.size, 0);
+    assert.equal(fetchCount, 1, 'first batch probed once');
+
+    // Same connection while benched: skipped entirely — no fetch.
+    const second = await probeCapabilities(['model-y', 'model-z'], ctx);
+    assert.equal(second.size, 0);
+    assert.equal(fetchCount, 1, 'benched connection must not fetch again');
+
+    // The bench is per-connection: a different connectionId still probes.
+    await probeCapabilities(['model-w'], { ...ctx, connectionId: 'test-429-other' });
+    assert.equal(fetchCount, 2, 'other connections are not benched');
+  });
+
   it('serves the second batch from cache (no re-probe)', async () => {
     let fetchCount = 0;
     globalThis.fetch = (async () => {
@@ -215,12 +338,32 @@ describe('capabilityProbe.probeCapabilities — batch semantics', () => {
     }) as typeof fetch;
     const ctx = { connectionId: 'test-cache', rootUrl: 'https://ollama.com' };
     const first = await probeCapabilities(['cached-model'], ctx);
-    assert.equal(first.get('cached-model')?.imageInput, true);
+    assert.equal(first.get('cached-model')?.capabilities.imageInput, true);
     const firstFetchCount = fetchCount;
 
     const second = await probeCapabilities(['cached-model'], ctx);
-    assert.equal(second.get('cached-model')?.imageInput, true);
+    assert.equal(second.get('cached-model')?.capabilities.imageInput, true);
     assert.equal(fetchCount, firstFetchCount, 'warm refresh re-probes nothing');
+  });
+
+  it('keeps modified_at through the batch result and the 24h cache (M1)', async () => {
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return jsonResponse({
+        capabilities: ['completion'],
+        modified_at: '2026-08-31T08:00:00.000Z',
+      });
+    }) as typeof fetch;
+    const ctx = { connectionId: 'test-m1', rootUrl: 'https://ollama.com' };
+
+    const first = await probeCapabilities(['m1-model'], ctx);
+    assert.equal(first.get('m1-model')?.modifiedAt, '2026-08-31T08:00:00.000Z');
+
+    // Cache round-trip: the warm batch serves modifiedAt without a fetch.
+    const second = await probeCapabilities(['m1-model'], ctx);
+    assert.equal(fetchCount, 1);
+    assert.equal(second.get('m1-model')?.modifiedAt, '2026-08-31T08:00:00.000Z');
   });
 
   it('limits concurrency to 4', async () => {
@@ -301,7 +444,16 @@ describe('capabilityProbe — catalog integration auth (Security gate B1 regress
       getRootUrl: () => 'https://ollama.com',
     };
     const { ModelCatalog } = await import('../../src/modelCatalog.js');
-    const catalog = new ModelCatalog(auth as never);
+    // P3-2-DI — permissive factory (fake guard): the test must not hit
+    // real DNS for ollama.com/example.com; only global.fetch (mocked
+    // above) is exercised.
+    let guardChecks = 0;
+    const catalog = new ModelCatalog(auth as never, () =>
+      ({
+        assertUrlAllowed: async () => {
+          guardChecks += 1;
+        },
+      }) as unknown as SsrfGuard);
 
     await catalog.refreshForConnections([
       conn({
@@ -329,5 +481,100 @@ describe('capabilityProbe — catalog integration auth (Security gate B1 regress
     assert.equal(cloudProbe.authorization, undefined, 'cloud probe must be keyless (gate B1)');
     assert.equal(cloudProbe.model, 'brand-new-cloud-model');
     assert.equal(vpsProbe.authorization, 'Bearer sk-vps-key', 'keyed remote sends its key');
+    assert.ok(guardChecks > 0, 'the injected factory guard was actually consulted');
+  });
+
+  it('batch log carries oldestCached=HH:MM:SS when /api/show reports modified_at (M1)', async () => {
+    startLogCapture();
+    try {
+      globalThis.fetch = (async (input: string | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('/api/show')) {
+          return jsonResponse({
+            capabilities: ['completion', 'vision'],
+            modified_at: '2026-08-01T09:08:07.000Z',
+          });
+        }
+        if (url.endsWith('/v1/models')) {
+          return jsonResponse({ data: [{ id: 'dated-new-model' }] });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      }) as typeof fetch;
+
+      const auth = {
+        getApiKey: async () => 'sk-cloud-key',
+        getApiKeyForConnection: async () => 'sk-cloud-key',
+        getBaseUrl: () => 'https://ollama.com/v1',
+        getRootUrl: () => 'https://ollama.com',
+      };
+      const { ModelCatalog } = await import('../../src/modelCatalog.js');
+      const catalog = new ModelCatalog(auth as never, permissiveSsrfGuardFactory());
+
+      await catalog.refreshForConnections([
+        conn({
+          id: 'cloud',
+          type: 'cloud',
+          label: 'Cloud',
+          baseUrl: 'https://ollama.com/v1',
+          allowedBaseUrls: ['https://ollama.com/v1'],
+          requiresApiKey: true,
+        }),
+      ]);
+
+      const line = capturedLogLines.find((l) =>
+        l.includes("capability-probe: connection='cloud'"),
+      );
+      assert.ok(line, 'batch log line emitted');
+      assert.ok(
+        line.includes('oldestCached=09:08:07'),
+        `oldestCached HH:MM:SS missing: ${line}`,
+      );
+    } finally {
+      stopLogCapture();
+    }
+  });
+
+  it('batch log carries oldestCached=- when no modified_at is reported (M1)', async () => {
+    startLogCapture();
+    try {
+      globalThis.fetch = (async (input: string | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('/api/show')) {
+          return jsonResponse({ capabilities: ['completion'] });
+        }
+        if (url.endsWith('/v1/models')) {
+          return jsonResponse({ data: [{ id: 'undated-new-model' }] });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      }) as typeof fetch;
+
+      const auth = {
+        getApiKey: async () => 'sk-cloud-key',
+        getApiKeyForConnection: async () => 'sk-cloud-key',
+        getBaseUrl: () => 'https://ollama.com/v1',
+        getRootUrl: () => 'https://ollama.com',
+      };
+      const { ModelCatalog } = await import('../../src/modelCatalog.js');
+      const catalog = new ModelCatalog(auth as never, permissiveSsrfGuardFactory());
+
+      await catalog.refreshForConnections([
+        conn({
+          id: 'cloud',
+          type: 'cloud',
+          label: 'Cloud',
+          baseUrl: 'https://ollama.com/v1',
+          allowedBaseUrls: ['https://ollama.com/v1'],
+          requiresApiKey: true,
+        }),
+      ]);
+
+      const line = capturedLogLines.find((l) =>
+        l.includes("capability-probe: connection='cloud'"),
+      );
+      assert.ok(line, 'batch log line emitted');
+      assert.ok(line.includes('oldestCached=-'), `oldestCached=- missing: ${line}`);
+    } finally {
+      stopLogCapture();
+    }
   });
 });

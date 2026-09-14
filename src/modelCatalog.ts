@@ -14,7 +14,12 @@ import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
 import { isModelKnownRetired } from './capabilityCache.js';
-import { createProductionSsrfGuard, type SsrfGuard } from './ssrfGuard.js';
+import {
+  createProductionSsrfGuard,
+  SsrfBlockedError,
+  type SsrfGuard,
+  type SsrfGuardOptions,
+} from './ssrfGuard.js';
 import {
   probeCapabilities,
   type ProbedCapabilities,
@@ -509,7 +514,20 @@ const KNOWN_MODEL_MAP = new Map(
 export class ModelCatalog {
   private models: ModelDefinition[] = [...KNOWN_MODELS];
 
-  constructor(private readonly authManager: AuthManager) {}
+  /**
+   * P3-2-DI (gate M-package) — SSRF guard creation seam. Production
+   * defaults to the strict DNS-resolving guard; tests inject a
+   * permissive fake so unit tests never hit real DNS. The factory
+   * receives the per-connection options (LOCAL connections allow
+   * loopback + RFC 1918), so the default maps 1:1 onto
+   * `createProductionSsrfGuard`.
+   */
+  constructor(
+    private readonly authManager: AuthManager,
+    private readonly ssrfGuardFactory: (
+      options?: SsrfGuardOptions,
+    ) => SsrfGuard = createProductionSsrfGuard,
+  ) {}
 
   list(): readonly ModelDefinition[] {
     // ArchCom 0011c Fix 2 — hide retired models from the picker. A model
@@ -544,7 +562,7 @@ export class ModelCatalog {
         connectionId: 'cloud',
         rootUrl: this.authManager.getRootUrl(),
       },
-      createProductionSsrfGuard(),
+      this.ssrfGuardFactory(),
     );
 
     const changed = !sameModelIds(this.models, nextModels);
@@ -617,7 +635,7 @@ export class ModelCatalog {
               rootUrl: rootUrlForConnection(connection),
               apiKey,
             },
-            createProductionSsrfGuard(
+            this.ssrfGuardFactory(
               connection.type === 'local'
                 ? { allowLoopback: true, allowPrivateRanges: true }
                 : undefined,
@@ -667,7 +685,7 @@ export class ModelCatalog {
     // The string whitelist (above) cannot catch rebinding; this guard
     // resolves the hostname right before fetch. Cloud connection =
     // strict profile (no private ranges).
-    const ssrfGuard = createProductionSsrfGuard();
+    const ssrfGuard = this.ssrfGuardFactory();
 
     try {
       return await fetchModelIdsFromOpenAICatalog(baseUrl, apiKey, ssrfGuard);
@@ -701,7 +719,7 @@ export class ModelCatalog {
     // catalog fetches (same gap as the cloud path). Local connections
     // allow loopback + RFC 1918 (LAN-hosted Ollama); everything else
     // uses the strict profile.
-    const ssrfGuard = createProductionSsrfGuard(
+    const ssrfGuard = this.ssrfGuardFactory(
       connection.type === 'local'
         ? { allowLoopback: true, allowPrivateRanges: true }
         : undefined,
@@ -874,22 +892,46 @@ async function applyCapabilityProbing(
       ssrfGuard ? { ...ctx, ssrfGuard } : ctx,
     );
     for (let i = 0; i < models.length; i++) {
-      const caps = probed.get(models[i].apiModel);
-      if (!caps) {
+      const entry = probed.get(models[i].apiModel);
+      if (!entry) {
         continue;
       }
-      models[i] = mergeProbed(models[i], caps);
+      models[i] = mergeProbed(models[i], entry.capabilities);
     }
+    // M1 (gate M-package) — oldest server-reported `modified_at` across
+    // the batch's results, formatted HH:MM:SS (UTC): a staleness hint
+    // for the audit log. '-' when the server reported none (older
+    // self-hosted servers omit the field).
+    const modifiedDates = [...probed.values()]
+      .map((entry) => entry.modifiedAt)
+      .filter((m): m is string => Boolean(m));
+    const oldestCached =
+      modifiedDates.length > 0
+        ? new Date(
+            Math.min(...modifiedDates.map((m) => Date.parse(m))),
+          ).toISOString().slice(11, 19)
+        : '-';
     logger.info(
-      `capability-probe: connection='${ctx.connectionId}' probed=${unknown.length} ok=${probed.size} fallback=${unknown.length - probed.size}`,
+      `capability-probe: connection='${ctx.connectionId}' probed=${unknown.length} ok=${probed.size} fallback=${unknown.length - probed.size} oldestCached=${oldestCached}`,
     );
   } catch (error) {
-    // Terminal probe failure (e.g. SsrfBlockedError) — the refresh must
-    // survive with snapshot/heuristic fallbacks, but the cause is loud.
-    logger.warn(
-      `capability-probe: connection='${ctx.connectionId}' aborted (${(error as Error)?.constructor?.name ?? 'unknown'}) — falling back to snapshot/heuristics`,
-      error,
-    );
+    // Terminal probe failure — the refresh must survive with snapshot/
+    // heuristic fallbacks, but the cause is loud. M4 (gate M-package):
+    // an SsrfBlockedError is a security-relevant block (the probe target
+    // resolved into a forbidden range — hostile or misrouted connection
+    // config), so it escalates to logger.error; every other abort stays
+    // a warn (operational noise: DNS failure, malformed URL, etc.).
+    if (error instanceof SsrfBlockedError) {
+      logger.error(
+        `capability-probe: connection='${ctx.connectionId}' aborted (SsrfBlockedError) — falling back to snapshot/heuristics`,
+        error,
+      );
+    } else {
+      logger.warn(
+        `capability-probe: connection='${ctx.connectionId}' aborted (${(error as Error)?.constructor?.name ?? 'unknown'}) — falling back to snapshot/heuristics`,
+        error,
+      );
+    }
   }
 }
 
