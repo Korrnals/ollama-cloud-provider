@@ -49,13 +49,13 @@ The default endpoint (`auto`, which resolves to `native` `/api/chat` for cloud) 
 - **Secret storage** — API keys are stored in the OS-backed secret store, never in `settings.json` or workspace files.
 - **Context filtering (token savings)** — optional pre-processing that drops duplicate messages, empty content parts, and redundant tool definitions, and compacts the system prompt — reducing token cost without touching semantic content. Tool-call integrity is guaranteed; vision content is never filtered. Three levels (`off` / `safe` / `aggressive`), `off` by default. See [Context filtering](#context-filtering).
 - **Structured error surfacing** — server-sent mid-stream errors (`{"error":"..."}`) are caught as `MidStreamError` and shown with the real server message. HTTP 402/403/429/5xx are classified into human-readable `LanguageModelError` messages (including the server's actual reason, e.g. "this model uses extra usage only"). Raw Node socket-close errors (the `aborted at TLSSocket.socketCloseListener` / `socket hang up` / `ECONNRESET` family) are reclassified by `isSocketCloseError()` into `ConnectionInterruptedError` (mid-stream, terminal) or `ZeroByteSocketCloseError` (connect-phase, retryable) — shown as a clean message instead of a raw stack (v0.9.2, see ADR 0008).
-- **Mid-stream retry (v0.13.0)** — when the Ollama Cloud server closes the stream mid-generation (ECONNRESET after 2–9 chunks), `readStream` now retries up to 3 attempts with exponential backoff (1 s / 2 s / 4 s), bounded to ≤ 50 chunks already received. This resolves the subagent crash loop where `ConnectionInterruptedError` killed `runSubagent` calls. ADR 0005 previously stated "no mid-stream retry"; this is updated — with up to 50 chunks, the server bills for the partial generation regardless, but the retry produces a complete answer.
+- **Commit-window early-break healing (v0.16.0, ADR 0014)** — the first ~5 s of every stream are buffered before they reach the chat; the window is armed by the first delta, not by connection start, so slow thinking-model TTFT adds no invisible wait, and the buffer flush is covered by the standard VS Code spinner. A stream break inside the window is retried **silently**: the buffer is reset, the user sees neither a duplicated prefix nor flicker — only the final answer. Every attempt starts with clean parser state (`onAttemptStart` resets pending tool-call buffers), so a hidden retry can never concatenate tool-call fragments from the discarded attempt. After the window closes, a mid-stream break is **terminal**: an honest error (the shown fragment may be incomplete — retry the request), with no auto-retry — mid-stream text duplication is impossible by construction. The v0.13.0 "≤ 50 chunks, 3 attempts" threshold is abolished; visibility, not chunk volume, decides retryability. Hidden retries share the per-message POST budget (6, see below), their backoff is jittered and capped at 10 s, Escape interrupts it immediately, and the hidden-retry count is disclosed in diagnostics only (`commitWindowHiddenRetries=`). A non-idle zero-chunk close that survives the connect-phase retries gets exactly one additional visible attempt (announced inline), then fails terminally.
 - **Proxy-aware networking** — a native HTTP client bypasses VS Code's `global.fetch()` interception, fixing connect-timeout issues under `chat.agent.sandbox.enabled: "on"`. Respects the `http.proxy` VS Code setting.
 - **Tool calling** — fully supported on `/v1/responses` (top-level `function_call` / `function_call_output` items) and on native `/api/chat` (object tool args). Handled natively by VS Code, with no shell execution from the extension.
 - **Automatic model sync** — model catalog auto-refreshes on startup and when connection settings change. Use `Ollama Cloud: Refresh Models` to force a sync at any time.
 - **Multi-connection** — connect to several OpenAI-compatible endpoints (Cloud, Local, VPS, custom) with per-connection API keys and URL whitelists.
 - **Retry and streaming timeouts** — exponential backoff for transient failures, plus OS-level TCP keepalive for dead-connection detection and a max-duration safety cap.
-- **Streaming protection (ADR 0005)** — two layers protect against dead connections without killing legitimate long-reasoning streams: **connect** 60 s (retried via `maxRetries`), and a **max-duration** safety cap of 30 min (never reset, prevents forgotten-tab token leaks). Dead connections are detected at the OS level via TCP keepalive (`setKeepAlive(true, 30000)`) rather than by an inactivity timer — the previous inactivity timer was a false-positive machine that killed working streams during LLM reasoning pauses, and is now permanently disabled (v0.11.0, ArchCom 0011b/0011c).
+- **Streaming protection (ADR 0012 / ADR 0014)** — a single **max-duration** timer is the only one left: default 60 min (`ollamaCloud.requestMaxDurationMin`, never reset, prevents forgotten-tab token leaks). The connect and inactivity timers were removed entirely (ADR 0012) — any timer that can fire before the first token kills legitimate slow-TTFT reasoning; dead connections are detected at the OS level via TCP keepalive (`setKeepAlive(true, 30000)`) instead. A stream closed after ≥ 90 s of upstream silence is classified as a known Ollama Cloud bug (ollama/ollama#16108): a terminal `UpstreamIdleTimeoutError` with an honest message and no auto-retry — an identical POST reproduces the identical silence, so the extension fails fast instead of burning minutes of doomed retries. All retry paths share one POST budget (6 per message: connect-phase retries, in-window hidden retries, zero-byte extra attempt), and every backoff carries ±25 % jitter (10 s cap on window retries) to prevent synchronized retry bursts during a cloud-wide incident.
 - **Manual endpoint override** — `Ollama Cloud: Switch Endpoint` opens a picker to override the endpoint (`auto` / `native` / `chat` / `responses`) at any time, without editing `settings.json`.
 - **Health check** — probe the endpoint and discover models before chatting.
 - **Configuration validation** — catch misconfiguration (missing key, URL not whitelisted) before it breaks a chat.
@@ -193,7 +193,7 @@ All settings are `scope: "application"` — workspace folders cannot override th
 | `Ollama Cloud: Set Vision Fallback Model` | Pick a vision-capable model from the catalog. |
 | `Ollama Cloud: Set Vision Fallback Connection` | Pick a connection for the vision model (includes a "Clear — use primary connection" option). |
 | `Ollama Cloud: Refresh Models` | Force-sync the model catalog with the cloud endpoint, bypassing the 30s cooldown. Shows model count on completion. |
-| `Ollama Cloud: Show Registered Models` | List models registered with VS Code. |
+| `Ollama Cloud: Show Registered Models` | List models registered with VS Code, with per-model capabilities and their provenance (`snapshot` / `api-show` / `inferred`). |
 | `Ollama Cloud: Show Logs` | Open the extension output channel. |
 
 ## 🔄 Model sync
@@ -203,6 +203,23 @@ The extension automatically syncs the model catalog from the cloud endpoint:
 - **On startup** — the catalog refreshes immediately after activation, so new models (e.g. newly added cloud models) appear without a restart or config change.
 - **On config change** — changing `ollamaCloud.baseUrl`, `ollamaCloud.connections`, or `ollamaCloud.allowedBaseUrls` triggers a sync (with a 30s cooldown to avoid spamming).
 - **Manual refresh** — run `Ollama Cloud: Refresh Models` to force a sync at any time, bypassing the cooldown. The command shows a progress notification and displays the model count on completion.
+
+### Live capability probing (v0.15.0+, ADR 0014)
+
+Models discovered on a connection that are missing from the hardcoded capability snapshot are probed live via the connection's public `POST /api/show`, which returns the authoritative `capabilities` array (`vision` / `thinking` / `tools`). This works against ollama.com and any self-hosted Ollama ≥ v0.6.4 — a newly added cloud model no longer misdetects as text-only until the extension ships a snapshot update.
+
+Capabilities resolve through layers, first match wins:
+
+1. **User override** — `ollamaCloud.visionModels` patterns; always senior, never overridden by server data.
+2. **Snapshot** — the per-model capability table shipped with the extension.
+3. **`api-show`** — the live probe result; replaces the name-heuristic guess.
+4. **Heuristics** — model-name patterns; the fallback when the probe fails.
+
+A probe result only elevates over a heuristic (server-true wins); a server-false never silently demotes a heuristic-true — the disagreement is logged and the heuristic kept. Every model records where its capabilities came from: `Ollama Cloud: Show Registered Models` prints `imageInput`, `reasoning` and the provenance (`snapshot` / `api-show` / `inferred`) per model.
+
+Probing is budget-aware: only snapshot-unknown models are probed (typically +1–3 requests on a warm refresh — snapshot-known models cost nothing extra), results are cached for 24 h per connection + model, concurrency is capped at 4, and a 429 cancels the remaining batch and benches the connection for `Retry-After` (60 s default). Cloud probes call the public endpoint without the API key; self-hosted connections with `requiresApiKey` send the key as usual.
+
+See [ADR 0014](docs/adr/0014-stream-idle-kill-and-capability-probing.md) for the full probing contract and trust rules.
 
 ## 🔀 Endpoint routing
 
