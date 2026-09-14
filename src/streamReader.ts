@@ -28,6 +28,10 @@
  *   - `chunksReceived` accounting + 0-chunk / >0-chunk boundary
  *   - Socket-close reclassification (ADR 0008)
  *   - AbortError routing by `abortReason`
+ *   - Commit-window retry loop (ArchCom §3.4): silent in-window retries,
+ *     terminal CIE after the window, zero-byte extra visible attempt —
+ *     the window STATE lives in `commitWindow.ts` (provider-owned), the
+ *     retry DECISION and the shared POST budget live here
  *   - `finally` cleanup + `resolve*` helpers + constants
  *
  * The CLIENT owns (endpoint-specific):
@@ -61,6 +65,11 @@
 
 import type { CancellationToken } from 'vscode';
 import * as vscode from 'vscode';
+import {
+  COMMIT_WINDOW_CONTROLLER,
+  type CommitWindowController,
+  type CommitWindowedCallbacks,
+} from './commitWindow.js';
 import { httpRequest, type HttpResponseLike } from './httpClient.js';
 import { logger, redactSensitive } from './logger.js';
 import type { StreamCallbacks } from './protocolTypes.js';
@@ -76,26 +85,23 @@ import {
   withRetry,
 } from './retry.js';
 
-/**
- * Mid-stream retry threshold. When a `ConnectionInterruptedError`
- * occurs with `chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS`, the
- * entire `readStream` (fetch + stream body) is retried from scratch.
- * Already-streamed tokens are lost (the caller receives them again on
- * retry), but this is far better than crashing subagents on every
- * server-side socket reset.
- *
- * Ollama Cloud regularly closes streams after 2-9 chunks (ECONNRESET
- * during generation). Without mid-stream retry, every long subagent
- * request that hits this server instability fails terminally.
- *
- * 50 chunks is a conservative threshold: long reasoning model outputs
- * (hundreds of chunks) are NOT retried (too much lost); short tool-call
- * responses (1-10 chunks) ARE retried (minimal loss, high recovery
- * rate). Subagent tool-call streams are the primary beneficiary.
- */
-const MID_STREAM_RETRY_MAX_CHUNKS = 50;
-const MID_STREAM_RETRY_MAX_ATTEMPTS = 3;
-const MID_STREAM_RETRY_BASE_DELAY_MS = 1000;
+// ArchCom 2026-09-14 §3.4 (commit-window, 0.15.x) — the 50-chunk
+// `MID_STREAM_RETRY_MAX_CHUNKS` threshold is ABOLISHED. The only silent
+// mid-stream auto-retry boundary is now TIME-based: a
+// `ConnectionInterruptedError` is retried silently while the
+// commit-window is open (first ~5 s of deltas, nothing flushed to the
+// user yet — the provider attaches the window controller to the
+// callbacks, see `src/commitWindow.ts`). After the window closes, CIE
+// is terminal everywhere: an honest error + manual user retry, because
+// a retry after visible output would duplicate already-shown text.
+//
+// Hidden (in-window) retries share the per-message POST budget
+// (MAX_POST_BUDGET_PER_MESSAGE) — the budget, not a fixed attempt
+// count, is the cap. Backoff keeps the ArchCom train-A jitter rule
+// (base * 2^retry * uniform(0.75..1.25)), capped so a flapping server
+// cannot stack exponentially longer invisible waits inside one budget.
+const COMMIT_WINDOW_RETRY_BASE_DELAY_MS = 1000;
+const COMMIT_WINDOW_RETRY_MAX_DELAY_MS = 10_000;
 
 // ArchCom 2026-09-14 (train A) — idle-kill classification. The known
 // Ollama Cloud issue ollama/ollama#16108 drops streams after
@@ -255,34 +261,49 @@ export interface StreamReaderOptions {
  * `ollamaClient.streamChat` and `responsesClient.streamResponses`.
  */
 /**
- * Mid-stream retry wrapper around `readStreamOnce`. When the server
- * closes the stream mid-generation (`ConnectionInterruptedError`)
- * with a small number of chunks, the entire fetch+stream is retried.
- * Already-streamed tokens are lost (caller receives them again), but
- * this prevents subagent crashes on server-side socket resets.
+ * Commit-window retry wrapper around `readStreamOnce` (ArchCom
+ * 2026-09-14 §3.4, replaces the former 50-chunk threshold loop).
  *
- * Retry conditions:
- *   - Error is `ConnectionInterruptedError`
- *   - `chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS` (50)
- *   - Caller has NOT cancelled
- *   - Attempt < `MID_STREAM_RETRY_MAX_ATTEMPTS` (3)
+ * Retry policy — the ONLY silent auto-retry boundary is the
+ * commit-window (time-based, `src/commitWindow.ts`):
  *
- * Non-retryable errors (MidStreamError, HttpError, MaxDurationError,
- * ZeroByteSocketCloseError, cancel, buffer overrun) pass through
- * unchanged — they are either retried by `withRetry` (connect phase)
- * or genuinely terminal (server error, user cancel).
+ *   - `ConnectionInterruptedError` while the window is open (nothing
+ *     flushed to the user) → SILENT retry: buffer reset via the window
+ *     controller, jittered backoff, hidden-retry counter surfaced in
+ *     diagnostics only (logger.warn + the runStream report field). No
+ *     `onNotice` — the user must not see a duplicate prefix or flicker.
+ *   - `ConnectionInterruptedError` after the window closed → TERMINAL.
+ *     Honest error, manual user retry. There is no chunk-count
+ *     threshold anymore — visibility, not volume, decides.
+ *   - `ZeroByteSocketCloseError` thrown out of `withRetry` (connect-
+ *     phase retries exhausted, non-idle <90 s close with 0 chunks —
+ *     nothing shown by construction) → ONE additional VISIBLE attempt
+ *     announced via `onNotice`, then terminal (ArchCom design
+ *     condition). Connect-phase ZeroByte retries inside `withRetry`
+ *     stay silent as before — that is not mid-stream.
+ *
+ * All hidden retries draw from the shared POST budget
+ * (`MAX_POST_BUDGET_PER_MESSAGE`); the loop terminates because every
+ * attempt consumes at least one budget unit before it can fail with a
+ * retryable class.
+ *
+ * Every other error (MidStreamError, HttpError, MaxDurationError,
+ * UpstreamIdleTimeoutError, PostBudgetExhaustedError, cancel, buffer
+ * overrun) passes through unchanged — terminal by classification.
  */
 export async function readStream(
   options: StreamReaderOptions,
   callbacks: StreamCallbacks,
 ): Promise<void> {
-  let lastError: unknown = null;
   // ArchCom 2026-09-14 (train A) — one shared POST budget across the
-  // mid-stream attempts below AND the connect-phase withRetry inside
-  // each attempt. Caps the worst case at 6 POSTs per user message
-  // (was up to 12 via nesting).
+  // commit-window retries below AND the connect-phase withRetry inside
+  // each attempt. Caps the worst case at 6 POSTs per user message.
   const budget = { remaining: MAX_POST_BUDGET_PER_MESSAGE };
-  for (let attempt = 0; attempt < MID_STREAM_RETRY_MAX_ATTEMPTS; attempt++) {
+  const commitWindow = getAttachedCommitWindow(callbacks);
+  let zeroByteExtraAttemptUsed = false;
+  let hiddenRetryCount = 0;
+  // Each attempt consumes ≥1 budget unit, so the loop is finite.
+  for (;;) {
     // Track chunks received THIS attempt — readStreamOnce updates
     // a local copy; we read it via a shared object.
     const attemptState = { chunksReceived: 0 };
@@ -290,52 +311,91 @@ export async function readStream(
       await readStreamOnce(options, callbacks, attemptState, budget);
       return; // success
     } catch (error) {
-      lastError = error;
-      // Retry only on ConnectionInterruptedError with few chunks.
-      const isCIE =
-        error instanceof ConnectionInterruptedError &&
-        attemptState.chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS;
-      const cancelled = options.cancellationToken?.isCancellationRequested === true;
-      logger.warn(`Mid-stream retry eval: attempt=${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS} isCIE=${isCIE} chunks=${attemptState.chunksReceived} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${(error as Error)?.constructor?.name}`);
-      if (
-        !isCIE ||
-        cancelled ||
-        budget.remaining <= 0 ||
-        attempt >= MID_STREAM_RETRY_MAX_ATTEMPTS - 1
-      ) {
-        throw error;
+      const cancelled =
+        options.cancellationToken?.isCancellationRequested === true;
+
+      if (error instanceof ConnectionInterruptedError) {
+        // Window open ⇔ nothing from this attempt reached the user.
+        // No window attached (plain callers/tests) ⇒ terminal: without
+        // a visibility owner there is no silent-retry boundary.
+        const windowOpen = commitWindow !== undefined && commitWindow.isOpen();
+        logger.warn(
+          `Mid-stream retry eval: chunks=${attemptState.chunksReceived} windowOpen=${windowOpen} hiddenRetry=${hiddenRetryCount} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${error.constructor.name}`,
+        );
+        if (!windowOpen || cancelled || budget.remaining <= 0) {
+          throw error;
+        }
+        hiddenRetryCount += 1;
+        // Reset the buffer BEFORE the retry so the discarded attempt's
+        // deltas can never leak into the user-visible stream.
+        commitWindow.onHiddenRetry();
+        // Exponential backoff: 1s, 2s, 4s... capped, with ±25% jitter
+        // (ArchCom 2026-09-14, Security condition): a systemic cloud
+        // incident would otherwise synchronize retries across requests.
+        const jitter = 0.75 + Math.random() * 0.5;
+        const delay = Math.round(
+          Math.min(
+            COMMIT_WINDOW_RETRY_BASE_DELAY_MS *
+              Math.pow(2, hiddenRetryCount - 1) *
+              jitter,
+            COMMIT_WINDOW_RETRY_MAX_DELAY_MS,
+          ),
+        );
+        logger.warn(
+          `Commit-window hidden retry ${hiddenRetryCount}: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks inside the window — buffer reset, user sees nothing. Retrying in ${delay}ms.`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
       }
-      // ArchCom 2026-09-14 (train A) — visible notice when the retry
-      // discards output the user has ALREADY seen: the retried stream
-      // restarts from scratch, so without this cue the re-shown prefix
-      // reads as duplicated/corrupted text. Transparent by design —
-      // no silent magic.
-      if (attemptState.chunksReceived > 0) {
+
+      if (error instanceof ZeroByteSocketCloseError) {
+        // Thrown out of `withRetry` ⇒ connect-phase retries exhausted
+        // (or maxRetries=0). 0 chunks ⇒ nothing was shown — the ArchCom
+        // §3.4 design condition grants ONE additional VISIBLE attempt,
+        // then terminal. No extra backoff: withRetry just ran its full
+        // exponential schedule; the visible notice explains the wait.
+        if (zeroByteExtraAttemptUsed || cancelled || budget.remaining <= 0) {
+          // Surface through the callback contract (same as the
+          // pre-window behaviour), then stop — readStreamOnce already
+          // handled socket teardown.
+          callbacks.onError(error);
+          return;
+        }
+        zeroByteExtraAttemptUsed = true;
         const notice =
-          `\n\n[Соединение потеряно после ${attemptState.chunksReceived} фрагментов — ` +
-          `перезапрашиваю ответ (попытка ${attempt + 2}/${MID_STREAM_RETRY_MAX_ATTEMPTS})]\n\n`;
+          '\n\n[Ответ так и не начался — делаю последнюю автоматическую попытку]\n\n';
         if (callbacks.onNotice) {
           callbacks.onNotice(notice);
         } else {
           // Doc contract: absent handler → the notice is logged, not
           // dropped (review P3-3г).
-          logger.warn(`Mid-stream retry notice (no onNotice handler): ${notice.trim()}`);
+          logger.warn(
+            `Zero-byte extra attempt notice (no onNotice handler): ${notice.trim()}`,
+          );
         }
+        logger.warn(
+          `Zero-byte close survived connect-phase retries — one extra visible attempt (budgetRemaining=${budget.remaining}).`,
+        );
+        continue;
       }
-      // Exponential backoff: 1s, 2s, 4s... with ±25% jitter
-      // (ArchCom 2026-09-14, Security condition): a systemic cloud
-      // incident would otherwise synchronize retries across requests.
-      const jitter = 0.75 + Math.random() * 0.5;
-      const delay = Math.round(
-        MID_STREAM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt) * jitter,
-      );
-      logger.warn(
-        `Mid-stream retry: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks (attempt ${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS}). Retrying in ${delay}ms.`,
-      );
-      await new Promise((resolve) => setTimeout(resolve, delay));
+
+      throw error;
     }
   }
-  throw lastError;
+}
+
+/**
+ * Discovers the commit-window controller the provider attached to the
+ * (wrapped) callbacks object. Plain callbacks — no window — return
+ * `undefined`, which means "no silent mid-stream retry boundary".
+ */
+function getAttachedCommitWindow(
+  callbacks: StreamCallbacks,
+): CommitWindowController | undefined {
+  const controller = (callbacks as CommitWindowedCallbacks)[
+    COMMIT_WINDOW_CONTROLLER
+  ];
+  return controller ?? undefined;
 }
 
 /**
@@ -847,6 +907,15 @@ async function readStreamOnce(
         throw new ConnectionInterruptedError(chunksReceived);
       }
       return;
+    }
+    // ArchCom 2026-09-14 §3.4 — a ZeroByteSocketCloseError reaching this
+    // fallthrough means `withRetry` exhausted its connect-phase retries
+    // (the probe reclassifies 0-chunk closes inside the wrapper). Throw
+    // it instead of surfacing via onError so `readStream` can apply the
+    // one-extra-visible-attempt policy; if no attempt is granted it
+    // delivers the error through the callback contract itself.
+    if (error instanceof ZeroByteSocketCloseError) {
+      throw error;
     }
     // Non-abort errors (HttpError, whitelist throw, buffer overrun,
     // MidStreamError thrown by the processLine callback) — surface

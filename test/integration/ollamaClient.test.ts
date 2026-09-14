@@ -758,9 +758,10 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
 
     const recorder = makeCallbacks();
     const client = new OllamaClient(BASE_URL, 'sk-test-key');
-    // Mid-stream retry: streamChat throws ConnectionInterruptedError after
-    // MID_STREAM_RETRY_MAX_ATTEMPTS retries fail (all 3 attempts hit the
-    // same socket close).
+    // ArchCom §3.4 (0.15.x): the 50-chunk mid-stream retry threshold is
+    // abolished. Without a commit-window attached to the callbacks
+    // (plain recorder here) a mid-stream socket close is TERMINAL on
+    // the first attempt: streamChat throws ConnectionInterruptedError.
     await assert.rejects(
       async () =>
         client.streamChat(
@@ -785,8 +786,8 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
         return true;
       },
     );
-    // The partial text was delivered before the socket closed (on each
-    // attempt — the retry re-streams it).
+    // The partial text was delivered before the socket closed (no
+    // window attached ⇒ nothing is buffered or retried away).
     assert.ok(recorder.text.length > 0, 'partial text was delivered');
 
     global.fetch = originalFetch;

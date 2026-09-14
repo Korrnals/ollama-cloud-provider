@@ -1,13 +1,18 @@
 /**
- * Review P2-2 (2026-09-14) — integration tests for the two central
- * behavioural claims of v0.14.x that the reviewer found untested:
+ * Review P2-2 (2026-09-14) — integration tests for the central
+ * behavioural claims of v0.14.x/v0.15.x:
  *
  *   1. Shared POST budget: total POST attempts across connect-phase
  *      withRetry retries are capped at MAX_POST_BUDGET_PER_MESSAGE (6),
  *      and exhaustion surfaces the typed PostBudgetExhaustedError (P2-1)
  *      — not a generic Error.
- *   2. onNotice: a mid-stream retry issued AFTER chunks were received
- *      emits exactly one visible notice; a retry at 0 chunks emits none.
+ *   2. Commit-window (ArchCom §3.4, 0.15.x): an EARLY break (inside
+ *      the ~5 s window, nothing flushed to the user) is retried
+ *      SILENTLY — exactly one retry, no visible notice, no duplicated
+ *      prefix. The former "visible notice on mid-stream retry" case is
+ *      gone by design: a break after the window is terminal (see
+ *      commitWindow.test.ts), so there is no post-shown retry left to
+ *      announce.
  */
 
 import { strict as assert } from 'node:assert';
@@ -16,6 +21,7 @@ import {
   readStream,
   MAX_POST_BUDGET_PER_MESSAGE,
 } from '../../src/streamReader.js';
+import { createCommitWindow } from '../../src/commitWindow.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 import { PostBudgetExhaustedError } from '../../src/retry.js';
 
@@ -104,8 +110,8 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
     assert.equal(fetchCalls, MAX_POST_BUDGET_PER_MESSAGE, 'budget is the binding cap');
   });
 
-  it('emits exactly one onNotice for a mid-stream retry after received chunks', async function () {
-    this.timeout(10000); // one retry backoff (~1s ± jitter) + stream time
+  it('retries an early break SILENTLY inside the commit window (no notice, no duplicate)', async function () {
+    this.timeout(10000); // one hidden-retry backoff (~1s ± jitter) + stream time
     let fetchCalls = 0;
     const notices: string[] = [];
     const texts: string[] = [];
@@ -113,10 +119,11 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
     globalThis.fetch = (async () => {
       fetchCalls += 1;
       if (fetchCalls === 1) {
-        // Attempt 1: one data chunk arrives (user sees it), then a raw
-        // socket close. The error is deferred so the queued chunk is
-        // delivered first (erroring a web stream in start() discards
-        // queued chunks per spec).
+        // Attempt 1: one data chunk arrives (buffered by the window,
+        // NOT shown), then a raw socket close 20ms in — inside the
+        // 60ms test window. The error is deferred so the queued chunk
+        // is delivered first (erroring a web stream in start()
+        // discards queued chunks per spec).
         const body = new ReadableStream<Uint8Array>({
           start(controller) {
             controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
@@ -136,7 +143,8 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
       return new Response(body, { status: 200 });
     }) as typeof fetch;
 
-    const callbacks: StreamCallbacks = {
+    let doneFlag = false;
+    const base: StreamCallbacks = {
       onText: (t) => texts.push(t),
       onToolCall: () => {},
       onDone: () => {
@@ -147,11 +155,15 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
       },
       onNotice: (n) => notices.push(n),
     };
-    let doneFlag = false;
+    // ArchCom §3.4 — attach the commit window (60ms test seam instead
+    // of the 5s default): the buffered 'partial' delta is RESET on the
+    // hidden retry and never reaches the user.
+    const win = createCommitWindow(60);
+    const callbacks = win.wrap(base);
 
     await readStream(
       {
-        logTag: 'notice-test',
+        logTag: 'silent-retry-test',
         url: 'https://ollama.com/v1/test',
         headers: {},
         body: '{}',
@@ -182,13 +194,12 @@ describe('Shared POST budget + onNotice (review P2-2)', () => {
       callbacks,
     );
 
-    assert.equal(fetchCalls, 2, 'exactly one retry');
+    assert.equal(fetchCalls, 2, 'exactly one hidden retry');
     assert.equal(doneFlag, true, 'second attempt completed the stream');
-    assert.equal(notices.length, 1, 'exactly one visible notice');
-    assert.ok(notices[0].includes('перезапрашиваю'), notices[0]);
-    // Both attempts' tokens reached the user (documented duplicate
-    // semantics until the 0.15.x commit-window lands).
-    assert.ok(texts.includes('partial'));
-    assert.ok(texts.includes('full answer'));
+    assert.equal(notices.length, 0, 'silent retry issues NO notice');
+    // Only the second attempt's tokens reached the user — the discarded
+    // prefix cannot leak, no duplication (the ArchCom §3.4 goal).
+    assert.deepEqual(texts, ['full answer']);
+    assert.equal(win.controller.hiddenRetryCount(), 1, 'disclosed in diagnostics');
   });
 });

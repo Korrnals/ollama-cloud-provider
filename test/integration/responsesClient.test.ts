@@ -456,8 +456,11 @@ describe('responsesClient.streamResponses — ADR 0008 socket-close classificati
 
     const recorder = makeCallbacks();
     const client = new ResponsesClient(BASE_URL, 'sk-test-key');
-    // Mid-stream retry: streamResponses throws ConnectionInterruptedError
-    // after MID_STREAM_RETRY_MAX_ATTEMPTS retries fail.
+    // ArchCom §3.4 (0.15.x): the 50-chunk mid-stream retry threshold is
+    // abolished. Without a commit-window attached to the callbacks
+    // (plain recorder here) a mid-stream socket close is TERMINAL on
+    // the first attempt: streamResponses throws
+    // ConnectionInterruptedError.
     await assert.rejects(
       async () =>
         client.streamResponses(
