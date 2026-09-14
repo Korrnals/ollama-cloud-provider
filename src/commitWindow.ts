@@ -75,7 +75,13 @@ export interface CommitWindowController {
    * hidden-retry counter.
    */
   onHiddenRetry(): void;
-  /** Number of hidden (silent) retries issued so far — diagnostics field. */
+  /**
+   * Number of hidden (silent) retries SCHEDULED so far — diagnostics
+   * field. P3-4b honesty note: a retry whose backoff was cancelled by
+   * the caller still counts (it was scheduled, its POST was never
+   * issued); the cancel-branch log line in `streamReader.ts` states
+   * this explicitly so the number is never misread as "POSTs issued".
+   */
   hiddenRetryCount(): number;
   /**
    * Flushes the buffer to the real callbacks immediately (idempotent).
@@ -211,6 +217,10 @@ export function createCommitWindow(
         },
         onUsage: (usage) => {
           // Pure diagnostics (token EMA + audit log) — never buffered.
+          // P3-4c: a usage from an attempt that a hidden retry then
+          // discards would pass straight through and be counted by the
+          // EMA twice — unreachable in practice, because `usage` rides
+          // the terminal chunk and a broken attempt never receives it.
           callbacks.onUsage?.(usage);
         },
         onDone: () => {

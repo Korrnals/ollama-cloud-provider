@@ -308,7 +308,11 @@ export interface StreamReaderOptions {
  *     nothing shown by construction) → ONE additional VISIBLE attempt
  *     announced via `onNotice`, then terminal (ArchCom design
  *     condition). Connect-phase ZeroByte retries inside `withRetry`
- *     stay silent as before — that is not mid-stream.
+ *     stay silent as before — that is not mid-stream. P3-2 (2026-09-15
+ *     review): 0-chunk closes classified INSIDE `readStreamOnce` (bare
+ *     AbortError / raw socket-close escaping `withRetry`) are re-thrown
+ *     as `ZeroByteSocketCloseError` instead of a direct `onError`, so
+ *     they follow this SAME policy — exactly one retry path per class.
  *
  * All hidden retries draw from the shared POST budget
  * (`MAX_POST_BUDGET_PER_MESSAGE`); the loop terminates because every
@@ -329,7 +333,12 @@ export async function readStream(
   const budget = { remaining: MAX_POST_BUDGET_PER_MESSAGE };
   const commitWindow = getAttachedCommitWindow(callbacks);
   let zeroByteExtraAttemptUsed = false;
-  let hiddenRetryCount = 0;
+  // P3-4a (2026-09-15 review) — the hidden-retry counter has ONE owner:
+  // the commit-window controller (`onHiddenRetry()` increments,
+  // `hiddenRetryCount()` reads). No local mirror — the retry ordinal for
+  // the backoff schedule is read from the controller right after the
+  // increment, so diagnostics (provider `commitWindowHiddenRetries=`,
+  // the warn lines here) and the schedule can never diverge.
   // Each attempt consumes ≥1 budget unit, so the loop is finite.
   for (;;) {
     // Review fix P1-1 — reset client-owned protocol state (pending
@@ -353,15 +362,18 @@ export async function readStream(
         // a visibility owner there is no silent-retry boundary.
         const windowOpen = commitWindow !== undefined && commitWindow.isOpen();
         logger.warn(
-          `Mid-stream retry eval: chunks=${attemptState.chunksReceived} windowOpen=${windowOpen} hiddenRetry=${hiddenRetryCount} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${error.constructor.name}`,
+          `Mid-stream retry eval: chunks=${attemptState.chunksReceived} windowOpen=${windowOpen} hiddenRetry=${commitWindow?.hiddenRetryCount() ?? 0} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${error.constructor.name}`,
         );
         if (!windowOpen || cancelled || budget.remaining <= 0) {
           throw error;
         }
-        hiddenRetryCount += 1;
         // Reset the buffer BEFORE the retry so the discarded attempt's
-        // deltas can never leak into the user-visible stream.
+        // deltas can never leak into the user-visible stream. The same
+        // call increments the controller-owned hidden-retry counter
+        // (P3-4a single source of truth) — read it back for the retry
+        // ordinal driving the backoff schedule below.
         commitWindow.onHiddenRetry();
+        const retryOrdinal = commitWindow.hiddenRetryCount();
         // Exponential backoff: 1s, 2s, 4s... capped, with ±25% jitter
         // (ArchCom 2026-09-14, Security condition): a systemic cloud
         // incident would otherwise synchronize retries across requests.
@@ -369,13 +381,13 @@ export async function readStream(
         const delay = Math.round(
           Math.min(
             COMMIT_WINDOW_RETRY_BASE_DELAY_MS *
-              Math.pow(2, hiddenRetryCount - 1) *
+              Math.pow(2, retryOrdinal - 1) *
               jitter,
             COMMIT_WINDOW_RETRY_MAX_DELAY_MS,
           ),
         );
         logger.warn(
-          `Commit-window hidden retry ${hiddenRetryCount}: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks inside the window — buffer reset, user sees nothing. Retrying in ${delay}ms.`,
+          `Commit-window hidden retry ${retryOrdinal}: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks inside the window — buffer reset, user sees nothing. Retrying in ${delay}ms.`,
         );
         // Review fix P2-2 — the backoff is interruptible: race the
         // delay against caller cancellation (same pattern as the
@@ -390,8 +402,13 @@ export async function readStream(
           options.cancellationToken,
         );
         if (!slept) {
+          // P3-4b — the controller counter (incremented by
+          // onHiddenRetry above) counts SCHEDULED retries. Cancellation
+          // killed this one BEFORE its POST was issued (no budget
+          // burned); the log states that explicitly so the
+          // diagnostics number is never misread as "POSTs issued".
           logger.warn(
-            'Commit-window hidden retry backoff interrupted by caller cancellation — completing quietly (onDone).',
+            `Commit-window hidden retry ${commitWindow.hiddenRetryCount()} was scheduled but cancelled before the POST was issued (no budget burned) — completing quietly (onDone).`,
           );
           callbacks.onDone();
           return;
@@ -926,8 +943,13 @@ async function readStreamOnce(
           callbacks.onError(idle);
           return;
         }
-        callbacks.onError(new ZeroByteSocketCloseError());
-        return;
+        // P3-2 (2026-09-15 review) — THROW, not callbacks.onError: this
+        // non-idle 0-chunk bare close must follow the same
+        // one-extra-visible-attempt policy in `readStream` as a
+        // ZeroByteSocketCloseError thrown out of `withRetry`. The
+        // pre-fix direct `onError` bypassed the policy (inconsistent
+        // with the probe path). Idle stays terminal here.
+        throw new ZeroByteSocketCloseError();
       }
       if (abortReason === null && chunksReceived > 0) {
         // Mid-stream retry: throw instead of callbacks.onError so the
@@ -983,7 +1005,12 @@ async function readStreamOnce(
           callbacks.onError(idle);
           return;
         }
-        callbacks.onError(new ZeroByteSocketCloseError());
+        // P3-2 (2026-09-15 review) — THROW, not callbacks.onError: a
+        // raw 0-chunk socket-close that escaped `withRetry` (retries
+        // exhausted there) must follow the same one-extra-visible-
+        // attempt policy in `readStream` as the probe-path ZeroByte.
+        // The pre-fix direct `onError` bypassed the policy.
+        throw new ZeroByteSocketCloseError();
       } else {
         // ArchCom 2026-09-14 (train A) — long silence before the close
         // means a deterministic idle kill: terminal, not retried.
@@ -999,7 +1026,8 @@ async function readStreamOnce(
         // retry wrapper in `readStream` can catch and retry.
         throw new ConnectionInterruptedError(chunksReceived);
       }
-      return;
+      // P3-2: both chunksReceived branches above now end in
+      // return/throw — nothing reaches past the if/else.
     }
     // ArchCom 2026-09-14 §3.4 — a ZeroByteSocketCloseError reaching this
     // fallthrough means `withRetry` exhausted its connect-phase retries

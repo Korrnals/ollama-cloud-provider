@@ -9,6 +9,9 @@
  *   - Connect timeout → ConnectTimeoutError → retry → success
  *   - Caller cancel mid-stream → onDone (not onError)
  *   - Socket close at 0 chunks → ZeroByteSocketCloseError
+ *   - P3-2: 0-chunk closes classified outside the probe (bare
+ *     AbortError / raw socket-close escaping withRetry) follow the
+ *     same one-extra-visible-attempt policy as the probe path
  *   - Socket close at >0 chunks → ConnectionInterruptedError
  *   - Buffer overrun → onError with bounded message
  *   - Cancel-during-async-setup race (synchronous isCancellationRequested)
@@ -95,14 +98,17 @@ function wireAbortSignal(
  */
 function makeCallbacks(): StreamCallbacks & {
   text: string[];
+  notices: string[];
   errors: Error[];
   doneCount: number;
 } {
   const text: string[] = [];
+  const notices: string[] = [];
   const errors: Error[] = [];
   const state = { doneCount: 0 };
   return {
     text,
+    notices,
     errors,
     get doneCount() {
       return state.doneCount;
@@ -113,6 +119,7 @@ function makeCallbacks(): StreamCallbacks & {
       state.doneCount += 1;
     },
     onError: (e) => errors.push(e),
+    onNotice: (t) => notices.push(t),
   };
 }
 
@@ -428,6 +435,107 @@ describe('streamReader.readStream — module contract', () => {
       fetchCalls,
       2,
       'initial attempt + exactly one extra visible attempt',
+    );
+    assert.equal(
+      recorder.errors.length,
+      1,
+      'onError must fire after the extra attempt fails',
+    );
+    assert.ok(
+      recorder.errors[0] instanceof ZeroByteSocketCloseError,
+      'error must be ZeroByteSocketCloseError',
+    );
+
+    global.fetch = originalFetch;
+  });
+
+  // -------------------------------------------------------------------------
+  // P3-2 (2026-09-15 review) — ZeroByte path unification. The
+  // one-extra-visible-attempt policy must ALSO apply to non-idle 0-chunk
+  // closes classified OUTSIDE the probe. The pre-fix code surfaced these
+  // via a direct `callbacks.onError(new ZeroByteSocketCloseError())`,
+  // bypassing the policy that a probe-path ZeroByte gets:
+  //   (a) a BARE AbortError (no abortReason tag — not caller-cancel, not
+  //       max-duration; message is not socket-close framing) rejecting
+  //       the probe read;
+  //   (b) a RAW socket-close error ESCAPING withRetry (retries exhausted
+  //       — maxRetries=0 here) before any headers arrive.
+  // Both must now behave exactly like the probe-path ZeroByte: ONE extra
+  // VISIBLE attempt (announced via onNotice), then terminal.
+  // -------------------------------------------------------------------------
+
+  it('applies the one-extra-visible-attempt policy to a bare AbortError 0-chunk close (P3-2)', async () => {
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      // 200 + headers, then the FIRST read (the probe inside withRetry)
+      // rejects with a bare AbortError: no cancellation token and no
+      // max-duration fire → abortReason === null, and the message is
+      // not socket-close framing, so the probe passes it through raw.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const err = new Error('The operation was aborted');
+          err.name = 'AbortError';
+          controller.error(err);
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    await readStream(makeBaseOptions(), recorder);
+
+    assert.equal(
+      fetchCalls,
+      2,
+      'bare AbortError 0-chunk close: initial attempt + exactly one extra visible attempt',
+    );
+    assert.equal(
+      recorder.notices.length,
+      1,
+      'the extra attempt must be announced via onNotice (visible attempt)',
+    );
+    assert.equal(
+      recorder.errors.length,
+      1,
+      'onError must fire after the extra attempt fails',
+    );
+    assert.ok(
+      recorder.errors[0] instanceof ZeroByteSocketCloseError,
+      'error must be ZeroByteSocketCloseError',
+    );
+
+    global.fetch = originalFetch;
+  });
+
+  it('applies the one-extra-visible-attempt policy to a raw socket-close escaping withRetry (P3-2)', async () => {
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      // Connect-phase raw socket-close (libuv ECONNRESET) — fetch itself
+      // rejects, no headers arrive. With maxRetries=0, withRetry throws
+      // the RAW error on its first attempt; readStreamOnce reclassifies
+      // the 0-chunk case and the readStream policy (not a direct
+      // onError) decides what follows.
+      const err = new Error('read ECONNRESET');
+      (err as { code?: string }).code = 'ECONNRESET';
+      throw err;
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    await readStream(makeBaseOptions(), recorder);
+
+    assert.equal(
+      fetchCalls,
+      2,
+      'raw socket-close 0-chunk: initial attempt + exactly one extra visible attempt',
+    );
+    assert.equal(
+      recorder.notices.length,
+      1,
+      'the extra attempt must be announced via onNotice (visible attempt)',
     );
     assert.equal(
       recorder.errors.length,

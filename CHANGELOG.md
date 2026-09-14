@@ -5,6 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Fixed
+- **Unified zero-byte retry policy (P3-2)** — a non-idle 0-chunk close classified inside `readStreamOnce` (a bare `AbortError` rejecting the first read, or a raw socket-close error escaping `withRetry` after exhausted connect retries) surfaced via `onError` directly, bypassing the "one extra visible attempt" policy that probe-path zero-byte closes already get. Both paths now re-throw `ZeroByteSocketCloseError`, so every zero-byte terminal follows the same policy: exactly one announced extra attempt, then a terminal error. Cancel / max-duration / idle-kill branches are unchanged.
+
+### Changed
+- **Hidden-retry counter cleanup (P3-4)** — the commit-window controller is now the single owner of the hidden-retry counter: `readStream`'s local mirror is removed, and both the backoff ordinal and the warn lines read `hiddenRetryCount()` (same source as the `commitWindowHiddenRetries=` field in `Stream done`/`Stream error`). The counter counts SCHEDULED retries — a backoff cancelled by the caller still counts one; the cancel-branch log now states honestly that the retry "was scheduled but cancelled before the POST was issued (no budget burned)".
+
 ## [0.16.0] - 2026-09-14
 
 Commit-window — silent early-break healing, 50-chunk mid-stream retry threshold abolished (ArchCom 2026-09-14 §3.4) — plus gate M-package hardening of `/api/show` capability probing and the commit-window review remediation (fix-then-ship). Stream breaks inside the first ~5 s now heal invisibly; after the window a break is terminal and honest: visibility, not chunk volume, decides retryability.
