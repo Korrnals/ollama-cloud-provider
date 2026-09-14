@@ -364,7 +364,25 @@ export async function readStream(
         logger.warn(
           `Commit-window hidden retry ${hiddenRetryCount}: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks inside the window — buffer reset, user sees nothing. Retrying in ${delay}ms.`,
         );
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        // Review fix P2-2 — the backoff is interruptible: race the
+        // delay against caller cancellation (same pattern as the
+        // max-duration timer racing the reader loop). Without the race
+        // a cancelled request kept the user's stream pending silently
+        // for up to the full capped delay (10 s) before the next
+        // attempt noticed the token. On cancel: immediate quiet
+        // completion (the same onDone branch the cancel path inside
+        // readStreamOnce takes) — no further attempt, no budget burn.
+        const slept = await sleepInterruptibly(
+          delay,
+          options.cancellationToken,
+        );
+        if (!slept) {
+          logger.warn(
+            'Commit-window hidden retry backoff interrupted by caller cancellation — completing quietly (onDone).',
+          );
+          callbacks.onDone();
+          return;
+        }
         continue;
       }
 
@@ -416,6 +434,39 @@ function getAttachedCommitWindow(
     COMMIT_WINDOW_CONTROLLER
   ];
   return controller ?? undefined;
+}
+
+/**
+ * Review fix P2-2 — backoff sleep that yields immediately when the
+ * caller cancels. Resolves `true` after the full delay, `false` as
+ * soon as `cancellationToken` fires (or when it is ALREADY cancelled —
+ * checked synchronously so a cancel racing the call cannot be missed).
+ * The cancellation listener is always disposed — a resolved promise
+ * must not leak an event subscription onto the caller's token.
+ */
+function sleepInterruptibly(
+  delayMs: number,
+  cancellationToken: CancellationToken | undefined,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (!cancellationToken) {
+      setTimeout(() => resolve(true), delayMs);
+      return;
+    }
+    if (cancellationToken.isCancellationRequested) {
+      resolve(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      subscription.dispose();
+      resolve(true);
+    }, delayMs);
+    const subscription = cancellationToken.onCancellationRequested(() => {
+      subscription.dispose();
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
 }
 
 /**

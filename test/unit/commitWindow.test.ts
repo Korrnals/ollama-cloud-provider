@@ -434,4 +434,55 @@ describe('commitWindow + readStream integration (ArchCom §3.4)', () => {
     assert.equal(recorded.done, false);
     assert.equal(win.controller.hiddenRetryCount(), 0, 'zero-byte path is not a hidden window retry');
   });
+
+  it('caller cancellation interrupts the hidden-retry backoff → immediate quiet onDone (P2-2)', async function () {
+    this.timeout(5000);
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      // Attempt 1: one delta, then a socket close 20ms in — inside the
+      // 60ms window → hidden retry with a ~1s (±25%) backoff.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
+          setTimeout(() => controller.error(socketCloseError()), 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(60);
+    const wrapped = win.wrap(callbacks);
+    const source = new vscode.CancellationTokenSource();
+
+    const startedAt = Date.now();
+    // Cancel 150ms in: attempt 1 has failed (~20ms), the hidden-retry
+    // backoff (750-1250ms) is running. Without the interruptible
+    // sleep the stream would stay pending until the FULL backoff
+    // elapsed and the next attempt noticed the token.
+    setTimeout(() => source.cancel(), 150);
+
+    await readStream(
+      {
+        logTag: 'cw-cancel-test',
+        url: 'https://ollama.com/v1/test',
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: sseProcessLine(wrapped),
+      },
+      wrapped,
+    );
+    const elapsed = Date.now() - startedAt;
+
+    assert.ok(
+      elapsed < 600,
+      `cancellation must cut the backoff immediately (took ${elapsed}ms; backoff alone is >=750ms)`,
+    );
+    assert.equal(recorded.done, true, 'quiet completion (onDone branch)');
+    assert.equal(recorded.error, undefined, 'a cancel is not an error');
+    assert.equal(fetchCalls, 1, 'no second POST after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 1, 'the hidden retry was scheduled');
+  });
 });
