@@ -31,8 +31,12 @@ interface FetchCall {
   init?: RequestInit;
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status });
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  headers?: Record<string, string>,
+): Response {
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
 describe('capabilityProbe.probeModelShow (ArchCom 2026-09-14 train B)', () => {
@@ -146,6 +150,31 @@ describe('capabilityProbe.probeModelShow (ArchCom 2026-09-14 train B)', () => {
     }) as typeof fetch;
     const outcome = await probeModelShow('huge-model', CLOUD_CTX);
     assert.equal(outcome.source, 'invalid');
+  });
+
+  it('rejects an oversized Content-Length WITHOUT reading the body (M3)', async () => {
+    let bodyReads = 0;
+    globalThis.fetch = (async () => {
+      const res = jsonResponse({ capabilities: ['completion'] }, 200, {
+        // Small actual body, oversized DECLARED size — proves the pre-check
+        // fires on the header alone.
+        'Content-Length': String(70_000),
+      });
+      // Response#text is typed read-only; shadow it via defineProperty so
+      // the spy only fires if the probe actually reads the body.
+      const originalText = res.text.bind(res);
+      Object.defineProperty(res, 'text', {
+        value: async () => {
+          bodyReads += 1;
+          return originalText();
+        },
+      });
+      return res;
+    }) as typeof fetch;
+
+    const outcome = await probeModelShow('declared-huge-model', CLOUD_CTX);
+    assert.equal(outcome.source, 'invalid');
+    assert.equal(bodyReads, 0, 'body must not be read when Content-Length is oversized');
   });
 
   it('propagates an SSRF guard block as a throw (terminal, not a fallback)', async () => {

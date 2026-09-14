@@ -157,6 +157,20 @@ export async function probeModelShow(
       return { apiModel, source: 'unavailable' };
     }
 
+    // M3 (gate M-package) — Content-Length pre-check BEFORE reading the
+    // body: a declared-oversized reply is discarded without pulling the
+    // payload into memory. The res.text() size cap below stays as
+    // defence-in-depth (a lying or absent Content-Length still gets
+    // caught after the read). Absent/garbage header → NaN → falls
+    // through to the read-path cap.
+    const declaredLength = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > PROBE_MAX_RESPONSE_BYTES) {
+      logger.warn(
+        `capability-probe: ${apiModel} declared Content-Length ${declaredLength} exceeds ${PROBE_MAX_RESPONSE_BYTES} bytes — discarded without reading body`,
+      );
+      return { apiModel, source: 'invalid' };
+    }
+
     const text = await res.text();
     if (text.length > PROBE_MAX_RESPONSE_BYTES) {
       logger.warn(
