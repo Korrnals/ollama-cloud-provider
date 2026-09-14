@@ -14,7 +14,11 @@ import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
 import { isModelKnownRetired } from './capabilityCache.js';
-import { createProductionSsrfGuard, type SsrfGuard } from './ssrfGuard.js';
+import {
+  createProductionSsrfGuard,
+  SsrfBlockedError,
+  type SsrfGuard,
+} from './ssrfGuard.js';
 import {
   probeCapabilities,
   type ProbedCapabilities,
@@ -884,12 +888,23 @@ async function applyCapabilityProbing(
       `capability-probe: connection='${ctx.connectionId}' probed=${unknown.length} ok=${probed.size} fallback=${unknown.length - probed.size}`,
     );
   } catch (error) {
-    // Terminal probe failure (e.g. SsrfBlockedError) — the refresh must
-    // survive with snapshot/heuristic fallbacks, but the cause is loud.
-    logger.warn(
-      `capability-probe: connection='${ctx.connectionId}' aborted (${(error as Error)?.constructor?.name ?? 'unknown'}) — falling back to snapshot/heuristics`,
-      error,
-    );
+    // Terminal probe failure — the refresh must survive with snapshot/
+    // heuristic fallbacks, but the cause is loud. M4 (gate M-package):
+    // an SsrfBlockedError is a security-relevant block (the probe target
+    // resolved into a forbidden range — hostile or misrouted connection
+    // config), so it escalates to logger.error; every other abort stays
+    // a warn (operational noise: DNS failure, malformed URL, etc.).
+    if (error instanceof SsrfBlockedError) {
+      logger.error(
+        `capability-probe: connection='${ctx.connectionId}' aborted (SsrfBlockedError) — falling back to snapshot/heuristics`,
+        error,
+      );
+    } else {
+      logger.warn(
+        `capability-probe: connection='${ctx.connectionId}' aborted (${(error as Error)?.constructor?.name ?? 'unknown'}) — falling back to snapshot/heuristics`,
+        error,
+      );
+    }
   }
 }
 
