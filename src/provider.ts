@@ -1969,6 +1969,28 @@ ${errorLines}
     // `readStream`. Hidden-retry count goes into the report lines below
     // (diagnostics disclosure of otherwise-silent retries).
     const commitWindow = createCommitWindow();
+    // Review fix P3-1 (commit-window remediation) — one terminal-error
+    // log line per stream, covering BOTH surfacing paths: the onError
+    // callback AND thrown errors that reject via the safety-net catch
+    // (a terminal ConnectionInterruptedError after the window is
+    // THROWN by readStream, never passes through onError, and used to
+    // bypass this log entirely). The guard flag prevents a duplicate
+    // line when a client both calls onError and rejects its promise.
+    let terminalErrorLogged = false;
+    const logStreamError = (error: Error): void => {
+      if (terminalErrorLogged) {
+        return;
+      }
+      terminalErrorLogged = true;
+      const durationMs = Date.now() - startedAt;
+      const status =
+        error instanceof HttpError ? ` status=${error.status}` : '';
+      const ref = errorRefId(error);
+      logger.error(
+        `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name} commitWindowHiddenRetries=${commitWindow.controller.hiddenRetryCount()} ref=${ref}`,
+        error,
+      );
+    };
     await new Promise<void>((resolve, reject) => {
       void invoke(commitWindow.wrap({
         onText: (text: string) => {
@@ -2070,14 +2092,9 @@ ${errorLines}
           // The ref is generated here (not in `classifyStreamError`)
           // so it is available in the log even when the error is later
           // re-classified or re-wrapped by the caller.
-          const durationMs = Date.now() - startedAt;
-          const status =
-            error instanceof HttpError ? ` status=${error.status}` : '';
-          const ref = errorRefId(error);
-          logger.error(
-            `Stream error: model="${modelLabel}" duration=${durationMs}ms${status} class=${error.constructor.name} commitWindowHiddenRetries=${commitWindow.controller.hiddenRetryCount()} ref=${ref}`,
-            error,
-          );
+          // P3-1: the logging itself lives in logStreamError (shared
+          // with the thrown-error path, duplicate-guarded).
+          logStreamError(error);
           reject(error);
         },
         // ArchCom 2026-09-14 — surface VISIBLE stream notices inline:
@@ -2092,11 +2109,18 @@ ${errorLines}
         // Safety net: if the client rejects its own promise instead
         // of calling onError (shouldn't happen, but defence-in-depth),
         // surface it as a rejection so the caller's try/catch fires.
-        // Flush the commit-window first: a thrown terminal error (e.g.
-        // CIE after the window, MidStreamError) must not discard
-        // already-received tokens the user was billed for.
+        // P3-1: a thrown terminal error (post-window CIE, budget
+        // exhaustion) NEVER passes through onError — log it here so
+        // every failed stream leaves exactly one `Stream error` line
+        // (logStreamError is duplicate-guarded against the onError
+        // path). Flush the commit-window first: a thrown terminal
+        // error must not discard already-received tokens the user was
+        // billed for.
         commitWindow.controller.flush();
-        reject(error instanceof Error ? error : new Error(String(error)));
+        const normalized =
+          error instanceof Error ? error : new Error(String(error));
+        logStreamError(normalized);
+        reject(normalized);
       });
     });
   }
