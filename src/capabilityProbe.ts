@@ -49,7 +49,22 @@ export interface ProbedCapabilities {
 export interface ProbeOutcome {
   apiModel: string;
   capabilities?: ProbedCapabilities;
+  /**
+   * M1 (gate M-package) — server-reported `modified_at` for the model
+   * (date string), when /api/show carries one. Metadata for cache
+   * staleness diagnostics only.
+   */
+  modifiedAt?: string;
   source: 'api-show' | 'unavailable' | 'invalid' | 'rate-limited';
+}
+
+/**
+ * M1 (gate M-package) — probeCapabilities result entry: the probed
+ * capabilities plus the server-reported `modified_at` (when present).
+ */
+export interface ProbeResult {
+  capabilities: ProbedCapabilities;
+  modifiedAt?: string;
 }
 
 /** Connection-scoped context for a probe batch. */
@@ -84,8 +99,15 @@ const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
  * resets on extension restart — acceptable per contract (capabilities for
  * a fixed model id are near-immutable; the TTL bounds staleness when the
  * upstream ships a new revision under the same id).
+ *
+ * M1 (gate M-package): entries also store the server-reported
+ * `modified_at`. It is recorded for staleness diagnostics ONLY — full
+ * digest-based invalidation (re-probe when `modified_at` changes under
+ * the same model id) is deliberately NOT implemented; see the gate
+ * M-package backlog item "M1-full: digest invalidation on modified_at
+ * change".
  */
-const cache = new Map<string, { caps: ProbedCapabilities; expiresAt: number }>();
+const cache = new Map<string, { result: ProbeResult; expiresAt: number }>();
 
 /**
  * M2 (gate M-package) — per-connection 429 backoff. When a probe batch
@@ -126,7 +148,7 @@ function cacheKey(ctx: ProbeContext, apiModel: string): string {
   return `${ctx.connectionId}::${apiModel}`;
 }
 
-function readCache(ctx: ProbeContext, apiModel: string): ProbedCapabilities | undefined {
+function readCache(ctx: ProbeContext, apiModel: string): ProbeResult | undefined {
   const entry = cache.get(cacheKey(ctx, apiModel));
   if (!entry) {
     return undefined;
@@ -135,12 +157,12 @@ function readCache(ctx: ProbeContext, apiModel: string): ProbedCapabilities | un
     cache.delete(cacheKey(ctx, apiModel));
     return undefined;
   }
-  return entry.caps;
+  return entry.result;
 }
 
-function writeCache(ctx: ProbeContext, apiModel: string, caps: ProbedCapabilities): void {
+function writeCache(ctx: ProbeContext, apiModel: string, result: ProbeResult): void {
   cache.set(cacheKey(ctx, apiModel), {
-    caps,
+    result,
     expiresAt: Date.now() + PROBE_CACHE_TTL_MS,
   });
 }
@@ -213,9 +235,9 @@ export async function probeModelShow(
       return { apiModel, source: 'invalid' };
     }
 
-    let parsed: { capabilities?: unknown };
+    let parsed: { capabilities?: unknown; modified_at?: unknown };
     try {
-      parsed = JSON.parse(text) as { capabilities?: unknown };
+      parsed = JSON.parse(text) as { capabilities?: unknown; modified_at?: unknown };
     } catch {
       return { apiModel, source: 'invalid' };
     }
@@ -231,7 +253,14 @@ export async function probeModelShow(
       reasoning: values.has('thinking'),
       toolCalling: values.has('tools'),
     };
-    return { apiModel, capabilities: caps, source: 'api-show' };
+    // M1 (gate M-package) — `modified_at` is optional; keep it only when
+    // it is a string holding a parseable date (garbage → undefined).
+    const modifiedAt =
+      typeof parsed.modified_at === 'string' &&
+      !Number.isNaN(Date.parse(parsed.modified_at))
+        ? parsed.modified_at
+        : undefined;
+    return { apiModel, capabilities: caps, modifiedAt, source: 'api-show' };
   } catch (error) {
     // Network error / timeout / abort — single attempt, degrade quietly.
     logger.debug(
@@ -251,14 +280,16 @@ export async function probeModelShow(
  * 429 also benches the connection (Retry-After, 60 s default) — batches
  * arriving while benched are skipped entirely (empty result + warn).
  *
- * Returns the map of successfully probed capabilities only (failures are
- * absent — the caller falls back to snapshot/heuristics for those ids).
+ * Returns the map of successfully probed results only (failures are
+ * absent — the caller falls back to snapshot/heuristics for those ids);
+ * each entry carries the capabilities plus the server-reported
+ * `modified_at` when present (M1, gate M-package).
  */
 export async function probeCapabilities(
   apiModels: readonly string[],
   ctx: ProbeContext,
-): Promise<Map<string, ProbedCapabilities>> {
-  const result = new Map<string, ProbedCapabilities>();
+): Promise<Map<string, ProbeResult>> {
+  const result = new Map<string, ProbeResult>();
   if (apiModels.length === 0) {
     return result;
   }
@@ -309,8 +340,12 @@ export async function probeCapabilities(
         return;
       }
       if (outcome.capabilities) {
-        result.set(id, outcome.capabilities);
-        writeCache(ctx, id, outcome.capabilities);
+        const entry: ProbeResult = {
+          capabilities: outcome.capabilities,
+          modifiedAt: outcome.modifiedAt,
+        };
+        result.set(id, entry);
+        writeCache(ctx, id, entry);
       }
     }
   };

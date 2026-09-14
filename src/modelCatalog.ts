@@ -878,14 +878,27 @@ async function applyCapabilityProbing(
       ssrfGuard ? { ...ctx, ssrfGuard } : ctx,
     );
     for (let i = 0; i < models.length; i++) {
-      const caps = probed.get(models[i].apiModel);
-      if (!caps) {
+      const entry = probed.get(models[i].apiModel);
+      if (!entry) {
         continue;
       }
-      models[i] = mergeProbed(models[i], caps);
+      models[i] = mergeProbed(models[i], entry.capabilities);
     }
+    // M1 (gate M-package) — oldest server-reported `modified_at` across
+    // the batch's results, formatted HH:MM:SS (UTC): a staleness hint
+    // for the audit log. '-' when the server reported none (older
+    // self-hosted servers omit the field).
+    const modifiedDates = [...probed.values()]
+      .map((entry) => entry.modifiedAt)
+      .filter((m): m is string => Boolean(m));
+    const oldestCached =
+      modifiedDates.length > 0
+        ? new Date(
+            Math.min(...modifiedDates.map((m) => Date.parse(m))),
+          ).toISOString().slice(11, 19)
+        : '-';
     logger.info(
-      `capability-probe: connection='${ctx.connectionId}' probed=${unknown.length} ok=${probed.size} fallback=${unknown.length - probed.size}`,
+      `capability-probe: connection='${ctx.connectionId}' probed=${unknown.length} ok=${probed.size} fallback=${unknown.length - probed.size} oldestCached=${oldestCached}`,
     );
   } catch (error) {
     // Terminal probe failure — the refresh must survive with snapshot/
