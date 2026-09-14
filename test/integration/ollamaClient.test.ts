@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
+import { createCommitWindow } from '../../src/commitWindow.js';
 import { OllamaClient } from '../../src/ollamaClient.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 
@@ -758,9 +759,10 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
 
     const recorder = makeCallbacks();
     const client = new OllamaClient(BASE_URL, 'sk-test-key');
-    // Mid-stream retry: streamChat throws ConnectionInterruptedError after
-    // MID_STREAM_RETRY_MAX_ATTEMPTS retries fail (all 3 attempts hit the
-    // same socket close).
+    // ArchCom §3.4 (0.15.x): the 50-chunk mid-stream retry threshold is
+    // abolished. Without a commit-window attached to the callbacks
+    // (plain recorder here) a mid-stream socket close is TERMINAL on
+    // the first attempt: streamChat throws ConnectionInterruptedError.
     await assert.rejects(
       async () =>
         client.streamChat(
@@ -785,8 +787,8 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
         return true;
       },
     );
-    // The partial text was delivered before the socket closed (on each
-    // attempt — the retry re-streams it).
+    // The partial text was delivered before the socket closed (no
+    // window attached ⇒ nothing is buffered or retried away).
     assert.ok(recorder.text.length > 0, 'partial text was delivered');
 
     global.fetch = originalFetch;
@@ -838,6 +840,104 @@ describe('ollamaClient.streamChat — ADR 0008 socket-close classification', () 
     assert.equal(recorder.doneCount, 1, 'onDone must fire after retry recovers');
     assert.equal(recorder.errors.length, 0, 'onError must NOT fire');
     assert.equal(recorder.text.join(''), 'ok');
+
+    global.fetch = originalFetch;
+  });
+});
+
+/**
+ * Review fix P1-1 (commit-window remediation) — a hidden in-window
+ * retry must start from CLEAN protocol state. The compat parser
+ * accumulates tool-call argument fragments in a Map that lives in the
+ * `streamChat` closure for the WHOLE message; without the per-attempt
+ * reset the retry's `arguments +=` concatenates onto the discarded
+ * attempt's fragment (`{"ci` + `{"city":"Paris"}` → invalid JSON →
+ * `safeJsonParse` silently yields `{}`) and the name doubles. This
+ * test drives the REAL `processLine` through `OllamaClient.streamChat`
+ * with a commit-window attached, exactly as production wires it.
+ */
+describe('ollamaClient.streamChat — commit-window hidden retry resets parser state (P1-1)', () => {
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestMaxDurationMin: 30,
+      maxRetries: 0,
+    });
+  });
+
+  afterEach(() => {
+    const stub = global.fetch as FetchStub;
+    if (stub.__isStub && stub.__original) global.fetch = stub.__original;
+  });
+
+  it('tool-call fragments from a discarded attempt never leak into the retry', async function () {
+    // One hidden-retry backoff (~1s ± jitter) + stream time.
+    this.timeout(10000);
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        // Attempt 1: a tool-call argument FRAGMENT arrives (buffered by
+        // the window, not shown), then the socket closes 20ms in —
+        // inside the 60ms window → silent retry.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encode(
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\\"ci"}}]}}]}\n\n',
+              ),
+            );
+            setTimeout(() => {
+              const err = new Error('read ECONNRESET');
+              (err as { code?: string }).code = 'ECONNRESET';
+              controller.error(err);
+            }, 20);
+          },
+        });
+        return mockResponse(body);
+      }
+      // Attempt 2: the model restarts the tool call from scratch — a
+      // full arguments object, finish_reason, [DONE].
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encode(
+              'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]}}]}\n\n',
+            ),
+          );
+          controller.enqueue(
+            encode(
+              'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+            ),
+          );
+          controller.enqueue(encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const client = new OllamaClient(BASE_URL, 'sk-test-key');
+    const commitWindow = createCommitWindow(60);
+    const wrapped = commitWindow.wrap(recorder);
+    await client.streamChat(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }] },
+      wrapped,
+    );
+
+    assert.equal(fetchCalls, 2, 'exactly one hidden in-window retry');
+    assert.equal(recorder.doneCount, 1, 'retry attempt completed the stream');
+    assert.equal(recorder.errors.length, 0, 'no error may surface');
+    // THE P1-1 invariant: exactly one VALID tool call — not a
+    // `{}`-input call (silent JSON corruption) and not a doubled name
+    // (`get_weatherget_weather`) from cross-attempt concatenation.
+    assert.equal(recorder.toolCalls.length, 1, 'exactly one tool call');
+    assert.equal(recorder.toolCalls[0]!.name, 'get_weather');
+    assert.deepEqual(recorder.toolCalls[0]!.input, { city: 'Paris' });
+    assert.equal(commitWindow.controller.hiddenRetryCount(), 1);
 
     global.fetch = originalFetch;
   });

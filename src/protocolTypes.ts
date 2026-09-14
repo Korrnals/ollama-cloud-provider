@@ -127,12 +127,15 @@ export interface StreamCallbacks {
   onDone: () => void;
   onError: (error: Error) => void;
   /**
-   * ArchCom 2026-09-14 (train A) — visible notice for events the user
-   * must not miss silently, e.g. a mid-stream retry issued AFTER tokens
-   * were already shown (the retried stream restarts from scratch, so
-   * the already-shown prefix would look duplicated without this cue).
-   * Rendered by the provider as an inline text part. Optional — absent
-   * handler means the notice is only logged.
+   * ArchCom 2026-09-14 — visible notice for stream events the user must
+   * not miss silently. Rendered by the provider as an inline text part.
+   * Optional — absent handler means the notice is only logged.
+   *
+   * §3.4 (0.15.x): the ONLY remaining callers are VISIBLE events —
+   * the zero-byte extra attempt announcement (connect-phase retries
+   * exhausted with nothing shown; one last automatic attempt follows).
+   * Silent commit-window retries never call this — they are disclosed
+   * in diagnostics only (logger.warn + the runStream report field).
    */
   onNotice?: (text: string) => void;
 }

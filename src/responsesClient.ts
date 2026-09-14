@@ -189,6 +189,15 @@ export class ResponsesClient {
         cancellationToken,
         processLine: processResponsesLineForStream,
         ssrfGuard: this.ssrfGuard,
+        // Review fix P1-1 (commit-window remediation) — `pendingEvent`
+        // is the two-line SSE protocol state held in this closure,
+        // living ONCE for the whole message. A hidden commit-window
+        // retry that lands between an `event:` line and its `data:`
+        // line must not carry the orphaned event type into the fresh
+        // attempt's parser. No-op for the first attempt.
+        onAttemptStart: () => {
+          pendingEvent = null;
+        },
       },
       callbacks,
     );

@@ -1,7 +1,7 @@
 # 0014. Stream Idle-Kill Classification + Live Capability Probing
 
 **Date:** 2026-09-14
-**Status:** Accepted — train A shipped in v0.14.0; train B (`/api/show` probing) shipped in v0.15.0; commit-window planned for 0.15.x
+**Status:** Accepted — train A shipped in v0.14.0; train B (`/api/show` probing) shipped in v0.15.0; commit-window shipped in 0.15.x (50-chunk threshold abolished)
 
 ## Deciders
 
@@ -38,22 +38,22 @@ A stream that ends (close / RST / clean end) after a quiet gap ≥ 90 s is class
 - Terminal everywhere: excluded from `withRetry`, excluded from mid-stream retry, detected in the 0-chunk probe path and in every catch branch of the stream reader.
 - The user-facing error is honest and actionable (from `provider.ts`): «Ollama Cloud: облако закрыло соединение после N с без данных — модель долго размышляла. Известная проблема Ollama Cloud (ollama/ollama#16108), на стороне расширения таймеры стрим не прерывали. Повторите запрос».
 
-Classification as shipped in v0.14.0 (the 50-chunk mid-stream threshold remains until the commit-window replaces it — Decision 5):
+Classification as shipped after the commit-window release (the v0.14.0 interim kept a 50-chunk mid-stream threshold — Decision 5 replaced it with the time-based window):
 
 ```mermaid
 flowchart TD
     E["stream ends: close / RST / clean end"] --> G{"quiet gap<br/>(now - lastChunkAt, or<br/>close - headersAt at 0 chunks)"}
     G -- ">= 90 s" --> IDLE["UpstreamIdleTimeoutError<br/>terminal - never retried<br/>honest message + issue 16108"]
-    G -- "< 90 s, chunks = 0" --> ZERO["ZeroByteSocketCloseError<br/>retryable (connect phase)"]
-    G -- "< 90 s, 0 < chunks <= 50" --> CIE["ConnectionInterruptedError<br/>mid-stream retry: jittered backoff,<br/>visible notice, shared POST budget"]
-    G -- "< 90 s, chunks > 50" --> TERM["terminal ConnectionInterruptedError<br/>honest error, manual retry"]
+    G -- "< 90 s, chunks = 0" --> ZERO["ZeroByteSocketCloseError<br/>connect-phase withRetry (silent)<br/>→ ONE extra visible attempt<br/>→ terminal"]
+    G -- "< 90 s, chunks > 0,<br/>commit-window open (~5 s,<br/>nothing flushed)" --> HIDDEN["silent in-window retry:<br/>buffer reset, jittered backoff,<br/>shared POST budget,<br/>diagnostics-only disclosure"]
+    G -- "< 90 s, chunks > 0,<br/>window closed (output shown)" --> TERM["terminal ConnectionInterruptedError<br/>honest error, manual retry"]
 ```
 
 ### 2. POST budget, jitter, visible retry (train A, shipped in v0.14.0)
 
-- **One shared POST budget per message:** connect-phase (`withRetry`) and mid-stream attempts draw from the same counter, `MAX_POST_BUDGET_PER_MESSAGE = 6` — the worst case drops from 12 POSTs to 6. On exhaustion the stream fails honestly ("POST budget of 6 attempts exhausted — not retrying").
-- **Jitter on every mid-stream backoff:** delay = `base * 2^attempt * uniform(0.75..1.25)` (±25 %). No unjittered retries remain on the mid-stream path.
-- **Visible retry:** a mid-stream retry issued after output has already been shown surfaces an `onNotice` message; with no handler registered the notice is logged, never dropped.
+- **One shared POST budget per message:** connect-phase (`withRetry`), commit-window hidden retries and the zero-byte extra attempt all draw from the same counter, `MAX_POST_BUDGET_PER_MESSAGE = 6` — the worst case drops from 12 POSTs to 6. On exhaustion the stream fails honestly ("POST budget of 6 attempts exhausted — not retrying").
+- **Jitter on every retry backoff:** delay = `base * 2^retry * uniform(0.75..1.25)` (±25 %), capped at 10 s for window retries. No unjittered backoff remains on the retry path.
+- **Visible vs silent (final semantics after §3.4):** the only auto-retry after which output is re-generated — the in-window hidden retry — is SILENT by design (nothing was shown, so nothing duplicates; disclosed in diagnostics). The remaining visible `onNotice` is the zero-byte extra attempt announcement; with no handler registered the notice is logged, never dropped. Post-shown auto-retry no longer exists.
 
 ### 3. Snapshot stopgap, vision-gate P0 fix, ssrfGuard on catalogs (train A, shipped in v0.14.0)
 
@@ -93,22 +93,30 @@ Security conditions of acceptance:
 | N+1 limits | Concurrency ≤ 4; cache keyed `(connectionId, model, digest\|modified_at)` with TTL 24 h; single-flight per refresh; exactly one attempt, never wrapped in `withRetry`; 429 → respect `Retry-After`, cancel the remaining batch. |
 | Validation | `capabilities` must be an array of strings; unknown values ignored; response size cap; strict schema validation — anything else falls back with `provenance: inferred`. |
 
-### 5. Commit-window as the retry boundary (planned, 0.15.x)
+### 5. Commit-window as the retry boundary (shipped, 0.15.x)
 
-- A ~5 s time-based buffer holds the first deltas before flushing. A break inside the window → one silent retry (disclosed in diagnostics); after the flush the stream is final — mid-stream duplication becomes impossible by construction.
-- `MID_STREAM_RETRY_MAX_CHUNKS` (50) is abolished atomically with the window. Removing the threshold alone would silently delete the only working mid-stream retry — rejected in critique.
-- Design condition for the same release: non-idle 0-chunk close (< 90 s before the first chunk) gets explicit behaviour — default: one visible attempt when nothing was shown.
+- A ~5 s time-based buffer (`src/commitWindow.ts`, `COMMIT_WINDOW_DEFAULT_MS = 5000`) holds the first deltas (`onText` / `onThinking` / `onToolCall`). The window is armed by the FIRST delta event — not by connection start — so a 60–70 s thinking TTFT adds no extra invisible time.
+- A break inside the window (`ConnectionInterruptedError`) → silent retry: the buffer is reset (the discarded attempt's deltas can never reach the user), the retry draws from the shared POST budget, the backoff is jittered (1 s base, ×2 per retry, ±25 % jitter, 10 s cap), and the hidden-retry count is disclosed in diagnostics only (`logger.warn` lines + the `commitWindowHiddenRetries=` field in the runStream report). The user sees neither a duplicate prefix nor flicker, and `onNotice` is NOT called.
+- The window closes on its timer → the buffer is flushed to the real callbacks in original order → everything after that streams directly. A mid-stream break after the flush is a terminal `ConnectionInterruptedError`: honest message ("the shown fragment may be incomplete; auto-retry is disabled to avoid duplication — retry the request"), manual user retry. Mid-stream duplication is impossible by construction.
+- `MID_STREAM_RETRY_MAX_CHUNKS` (50) was abolished ATOMICALLY with the window's introduction — removing the threshold alone would silently delete the only working mid-stream retry (rejected in critique); visibility, not chunk volume, now decides retryability.
+- Non-idle 0-chunk close (< 90 s before the first chunk) — design condition resolved as defaulted: `ZeroByteSocketCloseError` stays connect-retryable inside `withRetry` (silent, not mid-stream); once those retries are exhausted, `readStream` grants exactly ONE additional VISIBLE attempt announced via `onNotice` («Ответ так и не начался — делаю последнюю автоматическую попытку»), then the error is terminal. Budget exhausted or caller cancelled → no extra attempt.
+- Placement: the provider wraps the callbacks (`provider.ts runStream` → `createCommitWindow().wrap(...)`) because the clients' `processLine` closures invoke whatever callbacks object the provider passes down — that is the only interception point seeing every delta. The window controller rides on the wrapped callbacks under a symbol; `readStream` (owner of the attempt loop and the POST budget) discovers it there and makes the retry decision. `StreamCallbacks` is unchanged (backward compatible); `windowMs` is a constructor parameter (test seam), not user config.
 - Honesty clause (Product Architect): the commit-window does NOT heal the long-thinking quiet-gap kill — that is #16108 and client-unfixable. It is not presented to the owner as a cure.
+- Remediation (review fix-then-ship): every hidden retry starts from CLEAN protocol state — the reader calls the clients' `onAttemptStart` hook before each attempt (`ollamaClient`: `pendingToolCalls.clear()`; `responsesClient`: `pendingEvent = null`), so the retry's `arguments +=` never concatenates onto the discarded attempt's fragment. The hidden-retry backoff is interrupted by caller cancellation (immediate quiet `onDone`, no budget burn). The vision pass-through streams are commit-window wrapped exactly like the primary path (early breaks heal there too, zero-byte notice included). Thrown terminal errors (post-window CIE) now leave exactly one `Stream error` diagnostics line, like every other failure.
 
 Retry-diversification (endpoint switch / `think:false` on the retry attempt) is a spike behind a config flag, OFF by default, in no release until the spike proves a diversified retry survives an idle-kill.
 
 ### Invariants
 
 | Invariant | Rule |
-|---|---|
-| POST budget | Exactly one shared counter per message; hard cap 6 POSTs across connect + mid-stream attempts. |
-| Jitter | Every mid-stream retry delay carries ±25 % jitter; no unjittered backoff on the retry path. |
+| --- | --- |
+| POST budget | Exactly one shared counter per message; hard cap 6 POSTs across connect-phase, in-window hidden retries and the zero-byte extra attempt. |
+| Jitter | Every retry backoff carries ±25 % jitter (window retries capped at 10 s); no unjittered backoff on the retry path. |
 | Idle-kill class | `UpstreamIdleTimeoutError` is terminal — never auto-retried on any path; the 90 s gap is a code constant, not config. |
+| Commit-window | The only silent mid-stream retry boundary is time-based (~5 s from the first delta, nothing flushed). After the flush every mid-stream break is terminal — no chunk-count threshold exists. Hidden retries are silent to the user and disclosed in diagnostics. |
+| Protocol-state reset | Every hidden retry starts with clean parser state (`onAttemptStart` resets `pendingToolCalls` / `pendingEvent`) — no cross-attempt tool-call argument concatenation; "no duplicates" holds for protocol structures, not only visible text. |
+| Cancel vs backoff | Caller cancellation interrupts any hidden-retry backoff immediately — quiet `onDone`, no further POST. |
+| Zero-byte extra attempt | At most ONE, visible via `onNotice`, only while the budget holds and nothing was shown; never repeated. |
 | Capability layers + trust | Resolution order user → snapshot → api-show → inferred; server-false never downgrades silently; provenance recorded for every decision. |
 
 ## Consequences
@@ -116,8 +124,9 @@ Retry-diversification (endpoint switch / `think:false` on the retry attempt) is 
 ### Positive
 
 - A #16108 kill now costs one attempt and an honest message instead of ~7 minutes of doomed retries and multiple billings.
-- Worst-case POSTs per message halve (12 → 6); jitter removes the thundering-herd contribution; retries after shown output are visible to the user.
-- The "new cloud model = text-only" bug class closes structurally once train B lands; the snapshot correction and the vision-gate P0 fix already restore vision for glm-5.3-flash in v0.14.0.
+- Worst-case POSTs per message halve (12 → 6); jitter removes the thundering-herd contribution.
+- Early breaks (the frequent 2–9-chunk ECONNRESET class) are healed SILENTLY by the commit-window: the user sees only the final answer — no duplicated prefix, no flicker — and duplication after visible output is structurally impossible (post-window breaks are terminal).
+- The "new cloud model = text-only" bug class is closed structurally by live `/api/show` probing (train B).
 - The SSRF gap on catalog fetches is closed — every outbound request path now passes the guard.
 
 ### Negative / accepted
@@ -126,10 +135,11 @@ Retry-diversification (endpoint switch / `think:false` on the retry attempt) is 
 |---|---|---|
 | Long thinking stays unprotected until #16108 is fixed upstream | fast honest fail + issue reference in the error text | client-unfixable; we stop paying minutes and duplicate billing for a guaranteed failure |
 | The 90 s threshold can misclassify a transient reset with a long quiet gap as an idle-kill | tune the constant from `Mid-stream retry eval` diagnostics | rare; the cost is one manual retry |
-| The snapshot table still rots until train B ships | train A entries are a stopgap; train B is the structural fix | train B is accepted and scheduled (v0.15.0) |
+| The snapshot table can still rot for endpoints without `/api/show` | layered fallback snapshot → inferred with provenance recorded | layers-by-design; the failure is visible, never silent |
 | Cloud `/api/show` may change format or close | layered fallback snapshot → inferred with provenance recorded | layers-by-design; the failure is visible, never silent |
-| The commit-window (0.15.x) adds ~5 s to visible TTFT on retried streams | the window is covered by the standard VS Code spinner | TTFT of these models is 60–70 s; duplication becomes impossible |
-| Non-idle 0-chunk close (< 90 s) classification gap | explicit design item in the 0.15.x review | identified in committee critique; not reachable via the idle-kill path |
+| The commit-window adds ~5 s to visible TTFT (buffering before the flush) | the window is covered by the standard VS Code spinner; armed by the first delta, so slow thinking pays nothing | TTFT of these models is 60–70 s; duplication becomes impossible |
+| A break exactly at the window boundary races the flush timer | flush is synchronous and idempotent; the retry decision reads the controller state after the error | worst case the user sees the short prefix once and a terminal error — no duplication |
+| Non-idle 0-chunk close (< 90 s) burns one extra POST over the pure terminal behaviour | the extra attempt is visible, budget-accounted, granted at most once | resolved design condition (§5); without it a recoverable connect blip failed terminally |
 
 ## Alternatives considered
 
@@ -155,4 +165,4 @@ Retry-diversification (endpoint switch / `think:false` on the retry attempt) is 
 - ADR 0010 — shared stream reader (the mid-stream retry machinery this ADR constrains)
 - ADR 0012 — timer removal + SSRF guard (the baseline this ADR builds on)
 - ADR 0013 — two-phase vision fallback (consumer of capability data)
-- Code: `src/retry.ts` (`UpstreamIdleTimeoutError`), `src/streamReader.ts` (`IDLE_KILL_QUIET_GAP_MS`, `MAX_POST_BUDGET_PER_MESSAGE`, jittered backoff, notices), `src/provider.ts` (terminal error text, `visionModels` coalesce), `src/modelCatalog.ts` (snapshot)
+- Code: `src/retry.ts` (`UpstreamIdleTimeoutError`), `src/commitWindow.ts` (commit-window buffer/controller), `src/streamReader.ts` (`IDLE_KILL_QUIET_GAP_MS`, `MAX_POST_BUDGET_PER_MESSAGE`, in-window hidden retry loop, zero-byte extra attempt), `src/provider.ts` (window wiring in `runStream`, terminal error text, `visionModels` coalesce), `src/modelCatalog.ts` (snapshot)

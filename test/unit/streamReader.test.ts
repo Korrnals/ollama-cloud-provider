@@ -403,22 +403,36 @@ describe('streamReader.readStream — module contract', () => {
 
   // -------------------------------------------------------------------------
   // Socket close at 0 chunks → ZeroByteSocketCloseError.
+  //
+  // ArchCom §3.4 (0.15.x): with maxRetries=0 the connect-phase withRetry
+  // exhausts on its first attempt, and readStream grants exactly ONE
+  // additional VISIBLE attempt (design condition for the non-idle
+  // 0-chunk close) before surfacing the terminal error — so the fetch
+  // mock must return a FRESH empty stream per call (a consumed
+  // ReadableStream cannot be reused).
   // -------------------------------------------------------------------------
 
   it('fires ZeroByteSocketCloseError when socket closes at 0 chunks', async () => {
-    // Empty body — fetch resolves with 200 but no chunks.
-    const body = streamFromChunks([]);
-
+    let fetchCalls = 0;
     const originalFetch = global.fetch;
-    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      // Empty body — fetch resolves with 200 but no chunks.
+      return mockResponse(streamFromChunks([]));
+    }) as typeof fetch;
 
     const recorder = makeCallbacks();
     await readStream(makeBaseOptions(), recorder);
 
     assert.equal(
+      fetchCalls,
+      2,
+      'initial attempt + exactly one extra visible attempt',
+    );
+    assert.equal(
       recorder.errors.length,
       1,
-      'onError must fire on 0-chunk socket close',
+      'onError must fire after the extra attempt fails',
     );
     assert.ok(
       recorder.errors[0] instanceof ZeroByteSocketCloseError,
@@ -430,52 +444,37 @@ describe('streamReader.readStream — module contract', () => {
 
   // -------------------------------------------------------------------------
   // Socket close at >0 chunks → ConnectionInterruptedError.
+  //
+  // ArchCom §3.4 (0.15.x): the 50-chunk mid-stream retry threshold is
+  // ABOLISHED. With no commit-window attached to the callbacks there is
+  // no silent-retry boundary, so a mid-stream socket close is TERMINAL
+  // on the first attempt (the window-attached silent retry is covered
+  // by test/unit/commitWindow.test.ts).
   // -------------------------------------------------------------------------
 
   it('fires ConnectionInterruptedError when socket closes after chunks received', async function () {
-    // Review P3-4: mid-stream backoff gained ±25% jitter — worst-case
-    // two retry delays grew from 3.0s to ~3.75s, crowding the 5s mocha
-    // default on slow CI (the cluster runner). Give this test headroom.
-    this.timeout(8000);
-    // Stream that emits one chunk then errors with a socket-close error.
-    // Mid-stream retry means readStream retries 3 times — each fetch
-    // call must create a FRESH ReadableStream (a consumed stream cannot
-    // be reused). The mock factory below creates a new stream per call.
+    this.timeout(5000);
+    let fetchCalls = 0;
     const originalFetch = global.fetch;
-    global.fetch = (async (_input: unknown, init?: RequestInit) => {
-      // Fresh stream per fetch call — retry-safe.
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      // Fresh stream per fetch call: one chunk, then a mid-stream
+      // socket-close error after a short delay.
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(encode('data: partial\n'));
-          // Error after a short delay to simulate mid-stream socket close.
           setTimeout(() => {
             const e = new Error('aborted at TLSSocket.socketCloseListener');
             controller.error(e);
           }, 50);
         },
       });
-      // Wire abort signal to error the stream (mirrors real fetch).
-      const sig = init?.signal;
-      if (sig) {
-        const err = (): void => {
-          // The stream errors via the setTimeout above; the abort
-          // listener is a no-op placeholder for this test (the socket
-          // close is simulated by the setTimeout, not by abort).
-        };
-        if (sig.aborted) {
-          err();
-        } else {
-          sig.addEventListener('abort', err);
-        }
-      }
       return mockResponse(body);
     }) as typeof fetch;
 
     const recorder = makeCallbacks();
-    // Mid-stream retry: readStream now throws ConnectionInterruptedError
-    // (instead of calling onError) so the retry loop can catch it.
-    // After MID_STREAM_RETRY_MAX_ATTEMPTS (3) retries fail, the error
-    // propagates as a throw.
+    // Terminal CIE: readStream throws ConnectionInterruptedError (no
+    // retry — no window attached, threshold abolished).
     await assert.rejects(
       async () => readStream(makeBaseOptions(), recorder),
       (error: unknown) => {
@@ -486,6 +485,7 @@ describe('streamReader.readStream — module contract', () => {
         return true;
       },
     );
+    assert.equal(fetchCalls, 1, 'terminal on the first attempt — no retry');
 
     global.fetch = originalFetch;
   });
@@ -643,18 +643,26 @@ describe('streamReader.readStream — module contract', () => {
 
   // -------------------------------------------------------------------------
   // Stream ends naturally with 0 chunks and NO finalize →
-  // ZeroByteSocketCloseError (not silent onDone).
+  // ZeroByteSocketCloseError (not silent onDone). ArchCom §3.4: after
+  // the one extra visible attempt (fresh stream per fetch call).
   // -------------------------------------------------------------------------
 
   it('fires ZeroByteSocketCloseError when stream ends with 0 chunks (no finalize)', async () => {
-    const body = streamFromChunks([]);
-
+    let fetchCalls = 0;
     const originalFetch = global.fetch;
-    global.fetch = (async () => mockResponse(body)) as typeof fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      return mockResponse(streamFromChunks([]));
+    }) as typeof fetch;
 
     const recorder = makeCallbacks();
     await readStream(makeBaseOptions(), recorder);
 
+    assert.equal(
+      fetchCalls,
+      2,
+      'initial attempt + the single extra visible attempt',
+    );
     assert.equal(
       recorder.errors.length,
       1,

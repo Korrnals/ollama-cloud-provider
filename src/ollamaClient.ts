@@ -307,6 +307,17 @@ export class OllamaClient {
         processLine: processLineForFormat,
         finalize,
         ssrfGuard: this.ssrfGuard,
+        // Review fix P1-1 (commit-window remediation) — the compat
+        // parser accumulates tool-call argument fragments in this
+        // closure's Map, which lives ONCE for the whole message. A
+        // hidden commit-window retry must start from clean protocol
+        // state, or the retry's `arguments +=` concatenates onto the
+        // discarded attempt's fragment (corrupted JSON → safeJsonParse
+        // silently yields `{}`). No-op for native mode (no
+        // accumulation) and for the first attempt (empty Map).
+        onAttemptStart: () => {
+          pendingToolCalls.clear();
+        },
       },
       callbacks,
     );
