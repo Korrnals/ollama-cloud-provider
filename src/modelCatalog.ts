@@ -14,6 +14,7 @@ import { httpRequest } from './httpClient.js';
 import { logger } from './logger.js';
 import { httpErrorFromResponse, withRetry } from './retry.js';
 import { isModelKnownRetired } from './capabilityCache.js';
+import { createProductionSsrfGuard, type SsrfGuard } from './ssrfGuard.js';
 
 const MODELS_ENDPOINT_SUFFIX = '/models';
 const TAGS_ENDPOINT_SUFFIX = '/api/tags';
@@ -230,6 +231,32 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
     maxInputTokens: 1000000,
     maxOutputTokens: 131072,
     imageInput: false,
+    toolCalling: true,
+    reasoning: true,
+  },
+  {
+    // ArchCom 2026-09-14 — verified live via public POST /api/show:
+    // capabilities ["completion","thinking","tools"] (no vision);
+    // glm_dsa_moe.context_length = 1048576.
+    apiModel: 'glm-5.3',
+    family: 'glm',
+    maxInputTokens: 1048576,
+    maxOutputTokens: 131072,
+    imageInput: false,
+    toolCalling: true,
+    reasoning: true,
+  },
+  {
+    // ArchCom 2026-09-14 — verified live via public POST /api/show:
+    // capabilities ["completion","thinking","tools","vision"];
+    // glm5_next.context_length = 1048576. This entry fixed the
+    // "glm-5.3-flash misdetects as text-only" bug (train A stopgap
+    // until /api/show probing lands in train B).
+    apiModel: 'glm-5.3-flash',
+    family: 'glm',
+    maxInputTokens: 1048576,
+    maxOutputTokens: 131072,
+    imageInput: true,
     toolCalling: true,
     reasoning: true,
   },
@@ -574,8 +601,16 @@ export class ModelCatalog {
     // whitelisted, neither endpoint is safe.
     assertBaseUrlAllowed(baseUrl);
 
+    // ArchCom 2026-09-14 (train A) — close the ssrfGuard gap on
+    // catalog fetches: the guard previously ran only in streamReader,
+    // so /v1/models and /api/tags connected on DNS-rebindable hosts.
+    // The string whitelist (above) cannot catch rebinding; this guard
+    // resolves the hostname right before fetch. Cloud connection =
+    // strict profile (no private ranges).
+    const ssrfGuard = createProductionSsrfGuard();
+
     try {
-      return await fetchModelIdsFromOpenAICatalog(baseUrl, apiKey);
+      return await fetchModelIdsFromOpenAICatalog(baseUrl, apiKey, ssrfGuard);
     } catch (error) {
       logger.warn(
         'Failed to fetch Ollama Cloud catalog from /v1/models. Falling back to /api/tags.',
@@ -583,7 +618,7 @@ export class ModelCatalog {
       );
     }
 
-    return fetchModelIdsFromTagsCatalog(rootUrl, apiKey);
+    return fetchModelIdsFromTagsCatalog(rootUrl, apiKey, ssrfGuard);
   }
 
   /**
@@ -602,10 +637,20 @@ export class ModelCatalog {
     // never sent to a host not in the connection's own whitelist.
     assertBaseUrlAllowedForConnection(openaiBase, connection);
 
+    // ArchCom 2026-09-14 (train A) — ssrfGuard on per-connection
+    // catalog fetches (same gap as the cloud path). Local connections
+    // allow loopback + RFC 1918 (LAN-hosted Ollama); everything else
+    // uses the strict profile.
+    const ssrfGuard = createProductionSsrfGuard(
+      connection.type === 'local'
+        ? { allowLoopback: true, allowPrivateRanges: true }
+        : undefined,
+    );
+
     const apiKey = await this.authManager.getApiKeyForConnection(connection);
 
     try {
-      return await fetchModelIdsFromOpenAICatalog(openaiBase, apiKey);
+      return await fetchModelIdsFromOpenAICatalog(openaiBase, apiKey, ssrfGuard);
     } catch (error) {
       logger.warn(
         `Failed to fetch catalog from /v1/models for connection '${connection.id}'. Falling back to /api/tags.`,
@@ -613,7 +658,7 @@ export class ModelCatalog {
       );
     }
 
-    return fetchModelIdsFromTagsCatalog(rootUrl, apiKey);
+    return fetchModelIdsFromTagsCatalog(rootUrl, apiKey, ssrfGuard);
   }
 }
 
@@ -748,6 +793,7 @@ function inferModelForConnection(
 async function fetchModelIdsFromOpenAICatalog(
   baseUrl: string,
   apiKey?: string,
+  ssrfGuard?: SsrfGuard,
 ): Promise<string[]> {
   // Issue 9 — assert enforced by caller (fetchModelIds) before this
   // function is reached, so the API key is never sent to a non-
@@ -766,6 +812,11 @@ async function fetchModelIdsFromOpenAICatalog(
       CATALOG_FETCH_TIMEOUT_MS,
     );
     try {
+      // ArchCom 2026-09-14 (train A) — per-attempt SSRF guard, same
+      // placement as streamReader: right before the TCP connect.
+      if (ssrfGuard) {
+        await ssrfGuard.assertUrlAllowed(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`);
+      }
       const res = await httpRequest(`${baseUrl}${MODELS_ENDPOINT_SUFFIX}`, {
         headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
         signal: controller.signal,
@@ -797,6 +848,7 @@ async function fetchModelIdsFromOpenAICatalog(
 async function fetchModelIdsFromTagsCatalog(
   rootUrl: string,
   apiKey?: string,
+  ssrfGuard?: SsrfGuard,
 ): Promise<string[]> {
   // Issue 13 — same retry treatment as the OpenAI catalog fetch.
   // INFO-3 — explicit 30s timeout, same rationale as the OpenAI
@@ -809,6 +861,10 @@ async function fetchModelIdsFromTagsCatalog(
       CATALOG_FETCH_TIMEOUT_MS,
     );
     try {
+      // ArchCom 2026-09-14 (train A) — per-attempt SSRF guard.
+      if (ssrfGuard) {
+        await ssrfGuard.assertUrlAllowed(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`);
+      }
       const res = await httpRequest(`${rootUrl}${TAGS_ENDPOINT_SUFFIX}`, {
         headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined,
         signal: controller.signal,

@@ -57,6 +57,7 @@ import {
   MidStreamError,
   ZeroByteSocketCloseError,
   ConnectionInterruptedError,
+  UpstreamIdleTimeoutError,
   isSocketCloseError,
 } from './retry.js';
 import {
@@ -238,6 +239,17 @@ export function classifyStreamError(error: unknown): Error {
     // maxRetries=0), surface a clean message naming the failure mode.
     return vscode.LanguageModelError.Blocked(
       `Ollama Cloud: соединение закрыто сервером до получения данных. Попробуйте ещё раз — повторный запрос не тарифицируется (получено 0 токенов). [ref ${ref}]`,
+    );
+  }
+  if (error instanceof UpstreamIdleTimeoutError) {
+    // ArchCom 2026-09-14 (train A) — deterministic idle kill: the
+    // cloud dropped the stream after a long silent thinking phase
+    // (ollama/ollama#16108). Retrying an identical request reproduces
+    // the same silence, so the extension does NOT auto-retry — the
+    // honest message names the upstream issue and the quiet gap so
+    // the owner understands this is not the extension's timers.
+    return vscode.LanguageModelError.Blocked(
+      `Ollama Cloud: облако закрыло соединение после ${Math.round(error.quietMs / 1000)} с без данных — модель долго размышляла. Известная проблема Ollama Cloud (ollama/ollama#16108), на стороне расширения таймеры стрим не прерывали. Повторите запрос. [ref ${ref}]`,
     );
   }
   if (error instanceof ConnectionInterruptedError) {
@@ -839,7 +851,15 @@ export class OllamaCloudChatProvider
     const requestHasImages = messages.some(
       (m) => m.role === vscode.LanguageModelChatMessageRole.User && hasImageParts(m.content),
     );
-      const connectionVisionPatterns = connection?.visionModels ?? [];
+      // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection` to
+      // undefined (legacy path), which silently dropped the user's
+      // `ollamaCloud.visionModels` override for the cloud connection:
+      // the gate fell back to `[]` patterns and a user-declared vision
+      // model was still treated as text-only. `cloudConnection` carries
+      // the same patterns (synthesizeCloudConnection injects the global
+      // list), so coalescing restores the override for cloud too.
+      const connectionVisionPatterns =
+        (connection ?? cloudConnection)?.visionModels ?? [];
       const supportsImages = resolveVisionSupport(model, connectionVisionPatterns);
       if (requestHasImages && !supportsImages) {
         const fallbackEnabled = vscode.workspace
@@ -2028,6 +2048,13 @@ ${errorLines}
             error,
           );
           reject(error);
+        },
+        // ArchCom 2026-09-14 (train A) — surface mid-stream retry
+        // notices (issued after already-shown output) inline so the
+        // re-shown prefix is explained instead of looking like a
+        // duplication bug.
+        onNotice: (text: string) => {
+          progress.report(new vscode.LanguageModelTextPart(text));
         },
       }).catch((error: unknown) => {
         // Safety net: if the client rejects its own promise instead

@@ -67,6 +67,7 @@ import type { StreamCallbacks } from './protocolTypes.js';
 import {
   ConnectionInterruptedError,
   MaxDurationError,
+  UpstreamIdleTimeoutError,
   ZeroByteSocketCloseError,
   defaultRetryOn,
   httpErrorFromResponse,
@@ -94,6 +95,52 @@ import {
 const MID_STREAM_RETRY_MAX_CHUNKS = 50;
 const MID_STREAM_RETRY_MAX_ATTEMPTS = 3;
 const MID_STREAM_RETRY_BASE_DELAY_MS = 1000;
+
+// ArchCom 2026-09-14 (train A) — idle-kill classification. The known
+// Ollama Cloud issue ollama/ollama#16108 drops streams after
+// ~120-145s of upstream silence (long thinking / tool-argument
+// composition). A socket close whose preceding quiet gap reached this
+// threshold is classified as a deterministic idle kill — terminal, no
+// auto-retry (identical POST → identical silence → identical fail;
+// each retry would burn a fresh 60-70s TTFT and possible billing).
+// 90s sits safely below the ~120s observed proxy cut so genuine idle
+// kills are caught while transient resets stay retryable. Code
+// constant, NOT user config — tuned via diagnostics only.
+export const IDLE_KILL_QUIET_GAP_MS = 90_000;
+
+// ArchCom 2026-09-14 (train A) — shared POST budget per user message.
+// The nested retry structure (mid-stream attempts × connect-phase
+// withRetry) could multiply to 12 POSTs worst case; one shared counter
+// caps the total at 6 regardless of which layer consumes it.
+export const MAX_POST_BUDGET_PER_MESSAGE = 6;
+
+/**
+ * ArchCom 2026-09-14 (train A) — pure classifier for the idle-kill
+ * signature. Exported for unit testing (no clock mocking needed:
+// pass `nowMs` explicitly).
+ *
+ * For `chunks > 0` the quiet gap is measured from the last received
+ * network chunk; for `chunks === 0` it is measured from the moment
+ * response headers arrived (the model is thinking and has not emitted
+ * a byte yet). Returns an `UpstreamIdleTimeoutError` when the gap
+ * reached `IDLE_KILL_QUIET_GAP_MS`, `undefined` otherwise.
+ */
+export function classifyIdleKill(
+  chunks: number,
+  lastChunkAt: number | undefined,
+  headersAt: number | undefined,
+  nowMs: number = Date.now(),
+): UpstreamIdleTimeoutError | undefined {
+  const anchor = chunks > 0 ? lastChunkAt : headersAt;
+  if (anchor === undefined) {
+    return undefined;
+  }
+  const quietMs = nowMs - anchor;
+  if (quietMs >= IDLE_KILL_QUIET_GAP_MS) {
+    return new UpstreamIdleTimeoutError(quietMs, chunks);
+  }
+  return undefined;
+}
 
 // -------------------------------------------------------------------------
 // ADR 0012 (revised) — single-timer architecture. The connect timer
@@ -229,12 +276,17 @@ export async function readStream(
   callbacks: StreamCallbacks,
 ): Promise<void> {
   let lastError: unknown = null;
+  // ArchCom 2026-09-14 (train A) — one shared POST budget across the
+  // mid-stream attempts below AND the connect-phase withRetry inside
+  // each attempt. Caps the worst case at 6 POSTs per user message
+  // (was up to 12 via nesting).
+  const budget = { remaining: MAX_POST_BUDGET_PER_MESSAGE };
   for (let attempt = 0; attempt < MID_STREAM_RETRY_MAX_ATTEMPTS; attempt++) {
     // Track chunks received THIS attempt — readStreamOnce updates
     // a local copy; we read it via a shared object.
     const attemptState = { chunksReceived: 0 };
     try {
-      await readStreamOnce(options, callbacks, attemptState);
+      await readStreamOnce(options, callbacks, attemptState, budget);
       return; // success
     } catch (error) {
       lastError = error;
@@ -243,12 +295,32 @@ export async function readStream(
         error instanceof ConnectionInterruptedError &&
         attemptState.chunksReceived <= MID_STREAM_RETRY_MAX_CHUNKS;
       const cancelled = options.cancellationToken?.isCancellationRequested === true;
-      logger.warn(`Mid-stream retry eval: attempt=${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS} isCIE=${isCIE} chunks=${attemptState.chunksReceived} cancelled=${cancelled} errorClass=${(error as Error)?.constructor?.name}`);
-      if (!isCIE || cancelled || attempt >= MID_STREAM_RETRY_MAX_ATTEMPTS - 1) {
+      logger.warn(`Mid-stream retry eval: attempt=${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS} isCIE=${isCIE} chunks=${attemptState.chunksReceived} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${(error as Error)?.constructor?.name}`);
+      if (
+        !isCIE ||
+        cancelled ||
+        budget.remaining <= 0 ||
+        attempt >= MID_STREAM_RETRY_MAX_ATTEMPTS - 1
+      ) {
         throw error;
       }
-      // Exponential backoff: 1s, 2s, 4s...
-      const delay = MID_STREAM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      // ArchCom 2026-09-14 (train A) — visible notice when the retry
+      // discards output the user has ALREADY seen: the retried stream
+      // restarts from scratch, so without this cue the re-shown prefix
+      // reads as duplicated/corrupted text. Transparent by design —
+      // no silent magic.
+      if (attemptState.chunksReceived > 0) {
+        callbacks.onNotice?.(
+          `\n\n[Соединение потеряно после ${attemptState.chunksReceived} фрагментов — перезапрашиваю ответ (попытка ${attempt + 2}/${MID_STREAM_RETRY_MAX_ATTEMPTS})]\n\n`,
+        );
+      }
+      // Exponential backoff: 1s, 2s, 4s... with ±25% jitter
+      // (ArchCom 2026-09-14, Security condition): a systemic cloud
+      // incident would otherwise synchronize retries across requests.
+      const jitter = 0.75 + Math.random() * 0.5;
+      const delay = Math.round(
+        MID_STREAM_RETRY_BASE_DELAY_MS * Math.pow(2, attempt) * jitter,
+      );
       logger.warn(
         `Mid-stream retry: ConnectionInterruptedError after ${attemptState.chunksReceived} chunks (attempt ${attempt + 1}/${MID_STREAM_RETRY_MAX_ATTEMPTS}). Retrying in ${delay}ms.`,
       );
@@ -268,6 +340,7 @@ async function readStreamOnce(
   options: StreamReaderOptions,
   callbacks: StreamCallbacks,
   attemptState: { chunksReceived: number },
+  budget: { remaining: number },
 ): Promise<void> {
   const { logTag, url, headers, body, cancellationToken } = options;
 
@@ -282,6 +355,16 @@ async function readStreamOnce(
   logger.debug(
     `${logTag}: readStream START — maxDuration=${maxDurationMs}ms`,
   );
+
+  // ArchCom 2026-09-14 (train A) — idle-kill tracking. `headersAt` is
+  // stamped when the response headers arrive (the probe then waits for
+  // the first byte — a 0-chunk thinking pause is measured from here);
+  // `lastChunkAt` is stamped per received network chunk. The catch
+  // block feeds both into `classifyIdleKill` to detect the
+  // ollama/ollama#16108 signature (server/proxy drops the stream
+  // after a long silent thinking phase).
+  let headersAt: number | undefined;
+  let lastChunkAt: number | undefined;
 
   // Tagged abort reason — the catch block routes by this tag to emit
   // the right user-facing message and to decide onDone vs onError.
@@ -306,6 +389,7 @@ async function readStreamOnce(
   const trackChunks = (n: number): void => {
     chunksReceived = n;
     attemptState.chunksReceived = n;
+    lastChunkAt = Date.now();
   };
   // ArchCom 0011c (SSE finding #1): track parsed (meaningful) chunks
   // separately from raw bytes received. If bytes arrive but none parse
@@ -366,6 +450,17 @@ async function readStreamOnce(
     // because the stream body is tied to `attemptController.signal`.
     const response = await withRetry(
       async () => {
+        // ArchCom 2026-09-14 (train A) — shared POST budget. Every
+        // connect attempt (including retries inside withRetry)
+        // consumes from the same counter the mid-stream loop uses.
+        // Exhausted budget fails the attempt without retrying.
+        if (budget.remaining <= 0) {
+          throw new Error(
+            `${logTag}: POST budget of ${MAX_POST_BUDGET_PER_MESSAGE} attempts exhausted — not retrying.`,
+          );
+        }
+        budget.remaining -= 1;
+
         // Detach any previous attempt's main→attempt wire before
         // installing a fresh one.
         if (streamMainAbortListener) {
@@ -410,6 +505,7 @@ async function readStreamOnce(
             body,
             signal: attemptController.signal,
           });
+          headersAt = Date.now();
           if (!res.ok) {
             const message = await extractErrorMessage(res);
             throw await httpErrorFromResponse(res, message);
@@ -429,6 +525,16 @@ async function readStreamOnce(
           try {
             const first = await probeReader.read();
             if (first.done) {
+              // ArchCom 2026-09-14 (train A) — a clean EOF after a long
+              // silent thinking pause (headers arrived, no byte since) is
+              // the idle-kill signature too (FIN instead of RST). The
+              // idle error is terminal — defaultRetryOn returns false —
+              // so the probe does NOT burn 3× ~145s retries on a
+              // deterministic failure.
+              const idleDone = classifyIdleKill(0, undefined, headersAt);
+              if (idleDone) {
+                throw idleDone;
+              }
               // 200 + headers + immediate EOF = server closed before any
               // chunk. Retryable: 0 chunks = 0 billed tokens.
               throw new ZeroByteSocketCloseError();
@@ -445,6 +551,13 @@ async function readStreamOnce(
             if (error instanceof ZeroByteSocketCloseError) {
               throw error;
             }
+            // Idle-kill classification for the probe path — the
+            // dominant 0-chunk thinking-kill scenario (#16108): headers
+            // arrived, the model thinks in silence, the cloud proxy
+            // cuts the stream. Terminal, not retried.
+            if (error instanceof UpstreamIdleTimeoutError) {
+              throw error;
+            }
             // Release the lock on a failed probe so the stream tears down.
             try {
               probeReader.releaseLock();
@@ -452,6 +565,10 @@ async function readStreamOnce(
               // Already released or locked elsewhere — ignore.
             }
             if (isSocketCloseError(error)) {
+              const idleClose = classifyIdleKill(0, undefined, headersAt);
+              if (idleClose) {
+                throw idleClose;
+              }
               throw new ZeroByteSocketCloseError();
             }
             throw error;
@@ -621,12 +738,33 @@ async function readStreamOnce(
       // ADR 0005 § No mid-stream retry (Revision 2026-08-03) —
       // bare socket close: AbortError with no abortReason tag.
       if (abortReason === null && chunksReceived === 0) {
+        // ArchCom 2026-09-14 (train A) — idle kill beats the generic
+        // 0-chunk classification: a close after a long silent thinking
+        // pause is deterministic (#16108), so no retry anywhere.
+        const idle = classifyIdleKill(0, lastChunkAt, headersAt);
+        if (idle) {
+          logger.warn(
+            `${logTag}: idle kill detected — quiet=${Date.now() - (headersAt ?? Date.now())}ms chunks=0 (ollama/ollama#16108 signature)`,
+          );
+          callbacks.onError(idle);
+          return;
+        }
         callbacks.onError(new ZeroByteSocketCloseError());
         return;
       }
       if (abortReason === null && chunksReceived > 0) {
         // Mid-stream retry: throw instead of callbacks.onError so the
-        // retry wrapper in `readStream` can catch and retry.
+        // retry wrapper in `readStream` can catch and retry. Idle-kill
+        // (long silence between chunks) is terminal instead — retrying
+        // an identical POST reproduces the same silence.
+        const idle = classifyIdleKill(chunksReceived, lastChunkAt, headersAt);
+        if (idle) {
+          logger.warn(
+            `${logTag}: idle kill detected mid-stream — quiet=${idle.quietMs}ms chunks=${chunksReceived} (ollama/ollama#16108 signature)`,
+          );
+          callbacks.onError(idle);
+          return;
+        }
         throw new ConnectionInterruptedError(chunksReceived);
       }
       // Ambiguous AbortError with no tag and no chunks — caller-cancel
@@ -658,8 +796,28 @@ async function readStreamOnce(
         );
       }
       if (chunksReceived === 0) {
+        // ArchCom 2026-09-14 (train A) — idle-kill check before the
+        // retryable 0-chunk classification (see AbortError branch).
+        const idle = classifyIdleKill(0, lastChunkAt, headersAt);
+        if (idle) {
+          logger.warn(
+            `${logTag}: idle kill detected — quiet=${Date.now() - (headersAt ?? Date.now())}ms chunks=0 (ollama/ollama#16108 signature)`,
+          );
+          callbacks.onError(idle);
+          return;
+        }
         callbacks.onError(new ZeroByteSocketCloseError());
       } else {
+        // ArchCom 2026-09-14 (train A) — long silence before the close
+        // means a deterministic idle kill: terminal, not retried.
+        const idle = classifyIdleKill(chunksReceived, lastChunkAt, headersAt);
+        if (idle) {
+          logger.warn(
+            `${logTag}: idle kill detected mid-stream — quiet=${idle.quietMs}ms chunks=${chunksReceived} (ollama/ollama#16108 signature)`,
+          );
+          callbacks.onError(idle);
+          return;
+        }
         // Mid-stream retry: throw instead of callbacks.onError so the
         // retry wrapper in `readStream` can catch and retry.
         throw new ConnectionInterruptedError(chunksReceived);

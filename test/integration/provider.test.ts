@@ -483,6 +483,76 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     // Text-only request → content stays a plain string, not an array.
     assert.equal(userEntry.content, 'hi');
   });
+
+  it('cloud models honor the GLOBAL visionModels override (ArchCom 2026-09-14 P0 fix)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Regression: cloud models resolve `connection` to undefined (the
+    // legacy single-connection path), so the runtime vision gate read
+    // `connection?.visionModels ?? []` and the user's global
+    // `ollamaCloud.visionModels` patterns never reached it — a user-
+    // declared vision model was still rejected as text-only. The fix
+    // coalesces with `cloudConnection`, which carries the global list.
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: ['gpt-oss:120b*'],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+
+    global.fetch = (async (input: string | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      fetchCalls.push({ url, body });
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"described image"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    // gpt-oss:120b is text-only in the snapshot, but the global
+    // `visionModels: ['gpt-oss:120b*']` pattern declares it vision-
+    // capable. The gate must let the image through — no throw, no
+    // fallback — and forward the image as a data URL to the primary.
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    assert.equal(fetchCalls.length, 1, 'image request routed to the primary directly');
+    assert.ok(fetchCalls[0].url.endsWith('/chat/completions'));
+    const body = fetchCalls[0].body as {
+      model: string;
+      messages: Array<{ role: string; content: unknown }>;
+    };
+    assert.equal(body.model, 'gpt-oss:120b', 'primary model received the request');
+    const userMsg = body.messages.find((m) => m.role === 'user');
+    assert.ok(userMsg, 'a user message was sent');
+    assert.ok(Array.isArray(userMsg.content), 'content is a multipart array');
+    const parts = userMsg.content as Array<{
+      type: string;
+      image_url?: { url: string };
+    }>;
+    const imagePart = parts.find((p) => p.type === 'image_url');
+    assert.ok(imagePart, 'the image part was forwarded to the primary');
+  });
 });
 
 /**

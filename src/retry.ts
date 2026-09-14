@@ -109,6 +109,34 @@ export class ConnectionInterruptedError extends Error {
 }
 
 /**
+ * Upstream idle-timeout kill — the server (or an intermediary proxy)
+ * closed the stream after a long period with NO data while the model
+ * was thinking. Signature of the known Ollama Cloud issue
+ * ollama/ollama#16108: streams are dropped after ~120-145s of upstream
+ * silence during long reasoning / tool-argument composition.
+ *
+ * ArchCom 2026-09-14 — terminal, NOT retried. Retrying an identical
+ * POST produces identical silence and a deterministic re-fail: each
+ * retry burns a fresh TTFT (60-70s is normal for reasoning models)
+ * and possible token billing for zero benefit. The user gets an honest
+ * error citing the upstream issue and retries manually if they want a
+ * re-sample.
+ */
+export class UpstreamIdleTimeoutError extends Error {
+  readonly quietMs: number;
+  readonly chunksReceived: number;
+
+  constructor(quietMs: number, chunksReceived: number) {
+    super(
+      `Ollama Cloud: upstream closed the connection after ${Math.round(quietMs / 1000)}s of silence (idle kill)`,
+    );
+    this.name = 'UpstreamIdleTimeoutError';
+    this.quietMs = quietMs;
+    this.chunksReceived = chunksReceived;
+  }
+}
+
+/**
  * Detects a raw Node socket-close / network-reset error that escaped
  * the streaming clients' AbortError routing. Node's HTTP client emits
  * these as plain `Error` objects (name = 'Error', NOT 'AbortError')
@@ -145,7 +173,8 @@ export function isSocketCloseError(error: unknown): boolean {
     error instanceof ZeroByteSocketCloseError ||
     error instanceof ConnectionInterruptedError ||
     error instanceof MaxDurationError ||
-    error instanceof MidStreamError
+    error instanceof MidStreamError ||
+    error instanceof UpstreamIdleTimeoutError
   ) {
     return false;
   }
@@ -329,6 +358,11 @@ export function defaultRetryOn(error: unknown): boolean {
     return true;
   }
   if (error instanceof ConnectionInterruptedError) {
+    return false;
+  }
+  if (error instanceof UpstreamIdleTimeoutError) {
+    // ArchCom 2026-09-14 — deterministic idle kill: identical retry →
+    // identical silence → identical failure. Never auto-retry.
     return false;
   }
   if (error instanceof MaxDurationError) {

@@ -126,6 +126,15 @@ export interface StreamCallbacks {
   onUsage?: (usage: UsageInfo) => void;
   onDone: () => void;
   onError: (error: Error) => void;
+  /**
+   * ArchCom 2026-09-14 (train A) — visible notice for events the user
+   * must not miss silently, e.g. a mid-stream retry issued AFTER tokens
+   * were already shown (the retried stream restarts from scratch, so
+   * the already-shown prefix would look duplicated without this cue).
+   * Rendered by the provider as an inline text part. Optional — absent
+   * handler means the notice is only logged.
+   */
+  onNotice?: (text: string) => void;
 }
 
 // ---------------------------------------------------------------------------

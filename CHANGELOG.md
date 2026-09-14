@@ -5,6 +5,30 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-14
+
+Stream reliability under long thinking + vision capability fixes (ArchCom 2026-09-14, train A).
+
+**Why your streams dropped:** the frequent disconnects during long "thinking" phases are an **external Ollama Cloud bug** — the cloud drops streams after ~120-145 seconds of upstream silence during long reasoning / tool-argument composition (ollama/ollama#16108, open since 2026-05). The extension's own timers do NOT cut streams (the only remaining timer is the 60-minute max-duration guardrail; the connect and inactivity timers were removed back in ADR 0012). This release stops paying for that bug with your time and tokens: a deterministic idle kill is detected, reported honestly, and never pointlessly retried.
+
+### Added
+- **Idle-kill classification (`UpstreamIdleTimeoutError`)** — a stream closed after ≥90 s of upstream silence (or ≥90 s with no byte after headers) is recognized as the ollama/ollama#16108 signature: terminal, **no auto-retry**. Retrying an identical request reproduces the identical silence and fails again — previously this burned 3 × ~145 s of waiting (up to ~7 minutes) for a guaranteed failure, with each retry re-billing the fresh TTFT. The user now sees an honest inline message: the quiet gap, the upstream issue reference, and an explicit note that the extension's timers did not cut the stream.
+- **Visible mid-stream retry notice** — when a mid-stream retry fires *after* output was already shown in the chat, the re-shown prefix would previously read as duplicated/corrupted text. The extension now reports an inline notice (reconnect, attempt N/3) so the regeneration is visible, not silent magic. Delivered via the new optional `onNotice` stream callback.
+- **ssrfGuard on catalog fetches** — `/v1/models` and `/api/tags` requests now run the DNS-rebinding SSRF guard (previously only chat streams did). Local connections allow loopback + RFC 1918 as before.
+
+### Changed
+- **Shared POST budget (6 per message)** — connect-phase retries and mid-stream retries now share one counter (max 6 POSTs per user message). Previously the nested retry layers could multiply to 12 POSTs worst case on one message.
+- **Mid-stream retry backoff now has ±25 % jitter** — prevents synchronized retry bursts when the cloud has a systemic incident affecting all streams at once.
+
+### Fixed
+- **glm-5.3-flash misdetects as text-only** — the model is officially vision-capable (`capabilities: ["completion","thinking","tools","vision"]`, verified via the public `/api/show` endpoint). The hardcoded snapshot now declares vision for glm-5.3-flash (context 1 048 576), and glm-5.3 is added too (also verified: vision NOT included; context 1 048 576). Live capability probing via `/api/show` is the follow-up train B (0.15.0).
+- **Global `ollamaCloud.visionModels` ignored for cloud models (P0)** — cloud models resolve their connection via the legacy path, where the runtime vision gate read `connection?.visionModels ?? []` and got `[]`. A user-declared vision pattern (e.g. `["glm-5.3-flash*"]`) never reached the gate, so an override-declared vision model was still rejected as text-only. The gate now coalesces with the cloud connection object, which carries the global list.
+
+### Rejected (committee decision)
+- Raising the mid-stream retry chunk threshold (50 → 500): retrying an identical POST after an idle kill is provably futile (identical silence → identical failure) and re-bills the generated tail.
+- Fuzzy prefix deduplication on retry: a regeneration at temperature > 0 does not reproduce the same text; splicing would corrupt output.
+- Full circuit breaker: over-engineering for a single-user extension; a simple cooldown remains a 0.15.x option gated on telemetry.
+
 ## [0.13.0] - 2026-08-20
 
 Vision two-phase fallback, mid-stream retry on ConnectionInterruptedError, persistent image-description cache (survives window reload), compaction oscillation + EMA poisoning fixes, Code Review findings applied, release-pipeline hardening.
