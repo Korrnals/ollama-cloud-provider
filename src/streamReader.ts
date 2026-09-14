@@ -310,9 +310,16 @@ export async function readStream(
       // reads as duplicated/corrupted text. Transparent by design —
       // no silent magic.
       if (attemptState.chunksReceived > 0) {
-        callbacks.onNotice?.(
-          `\n\n[Соединение потеряно после ${attemptState.chunksReceived} фрагментов — перезапрашиваю ответ (попытка ${attempt + 2}/${MID_STREAM_RETRY_MAX_ATTEMPTS})]\n\n`,
-        );
+        const notice =
+          `\n\n[Соединение потеряно после ${attemptState.chunksReceived} фрагментов — ` +
+          `перезапрашиваю ответ (попытка ${attempt + 2}/${MID_STREAM_RETRY_MAX_ATTEMPTS})]\n\n`;
+        if (callbacks.onNotice) {
+          callbacks.onNotice(notice);
+        } else {
+          // Doc contract: absent handler → the notice is logged, not
+          // dropped (review P3-3г).
+          logger.warn(`Mid-stream retry notice (no onNotice handler): ${notice.trim()}`);
+        }
       }
       // Exponential backoff: 1s, 2s, 4s... with ±25% jitter
       // (ArchCom 2026-09-14, Security condition): a systemic cloud
@@ -700,6 +707,18 @@ async function readStreamOnce(
         callbacks.onError(new Error(
           `${logTag}: received ${chunksReceived} chunk(s) of data but none were valid stream events. This may indicate a captive portal, proxy error page, or server misconfiguration.`,
         ));
+        return;
+      }
+      // Review P3-1 (2026-09-14) — a FIN (clean EOF) after a long
+      // silent pause is the same #16108 idle-kill as an RST; without
+      // this check it passed as a normal stream end and silently
+      // truncated the answer. Terminal, surfaced honestly.
+      const idleEnd = classifyIdleKill(chunksReceived, lastChunkAt, headersAt);
+      if (idleEnd && chunksReceived > 0) {
+        logger.warn(
+          `${logTag}: idle kill at clean stream end — quiet=${idleEnd.quietMs}ms chunks=${chunksReceived} (ollama/ollama#16108 signature)`,
+        );
+        callbacks.onError(idleEnd);
         return;
       }
       // Clean stream end without a terminal line from the callback.

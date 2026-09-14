@@ -432,7 +432,11 @@ describe('streamReader.readStream — module contract', () => {
   // Socket close at >0 chunks → ConnectionInterruptedError.
   // -------------------------------------------------------------------------
 
-  it('fires ConnectionInterruptedError when socket closes after chunks received', async () => {
+  it('fires ConnectionInterruptedError when socket closes after chunks received', async function () {
+    // Review P3-4: mid-stream backoff gained ±25% jitter — worst-case
+    // two retry delays grew from 3.0s to ~3.75s, crowding the 5s mocha
+    // default on slow CI (the cluster runner). Give this test headroom.
+    this.timeout(8000);
     // Stream that emits one chunk then errors with a socket-close error.
     // Mid-stream retry means readStream retries 3 times — each fetch
     // call must create a FRESH ReadableStream (a consumed stream cannot
