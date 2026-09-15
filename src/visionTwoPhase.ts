@@ -538,7 +538,7 @@ function replaceImagesWithCachedDescriptions(
   return result;
 }
 
-function sha256ShortHex(data: Uint8Array): string {
+export function sha256ShortHex(data: Uint8Array): string {
   // Use node:crypto static import (ESM-safe). Correlation-only — not a security primitive.
   return createHash('sha256').update(data).digest('hex').slice(0, 16);
 }
