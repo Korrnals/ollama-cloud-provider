@@ -5,6 +5,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-15
+
+Unified vision describe + compaction default ON (ADR 0015, ArchCom 2026-09-15) — an image no longer lives in the model context as raw bytes in ANY primary outcome: vision-capable primaries now run the two-phase describe so only the description (compactable text) reaches the context, describe failures degrade to markers without poisoning the cache, and context compaction is enabled by default with an unknown-window-safe guard.
+
+### Added
+- **Unified two-phase describe for ALL primaries (ADR 0015, invariant 1)** — vision-capable primaries under `visionHistory.mode='marker'` now run the two-phase describe (the primary never receives an image part); the image never enters the context as raw bytes in any outcome — only its description, which is subject to compaction. No resolvable vision model or a describe failure degrades to the ADR 0013 marker cycle with a logger warn — not a throw, not raw. The text-only fallback/throw contract is unchanged.
+- **Per-turn describe budget** — at most 4 fresh describe calls per turn (`DESCRIBE_BUDGET_PER_TURN=4`, FIFO oldest-first: a freshly pasted 5th+ image may degrade while older images get described); over-budget images degrade to markers with a warn. ADR 0015 records the FIFO semantics and the prioritized-last-user-message follow-up (review P2-1).
+- **Compaction default ON** — `ollamaCloud.compaction.enabled` default flips `false → true` (ArchCom 2026-09-15 T2); thresholds (75→40), recency (25%/6 turns), rate-guard (5 min) and the summarizer model (`gpt-oss:20b`, no retry, 60 s, `think:false`) are unchanged, fallback contract untouched; the opt-out notice now honestly states compaction is currently DISABLED when opted out. Unknown-window guard: a missing/non-positive `maxInputTokens` never fires compaction (one warn per model; `shouldCompact` hard-guards 0/negative/NaN/Infinity denominators — 75% of no window is meaningless).
+- **ADR 0015** — `docs/adr/0015-unified-vision-descriptions-compaction-default.md`: invariants, pass-through exception (invariant 6: the fallback vision model answers the user directly and must see the image — exactly one raw send per turn, repeats still markered by the ADR 0013 lifecycle), Negative/accepted table with the FIFO budget semantics.
+
+### Fixed
+- **Transient describe failures no longer poison the cache (review P1-2)** — degraded hashes live in a per-turn overlay map instead of the persistent image-description cache: a transient describe failure (429/500) degrades THIS turn only (zero bytes still leak) and the next turn retries the honest describe with a fresh budget. Same for over-budget images. Regression test: turn-1 describe 500 → marker; turn-2 same image → describe retried, honest description in the payload.
+- **Legacy text-primary branch logs `degradedHashes`** — never silent partial degradation (review P2-2); residual printf-placeholder warns converted to template literals so incident diagnostics read cleanly (review P3-2).
+
+### Changed
+- **`visionHistory.mode` 'raw' semantics refined** — 'first send raw, repeats still markers' (the v0.18 lifecycle), applied in both modes; `package.json` setting descriptions updated to the new marker/raw semantics.
+
 ## [0.18.0] - 2026-09-15
 
 Image re-send lifecycle (ADR 0013 extension) — the RCA fix for sessions bloating to ~2.5M characters, which starved subagent delegations into "no output" crashes: the first send of an image goes to the model RAW (no quality loss on the turn that matters), every subsequent re-send of the same image from history is replaced with a short in-band text marker (~100 chars), pass-through vision is covered, and the new `ollamaCloud.visionHistory.mode` setting (`marker` default | `raw` restores the old behaviour) provides the opt-out.
