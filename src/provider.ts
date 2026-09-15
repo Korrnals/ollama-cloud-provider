@@ -73,9 +73,10 @@ import {
   openAiBaseUrl,
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
-import { executePassThrough, shouldFallback } from './visionFallback.js';
+import { executePassThrough, resolveVisionModel, shouldFallback } from './visionFallback.js';
 import {
   applyVisionHistoryLifecycle,
+  degradeImagesToMarkers,
   resolveVisionHistoryMode,
 } from './visionHistory.js';
 import { executeTwoPhaseVision } from './visionTwoPhase.js';
@@ -489,6 +490,8 @@ export class OllamaCloudChatProvider
    * v0.12.1 — tracks model ids for which the context-inflation warning
    * has already fired this session. Prevents spamming the user on every
    * turn once the threshold is crossed and compaction is disabled.
+   * v0.19.0 (ArchCom 2026-09-15 T2) — also carries the `${modelId}:unknown-window`
+   * sentinel for the unknown-window no-fire path (one warn per model).
    */
   private readonly contextInflationWarned = new Set<string>();
   /**
@@ -859,14 +862,28 @@ export class OllamaCloudChatProvider
       }
 
       // Vision gate — SEC-03 complement: do NOT silently drop image
-      // attachments sent to a text-only model. Two outcomes:
-      //   - Fallback ENABLED (ADR 0004): when the primary model cannot
-      //     handle the image, route the turn to a vision-capable model
-      //     via `executePassThrough` (single-hop pass-through). The vision
-      //     model answers the user directly; the primary is not involved.
-      //   - Fallback DISABLED: throw a clear error so the user sees why
-      //     the request failed and can switch to a vision-capable model
-      //     (constraint 9 — no silent degradation; current behaviour).
+      // attachments. Outcomes by branch (ArchCom 2026-09-15 variant
+      // (b) — "unified vision descriptions"):
+      //   - Text-only primary + fallback ENABLED (ADR 0004): route
+      //     the turn to a vision model (two-phase describe or
+      //     pass-through). Contract unchanged.
+      //   - Text-only primary + fallback DISABLED: throw a clear
+      //     error so the user sees why the request failed and can
+      //     switch to a vision-capable model (constraint 9 — no
+      //     silent degradation; unchanged).
+      //   - Vision-capable primary + visionHistory.mode='marker'
+      //     (default): the primary is NOT handed the raw image. The
+      //     turn runs the unified two-phase describe (vision model
+      //     describes, primary answers from the description). When
+      //     the describe cannot run (no vision model resolvable) or
+      //     fails, the history DEGRADES to the ADR 0013 marker cycle
+      //     with a logger.warn — degradation, not silence, and never
+      //     image bytes in the payload (owner directive: an image
+      //     must not live in context in ANY outcome).
+      //   - Vision-capable primary + visionHistory.mode='raw': the
+      //     FIRST send of each image goes RAW to the primary (the
+      //     v0.18 lifecycle); repeat re-sends from history still
+      //     become markers (the lifecycle itself is mode-independent).
       // v0.12.1 — vision gate. `requestHasImages` is true only when
     // Copilot Chat actually passed image parts. For text-only models
     // Copilot Chat clips image attachments UNLESS the model advertised
@@ -882,12 +899,13 @@ export class OllamaCloudChatProvider
     const requestHasImages = messages.some(
       (m) => m.role === vscode.LanguageModelChatMessageRole.User && hasImageParts(m.content),
     );
-    // ADR 0013 lifecycle — set true when the two-phase path replaces
-    // image parts with descriptions below (the native lifecycle then
-    // stays out of the way; see the native dispatch block).
+    // ADR 0013 lifecycle — set true when a path above already
+    // replaced image parts with descriptions/markers (the native
+    // lifecycle then stays out of the way; see the native dispatch
+    // block).
     let twoPhaseRewroteHistory = false;
-      // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection` to
-      // undefined (legacy path), which silently dropped the user's
+      // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection`
+      // to undefined (legacy path), which silently dropped the user's
       // `ollamaCloud.visionModels` override for the cloud connection:
       // the gate fell back to `[]` patterns and a user-declared vision
       // model was still treated as text-only. `cloudConnection` carries
@@ -953,6 +971,13 @@ export class OllamaCloudChatProvider
           // `convertToResponsesInput`, `convertMessagesToNative`) now
           // see the text description instead of the image parts.
           messages = twoPhaseResult.messages;
+          // Review P2-2 — surface partial degradation on the legacy
+          // text-primary path (budget/failure): never silent.
+          if (twoPhaseResult.degradedHashes.length > 0) {
+            logger.warn(
+              `vision two-phase: ${twoPhaseResult.degradedHashes.length} image(s) degraded to markers this turn (describe budget or failure) — hashes: ${twoPhaseResult.degradedHashes.join(', ')}`,
+            );
+          }
           // ADR 0013 lifecycle — the two-phase path already replaced
           // every image part with a description; the native lifecycle
           // must not record hashes from this rewritten history.
@@ -963,24 +988,76 @@ export class OllamaCloudChatProvider
             `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
           );
         }
+      } else if (
+        requestHasImages &&
+        supportsImages &&
+        resolveVisionHistoryMode() === 'marker'
+      ) {
+        // ArchCom 2026-09-15 variant (b) — unified describe for a
+        // VISION-CAPABLE primary. The primary never receives the raw
+        // image in marker mode; it receives the vision model's text
+        // description. Resolution order mirrors the fallback path:
+        // a resolvable vision model → two-phase describe
+        // (`degradeOnFailure`: a describe failure degrades that image
+        // to the marker cycle, the turn proceeds); no vision model →
+        // FULL degradation of every image to markers with a warning
+        // (NOT the "does not support image input" throw — that error
+        // is the text-only-without-fallback contract; here the
+        // primary CAN see images, we just refuse to forward bytes).
+        const visionTarget = resolveVisionModel(
+          model,
+          connection ?? cloudConnection,
+          this.modelCatalog.list(),
+          connections,
+        );
+        if (visionTarget) {
+          const twoPhaseResult = await executeTwoPhaseVision({
+            primaryModel: model,
+            primaryConnection: connection ?? cloudConnection,
+            messages,
+            options,
+            progress,
+            token,
+            authManager: this.authManager,
+            catalog: this.modelCatalog.list(),
+            connections,
+            degradeOnFailure: true,
+          });
+          messages = twoPhaseResult.messages;
+          twoPhaseRewroteHistory = true;
+          if (twoPhaseResult.degradedHashes.length > 0) {
+            logger.warn(
+              `unified vision describe: ${twoPhaseResult.degradedHashes.length} image(s) on a vision-capable primary degraded to markers this turn (hashes=${twoPhaseResult.degradedHashes.join(',')})`,
+            );
+          }
+        } else {
+          const degraded = degradeImagesToMarkers(messages);
+          if (degraded) {
+            messages = degraded.messages;
+            twoPhaseRewroteHistory = true;
+            logger.warn(
+              `unified vision describe: no vision model available to describe images for vision-capable primary ${model.name} — ${degraded.degradedHashes.length} image(s) degraded to markers (hashes=${degraded.degradedHashes.join(',')}). Configure ollamaCloud.visionFallback.model to enable descriptions.`,
+            );
+          }
+        }
       }
 
       // ADR 0013 lifecycle extension (2026-09-15) — apply the
       // image-resend lifecycle ONCE, right after the vision gate,
-      // for ALL dispatch branches (native / responses / compat). VS
-      // Code re-sends immutable history every turn; without this the
-      // same screenshot re-uploads ~2M base64 chars PER TURN on
-      // every vision-capable path, inflating sessions to 2.46M
-      // chars (the subagent D408 RCA). First send of a hash: RAW;
-      // repeats: a short in-band marker. Skipped entirely when
-      // two-phase already rewrote the history (its descriptions
-      // replace the images), when the request carries no images, or
-      // when the user opts out via ollamaCloud.visionHistory='raw'.
-      if (
-        requestHasImages &&
-        !twoPhaseRewroteHistory &&
-        resolveVisionHistoryMode() === 'marker'
-      ) {
+      // for ALL dispatch branches (native / responses / compat) and
+      // BOTH history modes. VS Code re-sends immutable history every
+      // turn; without this the same screenshot re-uploads ~2M base64
+      // chars PER TURN on every vision-capable path, inflating
+      // sessions to 2.46M chars (the subagent D408 RCA). First send
+      // of a hash: RAW; repeats: a short in-band marker. Skipped
+      // when a two-phase pass above already rewrote the history (its
+      // descriptions/markers replace the images) or when the request
+      // carries no images. NOTE: since ArchCom 2026-09-15 the
+      // lifecycle applies in `'raw'` mode TOO — `'raw'` opts out of
+      // the unified describe (first send raw), NOT out of the
+      // repeat-marker protection (that is the v0.18 lifecycle that
+      // shipped with `'raw'` already in effect).
+      if (requestHasImages && !twoPhaseRewroteHistory) {
         messages = applyVisionHistoryLifecycle(messages, this.sentImageHashes);
       }
 
@@ -1020,7 +1097,7 @@ export class OllamaCloudChatProvider
       let openaiMessages = convertMessagesToOpenAI(messages);
 
       // v0.13.0 Slice 2 — context compaction (spec:
-      // docs/compaction-spec.md, default OFF). Runs BEFORE the ADR 0007
+      // docs/compaction-spec.md). Runs BEFORE the ADR 0007
       // context filter and BEFORE endpoint dispatch, so the filter
       // operates on the COMPACTED list and the injected summary message
       // (a `role:'system'` OpenAI message) flows through all three
@@ -1028,6 +1105,10 @@ export class OllamaCloudChatProvider
       // the chat — every failure inside `maybeCompact` logs a warning
       // and returns the uncompacted history (the filter path may still
       // truncate; that is the accepted degradation).
+      // v0.19.0 (ArchCom 2026-09-15 T2) — default flipped ON. The
+      // `.get` default below stays `false` only as a defensive
+      // fallback for hosts with a stale settings cache; the shipped
+      // default lives in package.json (`true`).
       openaiMessages = await this.maybeCompact(
         openaiMessages,
         model,
@@ -1759,12 +1840,19 @@ export class OllamaCloudChatProvider
 
   /**
    * v0.13.0 Slice 2 — runs one compaction check over the OpenAI-format
-   * history when `ollamaCloud.compaction.enabled` is on (default off).
-   * Returns the messages to send onward: the compacted array on fire,
-   * the input array otherwise. Called BEFORE the ADR 0007 context
-   * filter and endpoint dispatch, so the filter runs on the COMPACTED
-   * list and the injected summary message (a `role:'system'` OpenAI
-   * message) flows through every endpoint unchanged.
+   * history when `ollamaCloud.compaction.enabled` is on (default ON
+   * since v0.19.0, ArchCom 2026-09-15 T2). Returns the messages to
+   * send onward: the compacted array on fire, the input array
+   * otherwise. Called BEFORE the ADR 0007 context filter and endpoint
+   * dispatch, so the filter runs on the COMPACTED list and the
+   * injected summary message (a `role:'system'` OpenAI message) flows
+   * through every endpoint unchanged.
+   *
+   * Unknown-window safe path (ArchCom invariant 4): when the model's
+   * window is unknown (`maxInputTokens` missing/non-positive),
+   * compaction does NOT fire — the hysteresis has no denominator and
+   * an arbitrary split would evict context the model may still need.
+   * A one-time warning is surfaced instead.
    *
    * Fallback contract: NEVER throws — a summarizer/store failure logs
    * a warning and returns the uncompacted history (the filter path
@@ -1778,16 +1866,27 @@ export class OllamaCloudChatProvider
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   ): Promise<OpenAICompatibleMessage[]> {
     const config = vscode.workspace.getConfiguration('ollamaCloud');
-    if (!config.get<boolean>('compaction.enabled', false)) {
-      // v0.12.1 — context-inflation warning (RCA 2026-08-19):
-      // compaction is opt-in (ADR: default off). When the conversation
-      // exceeds 75% of the model's window but compaction is disabled,
+    if (!config.get<boolean>('compaction.enabled', true)) {
+      // v0.19.0 — the default is ON (package.json); reaching here
+      // means the user explicitly opted out. The pre-v0.19
+      // context-inflation warning (RCA 2026-08-19) still applies:
       // surface a ONE-TIME-per-session warning so the user knows their
-      // context is growing unbounded and can enable compaction. The
-      // warning uses `progress.report` (visible in the chat UI) + a
-      // `logger.warn` line (visible in diagnostics). It fires at most
-      // once per modelId per session to avoid spamming.
+      // context is growing unbounded and can re-enable compaction.
       this.warnContextInflationIfNeeded(model, modelId, openaiMessages, progress);
+      return openaiMessages;
+    }
+    // ArchCom 2026-09-15 (invariant 4) — unknown-window safe path:
+    // no window → no compaction, ever. `compactIfNeeded` would
+    // otherwise treat 75% of 0/undefined as a trivially-reached
+    // threshold and evict against a nonsense denominator.
+    const windowTokens = model.maxInputTokens;
+    if (!windowTokens || windowTokens <= 0) {
+      if (!this.contextInflationWarned.has(`${modelId}:unknown-window`)) {
+        this.contextInflationWarned.add(`${modelId}:unknown-window`);
+        logger.warn(
+          `Compaction: model window unknown for ${modelId} (maxInputTokens=${model.maxInputTokens}) — compaction will not fire. The context filter may still truncate.`,
+        );
+      }
       return openaiMessages;
     }
     const store = this.getOrCreateCompactionStore();
@@ -1861,18 +1960,19 @@ export class OllamaCloudChatProvider
 
   /**
    * v0.12.1 — context-inflation warning (RCA 2026-08-19, ADR 0007
-   * complement). When `compaction.enabled` is `false` (the default)
-   * and the conversation exceeds 75% of the model's window, surface a
+   * complement), reworded for the v0.19.0 default flip (ArchCom
+   * 2026-09-15 T2). Reached ONLY when the user explicitly set
+   * `compaction.enabled=false` (the shipped default is ON): when the
+   * conversation exceeds 75% of the model's window, surface a
    * one-time-per-session warning so the user knows their context is
-   * growing unbounded and can enable compaction before hitting the
+   * growing unbounded and can re-enable compaction before hitting the
    * provider's hard context-window ceiling.
    *
    * The warning fires at most once per `modelId` per session (tracked
    * in {@link contextInflationWarned}) to avoid spamming on every turn.
    * It uses `progress.report` (visible in the chat UI as a streaming
    * annotation) + `logger.warn` (visible in diagnostics). It does NOT
-   * enable compaction — that remains a deliberate user opt-in per the
-   * compaction spec's "default off" decision.
+   * enable compaction — that remains the user's decision.
    *
    * Token estimate mirrors `compaction.ts`: `charsPerToken` from the
    * EMA (or the 4-char default), applied to the OpenAI-format request
@@ -1904,10 +2004,10 @@ export class OllamaCloudChatProvider
     const pct = Math.round((usedTokens / windowTokens) * 100);
     const warning =
       `⚠️ Context at ${pct}% of the ${model.name} window (${usedTokens.toLocaleString()}/${windowTokens.toLocaleString()} tokens). ` +
-      'Enable \"Ollama Cloud: Compaction\" (ollamaCloud.compaction.enabled) to summarize older turns and stay under the limit. ' +
+      'Compaction is currently DISABLED (ollamaCloud.compaction.enabled=false) — re-enable it to summarize older turns and stay under the limit. ' +
       'Without compaction, long conversations may hit the provider hard ceiling.';
     logger.warn(
-      `Context inflation: ${modelId} at ${pct}% of window (${usedTokens}/${windowTokens} tokens, ${openaiMessages.length} messages) — compaction disabled. Run 'Ollama Cloud: Set Compaction' or set ollamaCloud.compaction.enabled=true.`,
+      `Context inflation: ${modelId} at ${pct}% of window (${usedTokens}/${windowTokens} tokens, ${openaiMessages.length} messages) — compaction disabled by user setting (default is ON since v0.19.0). Set ollamaCloud.compaction.enabled=true to re-enable.`,
     );
     progress.report(new vscode.LanguageModelTextPart(warning));
   }

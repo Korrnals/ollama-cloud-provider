@@ -260,11 +260,11 @@
             "raw"
           ],
           "enumDescriptions": [
-            "Marker (default): the first send of each image goes to the model raw; every later re-send of the same image from history is replaced with a short text marker. VS Code re-sends the full history every turn — without this, one screenshot adds ~2M characters to EVERY request.",
-            "Raw: always send images raw, even repeats from history (pre-v0.18 behaviour)."
+            "Marker (default): images NEVER reach the primary model as raw bytes. A vision model describes every image first (the unified two-phase describe, for vision-capable and text-only models alike) and the primary answers from the text description; images that cannot be described (no vision model, a failed call, or past the 4-per-turn describe budget) degrade to short text markers. Zero image bytes in every outgoing payload.",
+            "Raw: the FIRST send of each image goes raw to a vision-capable primary (no describe step); repeat re-sends of the same image from history are still replaced with short text markers (the v0.18 lifecycle)."
           ],
           "default": "marker",
-          "description": "How re-sent history images are handled on the native vision path. Marker mode keeps sessions lean (a screenshot is uploaded once per session, not once per turn); raw mode restores the old behaviour.",
+          "description": "How images are handled for vision-capable models. Marker mode (default, ArchCom 2026-09-15) unifies the describe path: a vision model describes every image and the primary model answers from the description — an image never lives in the context as raw bytes. Raw mode means the FIRST send of each image goes raw to the primary (not \"everything raw always\"): repeats from history still become markers, so sessions stay lean either way.",
           "scope": "application"
         },
         "ollamaCloud.visionFallback.model": {
@@ -315,8 +315,8 @@
         },
         "ollamaCloud.compaction.enabled": {
           "type": "boolean",
-          "default": false,
-          "description": "Enable context compaction (v0.13.0). When the conversation approaches the model's context window (75%), older turns are summarized into a compact checkpoint by a cheap model; the full evicted history is kept locally and referenced by an `ocp-compaction://` pointer. Compaction never fails the chat — on any failure the request proceeds uncompacted. Off by default.",
+          "default": true,
+          "description": "Context compaction (v0.13.0, default ON since v0.19.0). When the conversation approaches the model's context window (75%), older turns are summarized into a compact checkpoint by a cheap model; the full evicted history is kept locally and referenced by an `ocp-compaction://` pointer. Compaction never fails the chat — on any failure the request proceeds uncompacted. Set to `false` to restore the pre-v0.19 opt-in behaviour.",
           "scope": "application"
         },
         "ollamaCloud.compaction.model": {

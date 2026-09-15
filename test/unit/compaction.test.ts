@@ -138,6 +138,18 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(shouldCompact(discharged, 900, 1000), false);
       assert.strictEqual(shouldCompact(discharged, 300, 1000), false);
     });
+
+    it('NEVER fires on an unknown window (ArchCom 2026-09-15 invariant 4)', () => {
+      const armed: CompactionState = { armed: true };
+      // 75% of an unknown/zero/non-finite window is meaningless — the
+      // machine must not fire regardless of usage. The v0.19.0 default
+      // flip makes this the safe path for any model whose window the
+      // catalog/probe could not establish.
+      assert.strictEqual(shouldCompact(armed, 900, 0), false);
+      assert.strictEqual(shouldCompact(armed, 900, -1000), false);
+      assert.strictEqual(shouldCompact(armed, 900, Number.NaN), false);
+      assert.strictEqual(shouldCompact(armed, 900, Number.POSITIVE_INFINITY), false);
+    });
   });
 
   describe('applyCompacted (re-arm at 75% fire threshold — Bug 1 fix)', () => {

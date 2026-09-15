@@ -468,8 +468,28 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.equal(textVals.filter((v) => v === 'full vision answer').length, 1);
   });
 
-  it('forwards the image as a data URL when the model supports vision', async () => {
+  it('forwards the image as a data URL when the model supports vision (visionHistory.mode=raw)', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // ArchCom 2026-09-15 — the unified describe (variant (b)) made
+    // marker mode replace the image with a vision-model description
+    // even for vision-capable primaries. The raw-forwarding contract
+    // this test pinned is the v0.18 behaviour; it now lives behind
+    // `visionHistory.mode='raw'` (first send raw). Marker mode is
+    // covered by unifiedVision.test.ts. NOTE: `_replace` swaps the
+    // WHOLE store, so the baseUrl/connections from beforeEach must
+    // be repeated here.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+      'visionHistory.mode': 'raw',
+    });
 
     // kimi-k3 is a vision-capable model (snapshot vision + /api/show-verified
     // imageInput metadata). The image must be forwarded in the
@@ -631,7 +651,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.ok(turn2.includes('[Image'), 'marker present');
   });
 
-  it('native vision: history re-send of an image becomes a marker, first send stays raw (ADR 0013 lifecycle)', async () => {
+  it('native vision: history re-send of an image becomes a marker, first send stays raw (ADR 0013 lifecycle, visionHistory.mode=raw)', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
     clearCapabilityCache();
     setConfig({
@@ -644,7 +664,10 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
       connections: [
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
       ],
-      'visionHistory.mode': 'marker',
+      // ArchCom 2026-09-15 — the marker-mode native path now runs the
+      // unified describe (see unifiedVision.test.ts). The v0.18
+      // first-send-raw lifecycle this test pins is the `'raw'` mode.
+      'visionHistory.mode': 'raw',
     });
 
     const imageBodies: Array<unknown> = [];
@@ -717,6 +740,10 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     // `ollamaCloud.visionModels` patterns never reached it — a user-
     // declared vision model was still rejected as text-only. The fix
     // coalesces with `cloudConnection`, which carries the global list.
+    // ArchCom 2026-09-15 — same as the native-vision test above: the
+    // global-override path forwards the image raw only in
+    // `visionHistory.mode='raw'` (marker mode now runs the unified
+    // describe for vision-capable primaries).
     clearCapabilityCache();
     setConfig({
       baseUrl: BASE_URL,
@@ -728,6 +755,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
       connections: [
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
       ],
+      'visionHistory.mode': 'raw',
     });
 
     global.fetch = (async (input: string | URL, init?: RequestInit) => {
