@@ -24,6 +24,7 @@ import {
   type SsrfGuard,
 } from './ssrfGuard.js';
 import { isSocketCloseError } from './retry.js';
+import { degradedImageMarker } from './visionHistory.js';
 
 /**
  * Vision Fallback Two-Phase (supersedes ADR 0004 pass-through as the
@@ -86,6 +87,16 @@ export function wrapDescription(
 ): string {
   return `[Image description from ${visionModelName}: ${description}]`;
 }
+
+/**
+ * ArchCom 2026-09-15 (variant (b), invariant 3) — per-turn describe
+ * budget. At most this many vision-model describe calls fire per chat
+ * turn; images past the budget degrade to the ADR 0013 marker cycle
+ * (with a warning log) instead of unbounded vision spend. Cached
+ * descriptions do NOT consume budget — only fresh describe calls
+ * count.
+ */
+export const DESCRIBE_BUDGET_PER_TURN = 4;
 
 /**
  * Session-level description cache: image hash → wrapped description.
@@ -190,6 +201,19 @@ export interface TwoPhaseParams {
   readonly authManager: AuthManager;
   readonly catalog: readonly ModelDefinition[];
   readonly connections: readonly ConnectionConfig[];
+  /**
+   * ArchCom 2026-09-15 variant (b) — degradation mode for
+   * VISION-CAPABLE primaries. When `true` (unified describe path for
+   * a vision primary), a describe failure or an empty description
+   * DEGRADES that image to the ADR 0013 marker cycle with a
+   * `logger.warn` instead of throwing: the vision primary still
+   * answers the turn, and the image bytes never reach the payload
+   * (owner directive: an image must not live in context in any
+   * outcome). When `false` (text-only primary, legacy contract), a
+   * failure still throws — the text-only primary could not answer an
+   * image turn at all.
+   */
+  readonly degradeOnFailure?: boolean;
 }
 
 /**
@@ -199,12 +223,18 @@ export interface TwoPhaseParams {
  *   continues its normal dispatch with these.
  * - `visionModelName` — the vision model that produced the
  *   description (for logging / disclosure).
+ * - `degradedHashes` — images that degraded to the ADR 0013 marker
+ *   cycle (ArchCom 2026-09-15 variant (b)): describe failure, empty
+ *   description, or per-turn budget exhaustion. Only populated in
+ *   `degradeOnFailure` mode; the legacy text-only path throws
+ *   instead and leaves this empty.
  */
 export interface TwoPhaseResult {
   readonly messages: vscode.LanguageModelChatRequestMessage[];
   readonly visionModel: ModelDefinition;
   readonly visionConnection: ConnectionConfig | undefined;
   readonly description: string;
+  readonly degradedHashes: string[];
 }
 
 /**
@@ -288,12 +318,30 @@ export async function executeTwoPhaseVision(
   );
   const cacheHits = uniqueImages.size - uncachedHashes.length;
 
+  // ArchCom 2026-09-15 (variant (b), invariant 3) — per-turn describe
+  // budget. Fresh describe calls are capped at DESCRIBE_BUDGET_PER_TURN
+  // (4); cached hits are free. Hashes past the budget degrade to the
+  // ADR 0013 marker cycle (logged below) — the primary never receives
+  // image bytes, and a pasted 10-image collage cannot cost 10 vision
+  // calls on one turn.
+  const budgetHashes = uncachedHashes.slice(0, DESCRIBE_BUDGET_PER_TURN);
+  const overBudgetHashes = uncachedHashes.slice(DESCRIBE_BUDGET_PER_TURN);
+  if (overBudgetHashes.length > 0) {
+    logger.warn(
+      'vision two-phase: describe budget (%d per turn) exceeded — %d image(s) degraded to markers this turn (hashes=%s)',
+      DESCRIBE_BUDGET_PER_TURN,
+      overBudgetHashes.length,
+      overBudgetHashes.join(','),
+    );
+  }
+
   // Routing disclosure (same annotation pattern as pass-through) —
-  // ONLY when there are NEW images to describe. On text-only turns
-  // where every image is already cached, the substitution is silent:
-  // no vision call, no "Describing image" annotation — control goes
-  // straight to the primary model (owner directive 2026-08-20).
-  if (uncachedHashes.length > 0) {
+  // ONLY when there are NEW images to describe (budget-capped). On
+  // text-only turns where every image is already cached, the
+  // substitution is silent: no vision call, no "Describing image"
+  // annotation — control goes straight to the primary model (owner
+  // directive 2026-08-20).
+  if (budgetHashes.length > 0) {
     const viaSuffix =
       visionConnection && visionConnection.id !== params.primaryModel.connectionId
         ? ` (via ${visionConnection.label})`
@@ -310,6 +358,7 @@ export async function executeTwoPhaseVision(
     imageHashes: [...uniqueImages.keys()],
     cacheHits,
     cacheMisses: uncachedHashes.length,
+    degraded: overBudgetHashes.length,
   });
 
   // --- Phase 1: non-streaming vision call ---
@@ -354,7 +403,8 @@ export async function executeTwoPhaseVision(
   }
 
   const freshDescriptions: string[] = [];
-  for (const hash of uncachedHashes) {
+  const degradedHashes: string[] = [...overBudgetHashes];
+  for (const hash of budgetHashes) {
     const base64 = uniqueImages.get(hash);
     if (!base64) {
       continue;
@@ -406,17 +456,36 @@ export async function executeTwoPhaseVision(
         clearTimeout(timer);
       }
     }
-    if (failure) {
-      const detail = abortedByTimeout
-        ? `vision model call timed out after ${TIMEOUT_MS}ms`
-        : failure instanceof Error
-          ? failure.message
-          : String(failure);
-      // Re-attach the context — the user sees a clear error, not a
-      // silent text-only fallback (no silent degradation, ADR 0004 #9).
-      throw new Error(`Vision two-phase: vision model call failed — ${detail}`);
-    }
-    if (!description.trim()) {
+    const emptyDescription = !failure && !description.trim();
+    if (failure || emptyDescription) {
+      const detail =
+        failure === undefined || failure === null
+          ? 'vision model returned an empty description'
+          : abortedByTimeout
+            ? `vision model call timed out after ${TIMEOUT_MS}ms`
+            : failure instanceof Error
+              ? failure.message
+              : String(failure);
+      // ArchCom 2026-09-15 variant (b), invariant 2 — degradation,
+      // not silence and not a dead turn. For a VISION-CAPABLE
+      // primary (degradeOnFailure), a failed/empty describe degrades
+      // the image to the ADR 0013 marker cycle with a warning log;
+      // the primary still answers the turn and no image bytes leak
+      // into the payload. For a TEXT-ONLY primary (legacy contract)
+      // the error still throws — the user gets a clear error, not a
+      // silent text-only fallback (ADR 0004 #9).
+      if (params.degradeOnFailure) {
+        logger.warn(
+          'vision two-phase: describe failed (hash=%s) — %s. Image degraded to marker (degradation mode for vision-capable primary).',
+          hash,
+          detail,
+        );
+        degradedHashes.push(hash);
+        continue;
+      }
+      if (failure) {
+        throw new Error(`Vision two-phase: vision model call failed — ${detail}`);
+      }
       throw new Error(
         'Vision two-phase: vision model returned an empty description. Cannot substitute image.',
       );
@@ -432,6 +501,15 @@ export async function executeTwoPhaseVision(
     const wrapped = wrapDescription(visionModel.name, description);
     imageDescriptionCache.set(hash, wrapped);
     freshDescriptions.push(wrapped);
+  }
+
+  // Degraded images enter the cache as MARKER strings so the rewrite
+  // pass below substitutes them like any other cache entry, and so a
+  // repeat send of the same image on a later turn ALSO stays a marker
+  // (never raw) — the invariant "zero image parts in every payload
+  // in marker mode" holds even when the describe failed.
+  for (const hash of degradedHashes) {
+    imageDescriptionCache.set(hash, degradedImageMarker(hash));
   }
 
   // Evict oldest entries when over the cap (insertion order = age),
@@ -459,6 +537,7 @@ export async function executeTwoPhaseVision(
     visionModel,
     visionConnection,
     description: freshDescriptions.join('\n\n'),
+    degradedHashes,
   };
 }
 

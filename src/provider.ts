@@ -73,9 +73,10 @@ import {
   openAiBaseUrl,
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
-import { executePassThrough, shouldFallback } from './visionFallback.js';
+import { executePassThrough, resolveVisionModel, shouldFallback } from './visionFallback.js';
 import {
   applyVisionHistoryLifecycle,
+  degradeImagesToMarkers,
   resolveVisionHistoryMode,
 } from './visionHistory.js';
 import { executeTwoPhaseVision } from './visionTwoPhase.js';
@@ -859,14 +860,28 @@ export class OllamaCloudChatProvider
       }
 
       // Vision gate — SEC-03 complement: do NOT silently drop image
-      // attachments sent to a text-only model. Two outcomes:
-      //   - Fallback ENABLED (ADR 0004): when the primary model cannot
-      //     handle the image, route the turn to a vision-capable model
-      //     via `executePassThrough` (single-hop pass-through). The vision
-      //     model answers the user directly; the primary is not involved.
-      //   - Fallback DISABLED: throw a clear error so the user sees why
-      //     the request failed and can switch to a vision-capable model
-      //     (constraint 9 — no silent degradation; current behaviour).
+      // attachments. Outcomes by branch (ArchCom 2026-09-15 variant
+      // (b) — "unified vision descriptions"):
+      //   - Text-only primary + fallback ENABLED (ADR 0004): route
+      //     the turn to a vision model (two-phase describe or
+      //     pass-through). Contract unchanged.
+      //   - Text-only primary + fallback DISABLED: throw a clear
+      //     error so the user sees why the request failed and can
+      //     switch to a vision-capable model (constraint 9 — no
+      //     silent degradation; unchanged).
+      //   - Vision-capable primary + visionHistory.mode='marker'
+      //     (default): the primary is NOT handed the raw image. The
+      //     turn runs the unified two-phase describe (vision model
+      //     describes, primary answers from the description). When
+      //     the describe cannot run (no vision model resolvable) or
+      //     fails, the history DEGRADES to the ADR 0013 marker cycle
+      //     with a logger.warn — degradation, not silence, and never
+      //     image bytes in the payload (owner directive: an image
+      //     must not live in context in ANY outcome).
+      //   - Vision-capable primary + visionHistory.mode='raw': the
+      //     FIRST send of each image goes RAW to the primary (the
+      //     v0.18 lifecycle); repeat re-sends from history still
+      //     become markers (the lifecycle itself is mode-independent).
       // v0.12.1 — vision gate. `requestHasImages` is true only when
     // Copilot Chat actually passed image parts. For text-only models
     // Copilot Chat clips image attachments UNLESS the model advertised
@@ -882,12 +897,13 @@ export class OllamaCloudChatProvider
     const requestHasImages = messages.some(
       (m) => m.role === vscode.LanguageModelChatMessageRole.User && hasImageParts(m.content),
     );
-    // ADR 0013 lifecycle — set true when the two-phase path replaces
-    // image parts with descriptions below (the native lifecycle then
-    // stays out of the way; see the native dispatch block).
+    // ADR 0013 lifecycle — set true when a path above already
+    // replaced image parts with descriptions/markers (the native
+    // lifecycle then stays out of the way; see the native dispatch
+    // block).
     let twoPhaseRewroteHistory = false;
-      // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection` to
-      // undefined (legacy path), which silently dropped the user's
+      // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection`
+      // to undefined (legacy path), which silently dropped the user's
       // `ollamaCloud.visionModels` override for the cloud connection:
       // the gate fell back to `[]` patterns and a user-declared vision
       // model was still treated as text-only. `cloudConnection` carries
@@ -963,24 +979,81 @@ export class OllamaCloudChatProvider
             `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
           );
         }
+      } else if (
+        requestHasImages &&
+        supportsImages &&
+        resolveVisionHistoryMode() === 'marker'
+      ) {
+        // ArchCom 2026-09-15 variant (b) — unified describe for a
+        // VISION-CAPABLE primary. The primary never receives the raw
+        // image in marker mode; it receives the vision model's text
+        // description. Resolution order mirrors the fallback path:
+        // a resolvable vision model → two-phase describe
+        // (`degradeOnFailure`: a describe failure degrades that image
+        // to the marker cycle, the turn proceeds); no vision model →
+        // FULL degradation of every image to markers with a warning
+        // (NOT the "does not support image input" throw — that error
+        // is the text-only-without-fallback contract; here the
+        // primary CAN see images, we just refuse to forward bytes).
+        const visionTarget = resolveVisionModel(
+          model,
+          connection ?? cloudConnection,
+          this.modelCatalog.list(),
+          connections,
+        );
+        if (visionTarget) {
+          const twoPhaseResult = await executeTwoPhaseVision({
+            primaryModel: model,
+            primaryConnection: connection ?? cloudConnection,
+            messages,
+            options,
+            progress,
+            token,
+            authManager: this.authManager,
+            catalog: this.modelCatalog.list(),
+            connections,
+            degradeOnFailure: true,
+          });
+          messages = twoPhaseResult.messages;
+          twoPhaseRewroteHistory = true;
+          if (twoPhaseResult.degradedHashes.length > 0) {
+            logger.warn(
+              'unified vision describe: %d image(s) on a vision-capable primary degraded to markers this turn (hashes=%s)',
+              twoPhaseResult.degradedHashes.length,
+              twoPhaseResult.degradedHashes.join(','),
+            );
+          }
+        } else {
+          const degraded = degradeImagesToMarkers(messages);
+          if (degraded) {
+            messages = degraded.messages;
+            twoPhaseRewroteHistory = true;
+            logger.warn(
+              'unified vision describe: no vision model available to describe images for vision-capable primary %s — %d image(s) degraded to markers (hashes=%s). Configure ollamaCloud.visionFallback.model to enable descriptions.',
+              model.name,
+              degraded.degradedHashes.length,
+              degraded.degradedHashes.join(','),
+            );
+          }
+        }
       }
 
       // ADR 0013 lifecycle extension (2026-09-15) — apply the
       // image-resend lifecycle ONCE, right after the vision gate,
-      // for ALL dispatch branches (native / responses / compat). VS
-      // Code re-sends immutable history every turn; without this the
-      // same screenshot re-uploads ~2M base64 chars PER TURN on
-      // every vision-capable path, inflating sessions to 2.46M
-      // chars (the subagent D408 RCA). First send of a hash: RAW;
-      // repeats: a short in-band marker. Skipped entirely when
-      // two-phase already rewrote the history (its descriptions
-      // replace the images), when the request carries no images, or
-      // when the user opts out via ollamaCloud.visionHistory='raw'.
-      if (
-        requestHasImages &&
-        !twoPhaseRewroteHistory &&
-        resolveVisionHistoryMode() === 'marker'
-      ) {
+      // for ALL dispatch branches (native / responses / compat) and
+      // BOTH history modes. VS Code re-sends immutable history every
+      // turn; without this the same screenshot re-uploads ~2M base64
+      // chars PER TURN on every vision-capable path, inflating
+      // sessions to 2.46M chars (the subagent D408 RCA). First send
+      // of a hash: RAW; repeats: a short in-band marker. Skipped
+      // when a two-phase pass above already rewrote the history (its
+      // descriptions/markers replace the images) or when the request
+      // carries no images. NOTE: since ArchCom 2026-09-15 the
+      // lifecycle applies in `'raw'` mode TOO — `'raw'` opts out of
+      // the unified describe (first send raw), NOT out of the
+      // repeat-marker protection (that is the v0.18 lifecycle that
+      // shipped with `'raw'` already in effect).
+      if (requestHasImages && !twoPhaseRewroteHistory) {
         messages = applyVisionHistoryLifecycle(messages, this.sentImageHashes);
       }
 
