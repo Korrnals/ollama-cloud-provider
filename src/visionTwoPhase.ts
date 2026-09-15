@@ -328,10 +328,7 @@ export async function executeTwoPhaseVision(
   const overBudgetHashes = uncachedHashes.slice(DESCRIBE_BUDGET_PER_TURN);
   if (overBudgetHashes.length > 0) {
     logger.warn(
-      'vision two-phase: describe budget (%d per turn) exceeded — %d image(s) degraded to markers this turn (hashes=%s)',
-      DESCRIBE_BUDGET_PER_TURN,
-      overBudgetHashes.length,
-      overBudgetHashes.join(','),
+      `vision two-phase: describe budget (${DESCRIBE_BUDGET_PER_TURN} per turn) exceeded — ${overBudgetHashes.length} image(s) degraded to markers this turn (hashes=${overBudgetHashes.join(',')})`,
     );
   }
 
@@ -503,13 +500,18 @@ export async function executeTwoPhaseVision(
     freshDescriptions.push(wrapped);
   }
 
-  // Degraded images enter the cache as MARKER strings so the rewrite
-  // pass below substitutes them like any other cache entry, and so a
-  // repeat send of the same image on a later turn ALSO stays a marker
-  // (never raw) — the invariant "zero image parts in every payload
-  // in marker mode" holds even when the describe failed.
+  // Review P1-2 (2026-09-15) — degraded hashes are NOT written into
+  // the image-description cache. The cache is persistent and a
+  // transient describe failure (429/500/timeout) must not poison the
+  // image into a permanent marker: the next turn with a fresh budget
+  // retries the honest describe. The rewrite below substitutes the
+  // marker through a LOCAL overlay instead — this turn's payload
+  // still contains zero image parts (invariant holds), but nothing
+  // is remembered. Over-budget images get the same treatment: the
+  // budget resets every turn.
+  const degradedOverlay = new Map<string, string>();
   for (const hash of degradedHashes) {
-    imageDescriptionCache.set(hash, degradedImageMarker(hash));
+    degradedOverlay.set(hash, degradedImageMarker(hash));
   }
 
   // Evict oldest entries when over the cap (insertion order = age),
@@ -530,6 +532,7 @@ export async function executeTwoPhaseVision(
   const rewrittenMessages = replaceImagesWithCachedDescriptions(
     params.messages,
     imageDescriptionCache,
+    degradedOverlay,
   );
 
   return {
@@ -559,6 +562,7 @@ export async function executeTwoPhaseVision(
 function replaceImagesWithCachedDescriptions(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
   cache: ReadonlyMap<string, string>,
+  degradedOverlay: ReadonlyMap<string, string> = new Map(),
 ): vscode.LanguageModelChatRequestMessage[] {
   const result: vscode.LanguageModelChatRequestMessage[] = [];
 
@@ -586,7 +590,10 @@ function replaceImagesWithCachedDescriptions(
           data && data.length > 0
             ? sha256ShortHex(Buffer.from(data))
             : 'no-image';
-        const cached = cache.get(hash);
+        // Review P1-2: degraded markers live in a per-turn overlay —
+        // checked BEFORE the persistent cache (a poisoned entry must
+        // not exist there anymore, but the order is defensive).
+        const cached = degradedOverlay.get(hash) ?? cache.get(hash);
         if (cached) {
           // Substitute the cached (or just-fresh) description.
           newContent.push(new vscode.LanguageModelTextPart(`\n\n${cached}`));

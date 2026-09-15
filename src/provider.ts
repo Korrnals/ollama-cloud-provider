@@ -971,6 +971,13 @@ export class OllamaCloudChatProvider
           // `convertToResponsesInput`, `convertMessagesToNative`) now
           // see the text description instead of the image parts.
           messages = twoPhaseResult.messages;
+          // Review P2-2 — surface partial degradation on the legacy
+          // text-primary path (budget/failure): never silent.
+          if (twoPhaseResult.degradedHashes.length > 0) {
+            logger.warn(
+              `vision two-phase: ${twoPhaseResult.degradedHashes.length} image(s) degraded to markers this turn (describe budget or failure) — hashes: ${twoPhaseResult.degradedHashes.join(', ')}`,
+            );
+          }
           // ADR 0013 lifecycle — the two-phase path already replaced
           // every image part with a description; the native lifecycle
           // must not record hashes from this rewritten history.
@@ -1031,10 +1038,7 @@ export class OllamaCloudChatProvider
             messages = degraded.messages;
             twoPhaseRewroteHistory = true;
             logger.warn(
-              'unified vision describe: no vision model available to describe images for vision-capable primary %s — %d image(s) degraded to markers (hashes=%s). Configure ollamaCloud.visionFallback.model to enable descriptions.',
-              model.name,
-              degraded.degradedHashes.length,
-              degraded.degradedHashes.join(','),
+              `unified vision describe: no vision model available to describe images for vision-capable primary ${model.name} — ${degraded.degradedHashes.length} image(s) degraded to markers (hashes=${degraded.degradedHashes.join(',')}). Configure ollamaCloud.visionFallback.model to enable descriptions.`,
             );
           }
         }

@@ -513,11 +513,78 @@ describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates
     assert.ok(
       logger
         .getRecentErrors()
-        // logger.warn does no printf substitution — the literal `%d`
-        // placeholder stays in the formatted line.
-        .some((line) => /describe budget \(%d per turn\) exceeded/.test(line)),
+        // P3-2: the warn uses a template literal now — assert the real
+        // message text with the budget value interpolated.
+        .some((line) => /describe budget \(4 per turn\) exceeded/.test(line)),
       'the budget overrun was logged',
     );
+  });
+
+  it('G1: transient describe failure does NOT poison the image — next turn gets an honest describe (review P1-2)', async () => {
+    let describeCalls = 0;
+    let describeFails = true;
+    configure();
+    const chatBodies: Array<Record<string, unknown>> = [];
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        describeCalls += 1;
+        if (describeFails) {
+          return new Response('vision upstream overloaded', { status: 500 });
+        }
+        return new Response(
+          JSON.stringify({ message: { content: 'a fresh honest description' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      chatBodies.push(parsed);
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const token = new vscode.CancellationTokenSource().token;
+    const call = () =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        [imageMsg(IMG_A)],
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+
+    // Turn 1: describe returns 500 — degrade to a marker THIS turn
+    // (zero bytes leak), but nothing is remembered in the cache.
+    await call();
+    assert.equal(describeCalls, 1, 'turn 1: describe attempted');
+    assertZeroImageBytes(chatBodies[0] as Record<string, unknown>, 'turn 1 degraded');
+    assert.ok(
+      JSON.stringify(chatBodies[0]).includes('[Image'),
+      'turn 1 marker present',
+    );
+
+    // Turn 2: SAME image — describe must be RETRIED (the failed
+    // marker was never cached); the payload carries the description.
+    describeFails = false;
+    await call();
+    assert.equal(describeCalls, 2, 'turn 2: describe retried, not a poisoned cache hit');
+    const serialized2 = JSON.stringify(chatBodies[1]);
+    assert.ok(
+      serialized2.includes('a fresh honest description'),
+      'turn 2 payload carries the honest description',
+    );
+    assertZeroImageBytes(chatBodies[1] as Record<string, unknown>, 'turn 2 still zero bytes');
   });
 
   it('G1: raw mode — vision-capable primary receives the image part on the FIRST send (v0.18 behaviour preserved)', async () => {
