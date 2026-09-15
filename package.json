@@ -253,6 +253,20 @@
           "description": "How the vision fallback handles an image attached to a text-only model. Two-phase describes the image via a vision model, then your primary model answers — keeping your primary model's reasoning. Pass-through lets the vision model answer directly.",
           "scope": "application"
         },
+        "ollamaCloud.visionHistory.mode": {
+          "type": "string",
+          "enum": [
+            "marker",
+            "raw"
+          ],
+          "enumDescriptions": [
+            "Marker (default): the first send of each image goes to the model raw; every later re-send of the same image from history is replaced with a short text marker. VS Code re-sends the full history every turn — without this, one screenshot adds ~2M characters to EVERY request.",
+            "Raw: always send images raw, even repeats from history (pre-v0.18 behaviour)."
+          ],
+          "default": "marker",
+          "description": "How re-sent history images are handled on the native vision path. Marker mode keeps sessions lean (a screenshot is uploaded once per session, not once per turn); raw mode restores the old behaviour.",
+          "scope": "application"
+        },
         "ollamaCloud.visionFallback.model": {
           "type": "string",
           "default": "",

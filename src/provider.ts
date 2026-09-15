@@ -74,6 +74,10 @@ import {
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
+import {
+  applyVisionHistoryLifecycle,
+  resolveVisionHistoryMode,
+} from './visionHistory.js';
 import { executeTwoPhaseVision } from './visionTwoPhase.js';
 import type {
   NativeChatMessage,
@@ -488,6 +492,19 @@ export class OllamaCloudChatProvider
    */
   private readonly contextInflationWarned = new Set<string>();
   /**
+   * ADR 0013 lifecycle extension (2026-09-15) — image hashes already
+   * sent RAW in this window/session. VS Code re-sends immutable
+   * history every turn; without this set the native vision path
+   * re-uploaded ~2M chars of base64 per screenshot PER TURN (the RCA
+   * behind the owner's 2.46M-char sessions that killed subagent
+   * delegations with context overflow). First send: raw; repeats: an
+   * in-band marker (~100 chars). In-memory per instance — a window
+   * reload re-sends each image once (acceptable, mirrors the
+   * two-phase cache posture rationale). Opt-out:
+   * ollamaCloud.visionHistory.mode = 'raw'.
+   */
+  private readonly sentImageHashes = new Set<string>();
+  /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
    * test harnesses may build contexts without `globalStorageUri`.
@@ -865,6 +882,10 @@ export class OllamaCloudChatProvider
     const requestHasImages = messages.some(
       (m) => m.role === vscode.LanguageModelChatMessageRole.User && hasImageParts(m.content),
     );
+    // ADR 0013 lifecycle — set true when the two-phase path replaces
+    // image parts with descriptions below (the native lifecycle then
+    // stays out of the way; see the native dispatch block).
+    let twoPhaseRewroteHistory = false;
       // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection` to
       // undefined (legacy path), which silently dropped the user's
       // `ollamaCloud.visionModels` override for the cloud connection:
@@ -892,10 +913,20 @@ export class OllamaCloudChatProvider
             .getConfiguration('ollamaCloud')
             .get<'two-phase' | 'pass-through'>('visionFallback.mode', 'two-phase');
           if (fallbackMode === 'pass-through') {
+            // ADR 0013 lifecycle — pass-through streams the VISION
+            // model's answer directly, but the request it sends still
+            // carries the user history (images included). Apply the
+            // re-send lifecycle here too: first RAW send reaches the
+            // vision model; repeats become markers (same ~2M/turn
+            // inflation fix as the primary dispatch — review P1-2).
+            const passThroughMessages =
+              resolveVisionHistoryMode() === 'marker'
+                ? applyVisionHistoryLifecycle(messages, this.sentImageHashes)
+                : messages;
             return await executePassThrough({
               primaryModel: model,
               primaryConnection: connection ?? cloudConnection,
-              messages,
+              messages: passThroughMessages,
               options,
               progress,
               token,
@@ -922,12 +953,35 @@ export class OllamaCloudChatProvider
           // `convertToResponsesInput`, `convertMessagesToNative`) now
           // see the text description instead of the image parts.
           messages = twoPhaseResult.messages;
+          // ADR 0013 lifecycle — the two-phase path already replaced
+          // every image part with a description; the native lifecycle
+          // must not record hashes from this rewritten history.
+          twoPhaseRewroteHistory = true;
           // Fall through to the normal primary-model dispatch below.
         } else {
           throw new Error(
             `${model.name} does not support image input. Select a model with vision capability before attaching images.`,
           );
         }
+      }
+
+      // ADR 0013 lifecycle extension (2026-09-15) — apply the
+      // image-resend lifecycle ONCE, right after the vision gate,
+      // for ALL dispatch branches (native / responses / compat). VS
+      // Code re-sends immutable history every turn; without this the
+      // same screenshot re-uploads ~2M base64 chars PER TURN on
+      // every vision-capable path, inflating sessions to 2.46M
+      // chars (the subagent D408 RCA). First send of a hash: RAW;
+      // repeats: a short in-band marker. Skipped entirely when
+      // two-phase already rewrote the history (its descriptions
+      // replace the images), when the request carries no images, or
+      // when the user opts out via ollamaCloud.visionHistory='raw'.
+      if (
+        requestHasImages &&
+        !twoPhaseRewroteHistory &&
+        resolveVisionHistoryMode() === 'marker'
+      ) {
+        messages = applyVisionHistoryLifecycle(messages, this.sentImageHashes);
       }
 
       const clientBaseUrl = connection
@@ -1356,6 +1410,8 @@ export class OllamaCloudChatProvider
           // is `off`, the original conversion path runs unchanged.
           // Before this, the native path — the DEFAULT for cloud
           // (`auto` → native) — silently bypassed the filter.
+          // ADR 0013 lifecycle — already applied once above the
+          // dispatch (all three branches share it); no per-branch copy.
           const nativeMessages = resolveNativeMessages(filterReport, filteredMessages, messages);
           const nativeTools = resolveNativeTools(filterReport, filteredTools, options.tools);
           const nativeConfig = resolveModelRequestConfiguration(model, modelOptions, 'native');

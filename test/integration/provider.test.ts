@@ -567,6 +567,148 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.equal(userEntry.content, 'hi');
   });
 
+  it('pass-through vision fallback: history re-send also becomes a marker (ADR 0013 lifecycle, review P1-2)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
+      'visionFallback.mode': 'pass-through',
+      'visionHistory.mode': 'marker',
+    });
+
+    const bodies: Array<unknown> = [];
+    global.fetch = (async (_input: string | URL, init?: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      bodies.push(body);
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"vision ok"}}]}\n\n'),
+          encode('data: [DONE]\n\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+    const call = (msgs: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        msgs,
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+
+    // Turn 1: the pass-through vision model must see the image RAW.
+    await call([imageMsg()]);
+    assert.ok(JSON.stringify(bodies[0]).includes('image_url'), 'turn 1 raw');
+
+    // Turn 2: same history re-sent — marker, not 2M of base64 again.
+    await call([
+      imageMsg(),
+      {
+        role: vscode.LanguageModelChatMessageRole.Assistant,
+        content: [new vscode.LanguageModelTextPart('vision ok')],
+        name: undefined,
+      } as vscode.LanguageModelChatRequestMessage,
+      userMsg('and now?'),
+    ]);
+    const turn2 = JSON.stringify(bodies[1]);
+    assert.ok(!turn2.includes('image_url'), 'turn 2 history image became a marker');
+    assert.ok(turn2.includes('[Image'), 'marker present');
+  });
+
+  it('native vision: history re-send of an image becomes a marker, first send stays raw (ADR 0013 lifecycle)', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+      'visionHistory.mode': 'marker',
+    });
+
+    const imageBodies: Array<unknown> = [];
+    global.fetch = (async (_input: string | URL, init?: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      imageBodies.push(body);
+      return mockResponse(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'),
+          encode('data: [DONE]\n\n'),
+        ]),
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+
+    // Turn 1: kimi-k3 is a vision model — the image must go through
+    // as a RAW image_url data URL on the native (/chat/completions
+    // pinned) path.
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      token,
+    );
+    const turn1 = JSON.stringify(imageBodies[0]);
+    assert.ok(turn1.includes('image_url'), 'turn 1 forwards the image raw');
+
+    // Turn 2: VS Code re-sends the same history (image included).
+    // The lifecycle must replace the image part with a text marker.
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      [
+        imageMsg(),
+        {
+          role: vscode.LanguageModelChatMessageRole.Assistant,
+          content: [new vscode.LanguageModelTextPart('ok')],
+          name: undefined,
+        } as vscode.LanguageModelChatRequestMessage,
+        userMsg('what else?'),
+      ],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      token,
+    );
+    const turn2 = JSON.stringify(imageBodies[1]);
+    assert.ok(!turn2.includes('image_url'), 'turn 2 history image became a marker');
+    assert.ok(
+      turn2.includes('[Image'),
+      'the marker text is present in turn 2',
+    );
+    assert.ok(turn2.includes('what else?'), 'the new user text survived');
+
+    // beforeEach captured the clean fetch; afterEach restores it.
+  });
+
   it('cloud models honor the GLOBAL visionModels override (ArchCom 2026-09-14 P0 fix)', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
     // Regression: cloud models resolve `connection` to undefined (the
