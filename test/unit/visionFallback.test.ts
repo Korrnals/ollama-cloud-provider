@@ -558,7 +558,7 @@ describe('visionFallback.executePassThrough — 410 retire handling (OCP-2)', ()
     return new TextEncoder().encode(s);
   }
 
-  it('a 410 from /v1/responses propagates as LanguageModelError (retire-visible)', async () => {
+  it('a 410 from /v1/responses silently falls back to /chat/completions — the user still gets the vision answer', async () => {
     const { AuthManager } = await import('../../src/auth.js');
     const authManager = new AuthManager(makeMockContext());
     const primary = makeModel('ollama-cloud/gpt-oss:120b', 'cloud', false);
