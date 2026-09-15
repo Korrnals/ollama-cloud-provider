@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-15
+
+Catalog synced with live Ollama Cloud state: 27 retired models (HTTP 410) pruned from the picker — 410 now retires a model alongside 404 — kimi-k3 and nemotron-3-nano:30b context windows corrected (both live-verified via `/api/show`), `deepseek-v4.1-flash` (vision+thinking+tools), `deepseek-v4-flash:0731` and `deepseek-v4-pro:0813` added with minor context alignment, and the OCP-6 test debt (responsesClient window reset, pass-through healing) closed.
+
 ### Fixed
 - **Catalog synced with live Ollama Cloud state (slice catalog-sync-0.17)** — 27 retired models (HTTP 410) pruned from the snapshot; kimi-k3 context corrected 262144→1048576 and nemotron-3-nano:30b 1048576→262144 (both live-verified via `/api/show`); added `deepseek-v4.1-flash` (vision+thinking+tools), `deepseek-v4-flash:0731`, `deepseek-v4-pro:0813`; minor context alignment (glm-5.2, minimax-m2.7/m3, deepseek-v4-*); HTTP 410 now retires a model from the picker alongside 404. The picker no longer offers 27 dead models between refreshes.
 
