@@ -473,9 +473,7 @@ export async function executeTwoPhaseVision(
       // silent text-only fallback (ADR 0004 #9).
       if (params.degradeOnFailure) {
         logger.warn(
-          'vision two-phase: describe failed (hash=%s) — %s. Image degraded to marker (degradation mode for vision-capable primary).',
-          hash,
-          detail,
+          `vision two-phase: describe failed (hash=${hash}) — ${detail}. Image degraded to marker (degradation mode for vision-capable primary).`,
         );
         degradedHashes.push(hash);
         continue;

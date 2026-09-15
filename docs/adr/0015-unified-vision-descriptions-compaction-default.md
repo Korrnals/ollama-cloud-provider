@@ -191,6 +191,7 @@ The pass-through vision fallback (`visionFallback.mode='pass-through'`) is an EX
 | Risk | Mitigation | Why accepted |
 |---|---|---|
 | A vision-capable primary loses direct sight — even the first send is a description, not pixels | detailed hardcoded describe prompt; `visionHistory.mode='raw'` restores the v0.18 first-raw lifecycle; variant (v) held as opt-in if the field complains about first-turn quality | the directive ranks «no images in context, ever» above first-turn fidelity |
+| Describe-budget excess is chosen FIFO by history order (oldest first) — on a turn with 5+ new images the freshly-pasted one may degrade to a marker | Follow-up: prioritize the LAST user message's images when slicing the budget (review P2-1) |
 | A describe failure degrades the turn to markers | honest marker + log, visible annotation — never silent, never raw | degradation is visible by invariant 2; raw without opt-out would violate the master invariant |
 | Describe adds one hop to image turns | budget at most 4/turn; one-shot non-streaming call with 90 s timeout on a cheap model | a single call per new image only |
 | Compaction fires for users who never opted in | unchanged thresholds; never-fails-the-chat fallback; unknown-window never fires; rollback without rebuild | «качественно протестировать» = default flip + gates G1–G4 (Product Architect position) |

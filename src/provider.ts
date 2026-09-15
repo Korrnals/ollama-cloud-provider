@@ -1027,9 +1027,7 @@ export class OllamaCloudChatProvider
           twoPhaseRewroteHistory = true;
           if (twoPhaseResult.degradedHashes.length > 0) {
             logger.warn(
-              'unified vision describe: %d image(s) on a vision-capable primary degraded to markers this turn (hashes=%s)',
-              twoPhaseResult.degradedHashes.length,
-              twoPhaseResult.degradedHashes.join(','),
+              `unified vision describe: ${twoPhaseResult.degradedHashes.length} image(s) on a vision-capable primary degraded to markers this turn (hashes=${twoPhaseResult.degradedHashes.join(',')})`,
             );
           }
         } else {
