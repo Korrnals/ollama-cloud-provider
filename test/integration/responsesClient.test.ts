@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import { ResponsesClient } from '../../src/responsesClient.js';
+import { createCommitWindow } from '../../src/commitWindow.js';
 import type { StreamCallbacks } from '../../src/protocolTypes.js';
 
 /** Typed view of a stubbed global.fetch — carries restore metadata. */
@@ -85,6 +86,101 @@ function encode(s: string): Uint8Array {
 function event(type: string, json: string): Uint8Array {
   return encode(`event: ${type}\ndata: ${json}\n\n`);
 }
+
+
+// OCP-6 test-debt (2026-09-15): mirror of the ollamaClient P1-1 test —
+// a hidden in-window retry must never leak parser protocol state. For
+// /v1/responses the only cross-attempt state is `pendingEvent` (an
+// `event:` line held while waiting for its `data:` pair). The retry
+// resets it via onAttemptStart (src/responsesClient.ts).
+describe('responsesClient.streamResponses — commit-window hidden retry resets pendingEvent (OCP-6)', () => {
+  beforeEach(() => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestMaxDurationMin: 30,
+      maxRetries: 0,
+    });
+  });
+  afterEach(() => {
+    const stub = global.fetch as { __isStub?: boolean; __original?: typeof fetch };
+    if (stub.__isStub && stub.__original) global.fetch = stub.__original;
+  });
+
+  it('a dangling event: line from a discarded attempt never corrupts the retry', async function () {
+    this.timeout(10000); // one hidden-retry backoff (~1s ± jitter)
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        // Attempt 1: an `event:` line arrives WITHOUT its `data:` pair
+        // (pendingEvent is left dangling), then the socket closes 20ms
+        // in — inside the 60ms window → silent retry.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encode('event: response.output_item.done\n\n'));
+            setTimeout(() => {
+              const err = new Error('read ECONNRESET');
+              (err as { code?: string }).code = 'ECONNRESET';
+              controller.error(err);
+            }, 20);
+          },
+        });
+        return mockResponse(body);
+      }
+      // Attempt 2: the complete event pair + completed.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            event(
+              'response.output_item.done',
+              JSON.stringify({
+                item: {
+                  id: 'fc1',
+                  type: 'function_call',
+                  call_id: 'call-9',
+                  name: 'search',
+                  arguments: JSON.stringify({ q: 'x' }),
+                },
+                output_index: 0,
+              }),
+            ),
+          );
+          controller.enqueue(
+            event(
+              'response.completed',
+              '{"response":{"id":"r1","status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}',
+            ),
+          );
+          controller.close();
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const recorder = makeCallbacks();
+    const commitWindow = createCommitWindow(60);
+    const wrapped = commitWindow.wrap(recorder);
+    const client = new ResponsesClient(BASE_URL, 'sk-test-key');
+    await client.streamResponses(
+      { model: 'm', input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }] },
+      wrapped,
+    );
+
+    assert.equal(fetchCalls, 2, 'exactly one hidden in-window retry');
+    assert.equal(recorder.doneCount, 1);
+    assert.equal(recorder.errors.length, 0);
+    assert.equal(recorder.toolCalls.length, 1, 'exactly one valid tool call');
+    assert.equal(recorder.toolCalls[0]!.id, 'call-9');
+    assert.equal(recorder.toolCalls[0]!.name, 'search');
+    assert.deepEqual(recorder.toolCalls[0]!.input, { q: 'x' });
+    assert.equal(commitWindow.controller.hiddenRetryCount(), 1);
+
+    global.fetch = originalFetch;
+  });
+});
+
 
 describe('responsesClient.streamResponses — /v1/responses event protocol', () => {
   beforeEach(() => {

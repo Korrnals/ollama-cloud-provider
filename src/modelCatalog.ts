@@ -112,34 +112,9 @@ const HUMANIZED_SEGMENTS: Record<string, string> = {
 
 const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
   {
-    apiModel: 'cogito-2.1:671b',
-    family: 'cogito',
-    maxInputTokens: 163840,
-    maxOutputTokens: 32000,
-    imageInput: false,
-    toolCalling: true,
-    reasoning: false,
-  },
-  {
-    apiModel: 'deepseek-v3.1:671b',
-    family: 'deepseek',
-    maxInputTokens: 163840,
-    maxOutputTokens: 163840,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'deepseek-v3.2',
-    family: 'deepseek',
-    maxInputTokens: 163840,
-    maxOutputTokens: 65536,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
     apiModel: 'deepseek-v4-flash',
     family: 'deepseek',
-    maxInputTokens: 1000000,
+    maxInputTokens: 1048576,
     maxOutputTokens: 384000,
     imageInput: false,
     toolCalling: true,
@@ -147,59 +122,43 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
   {
     apiModel: 'deepseek-v4-pro',
     family: 'deepseek',
-    maxInputTokens: 1000000,
+    maxInputTokens: 1048576,
     maxOutputTokens: 384000,
     imageInput: false,
     toolCalling: true,
   },
   {
-    apiModel: 'devstral-2:123b',
-    family: 'devstral',
-    maxInputTokens: 262144,
-    maxOutputTokens: 262144,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'devstral-small-2:24b',
-    family: 'devstral',
-    maxInputTokens: 262144,
-    maxOutputTokens: 262144,
-    imageInput: true,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'gemini-3-flash-preview',
-    family: 'gemini',
+    // OCP-4 (2026-09-15) — live-verified via /api/show: caps
+    // [completion, tools, thinking]; context 1048576.
+    apiModel: 'deepseek-v4-flash:0731',
+    family: 'deepseek',
     maxInputTokens: 1048576,
-    maxOutputTokens: 65536,
+    maxOutputTokens: 384000,
     imageInput: false,
     toolCalling: true,
     reasoning: true,
   },
   {
-    apiModel: 'gemma3:12b',
-    family: 'gemma',
-    maxInputTokens: 131072,
-    maxOutputTokens: 131072,
-    imageInput: true,
-    toolCalling: false,
+    // OCP-4 (2026-09-15) — live-verified via /api/show: caps
+    // [completion, tools, thinking]; context 1048576.
+    apiModel: 'deepseek-v4-pro:0813',
+    family: 'deepseek',
+    maxInputTokens: 1048576,
+    maxOutputTokens: 384000,
+    imageInput: false,
+    toolCalling: true,
+    reasoning: true,
   },
   {
-    apiModel: 'gemma3:27b',
-    family: 'gemma',
-    maxInputTokens: 131072,
-    maxOutputTokens: 131072,
+    // OCP-4 (2026-09-15) — live-verified via /api/show: caps
+    // [completion, thinking, tools, VISION]; context 1048576.
+    apiModel: 'deepseek-v4.1-flash',
+    family: 'deepseek',
+    maxInputTokens: 1048576,
+    maxOutputTokens: 384000,
     imageInput: true,
-    toolCalling: false,
-  },
-  {
-    apiModel: 'gemma3:4b',
-    family: 'gemma',
-    maxInputTokens: 131072,
-    maxOutputTokens: 131072,
-    imageInput: true,
-    toolCalling: false,
+    toolCalling: true,
+    reasoning: true,
   },
   {
     apiModel: 'gemma4:31b',
@@ -209,30 +168,6 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
     imageInput: true,
     toolCalling: true,
     reasoning: true,
-  },
-  {
-    apiModel: 'glm-4.6',
-    family: 'glm',
-    maxInputTokens: 202752,
-    maxOutputTokens: 131072,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'glm-4.7',
-    family: 'glm',
-    maxInputTokens: 202752,
-    maxOutputTokens: 131072,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'glm-5',
-    family: 'glm',
-    maxInputTokens: 202752,
-    maxOutputTokens: 131072,
-    imageInput: false,
-    toolCalling: true,
   },
   {
     apiModel: 'glm-5.1',
@@ -245,7 +180,7 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
   {
     apiModel: 'glm-5.2',
     family: 'glm',
-    maxInputTokens: 1000000,
+    maxInputTokens: 1048576,
     maxOutputTokens: 131072,
     imageInput: false,
     toolCalling: true,
@@ -294,14 +229,6 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
     toolCalling: true,
   },
   {
-    apiModel: 'kimi-k2.5',
-    family: 'kimi',
-    maxInputTokens: 262144,
-    maxOutputTokens: 262144,
-    imageInput: true,
-    toolCalling: true,
-  },
-  {
     apiModel: 'kimi-k2.6',
     family: 'kimi',
     maxInputTokens: 262144,
@@ -319,61 +246,18 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
     reasoning: true,
   },
   {
-    apiModel: 'kimi-k2:1t',
-    family: 'kimi',
-    maxInputTokens: 262144,
-    maxOutputTokens: 262144,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'kimi-k2-thinking',
-    family: 'kimi',
-    maxInputTokens: 262144,
-    maxOutputTokens: 262144,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
     apiModel: 'kimi-k3',
     family: 'kimi',
-    maxInputTokens: 262144,
+    maxInputTokens: 1048576,
     maxOutputTokens: 262144,
     imageInput: true,
     toolCalling: true,
     reasoning: true,
   },
   {
-    apiModel: 'minimax-m2',
-    family: 'minimax',
-    maxInputTokens: 204800,
-    maxOutputTokens: 128000,
-    imageInput: false,
-    toolCalling: true,
-    reasoning: true,
-  },
-  {
-    apiModel: 'minimax-m2.1',
-    family: 'minimax',
-    maxInputTokens: 204800,
-    maxOutputTokens: 131072,
-    imageInput: false,
-    toolCalling: true,
-    reasoning: true,
-  },
-  {
-    apiModel: 'minimax-m2.5',
-    family: 'minimax',
-    maxInputTokens: 204800,
-    maxOutputTokens: 131072,
-    imageInput: false,
-    toolCalling: true,
-    reasoning: true,
-  },
-  {
     apiModel: 'minimax-m2.7',
     family: 'minimax',
-    maxInputTokens: 204800,
+    maxInputTokens: 196608,
     maxOutputTokens: 131072,
     imageInput: false,
     toolCalling: true,
@@ -382,35 +266,11 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
   {
     apiModel: 'minimax-m3',
     family: 'minimax',
-    maxInputTokens: 524288,
+    maxInputTokens: 512000,
     maxOutputTokens: 131072,
     imageInput: true,
     toolCalling: true,
     reasoning: true,
-  },
-  {
-    apiModel: 'ministral-3:14b',
-    family: 'ministral',
-    maxInputTokens: 262144,
-    maxOutputTokens: 128000,
-    imageInput: true,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'ministral-3:3b',
-    family: 'ministral',
-    maxInputTokens: 262144,
-    maxOutputTokens: 128000,
-    imageInput: true,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'ministral-3:8b',
-    family: 'ministral',
-    maxInputTokens: 262144,
-    maxOutputTokens: 128000,
-    imageInput: true,
-    toolCalling: true,
   },
   {
     apiModel: 'mistral-large-3:675b',
@@ -423,7 +283,7 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
   {
     apiModel: 'nemotron-3-nano:30b',
     family: 'nemotron',
-    maxInputTokens: 1048576,
+    maxInputTokens: 262144,
     maxOutputTokens: 131072,
     imageInput: false,
     toolCalling: true,
@@ -451,54 +311,6 @@ const SNAPSHOT_MODELS: readonly SnapshotModelDefinition[] = [
     maxInputTokens: 262144,
     maxOutputTokens: 81920,
     imageInput: true,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'qwen3-coder:480b',
-    family: 'qwen',
-    maxInputTokens: 262144,
-    maxOutputTokens: 65536,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'qwen3-coder-next',
-    family: 'qwen',
-    maxInputTokens: 262144,
-    maxOutputTokens: 65536,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'qwen3-next:80b',
-    family: 'qwen',
-    maxInputTokens: 262144,
-    maxOutputTokens: 32768,
-    imageInput: false,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'qwen3-vl:235b',
-    family: 'qwen',
-    maxInputTokens: 262144,
-    maxOutputTokens: 32768,
-    imageInput: true,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'qwen3-vl:235b-instruct',
-    family: 'qwen',
-    maxInputTokens: 262144,
-    maxOutputTokens: 131072,
-    imageInput: true,
-    toolCalling: true,
-  },
-  {
-    apiModel: 'rnj-1:8b',
-    family: 'rnj',
-    maxInputTokens: 32768,
-    maxOutputTokens: 4096,
-    imageInput: false,
     toolCalling: true,
   },
 ];
@@ -1206,10 +1018,17 @@ export function inferVersion(id: string, family: string): string {
 export function inferMaxInputTokens(id: string): number {
   if (
     id.startsWith('deepseek-v4-') ||
-    id.startsWith('gemini-3-flash-preview') ||
-    id.startsWith('nemotron-3-nano')
+    id.startsWith('deepseek-v4.1') ||
+    id.startsWith('gemini-3-flash-preview')
   ) {
     return 1048576;
+  }
+  // OCP-3 review sync (2026-09-15): nemotron-3-nano live-verified at
+  // 262144 — the former 1048576 was a 4x OVER-advertise (context
+  // overflow risk for unknown nano variants before the /api/show
+  // probe resolves them).
+  if (id.startsWith('nemotron-3-nano')) {
+    return 262144;
   }
   if (id.startsWith('deepseek-')) {
     return 163840;
@@ -1225,16 +1044,19 @@ export function inferMaxInputTokens(id: string): number {
     return 262144;
   }
   if (id.startsWith('glm-5.2')) {
-    return 1000000;
+    return 1048576;
   }
   if (id.startsWith('glm-')) {
     return 202752;
   }
   if (id.startsWith('minimax-m3')) {
-    return 524288;
+    return 512000;
   }
+  // Review sync: base minimax- heuristic follows the live m2.7
+  // (196608); retired m2/m2.1/m2.5 (204800) are pruned from the
+  // snapshot.
   if (id.startsWith('minimax-')) {
-    return 204800;
+    return 196608;
   }
   if (id.startsWith('gpt-oss')) {
     return 131072;
@@ -1305,6 +1127,7 @@ export function inferMaxOutputTokens(id: string): number {
 export function inferImageInput(id: string): boolean {
   return (
     id.includes('-vl:') ||
+    id.startsWith('deepseek-v4.1') ||
     id.startsWith('gemma3:') ||
     id.startsWith('gemma4:') ||
     id.startsWith('kimi-k2.5') ||

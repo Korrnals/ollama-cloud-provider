@@ -7,7 +7,12 @@ import {
   MidStreamError,
   ZeroByteSocketCloseError,
 } from '../../src/retry.js';
-import { clearCapabilityCache, markResponsesUnavailable } from '../../src/capabilityCache.js';
+import {
+  clearCapabilityCache,
+  isModelKnownRetired,
+  markChatAvailable,
+  markResponsesUnavailable,
+} from '../../src/capabilityCache.js';
 import { logger } from '../../src/logger.js';
 
 const BASE_URL = 'https://ollama.com/v1';
@@ -323,9 +328,9 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
   it('routes to vision fallback when enabled and primary cannot handle image', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
     // Enable the pass-through fallback (ADR 0004). The configured
-    // vision model is gemma3:12b — vision-capable, lives on the cloud
+    // vision model is kimi-k3 — vision-capable, lives on the cloud
     // connection. The primary (gpt-oss:120b) cannot handle images, so
-    // the provider must route the turn to gemma3:12b instead of
+    // the provider must route the turn to kimi-k3 instead of
     // throwing. Pin the cloud connection to /chat/completions so the
     // mock's chat-format SSE stream is consumed correctly (the test
     // asserts the fallback fires, not which endpoint is used).
@@ -341,7 +346,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
       ],
       'visionFallback.enabled': true,
-      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
       'visionFallback.mode': 'pass-through',
     });
 
@@ -373,11 +378,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     );
 
     // The fallback fired: fetch was called exactly once, targeting
-    // the vision model (gemma3:12b), not the primary. The user sees
+    // the vision model (kimi-k3), not the primary. The user sees
     // the vision model's streamed text, not the throw.
     assert.equal(fetchCalls.length, 1, 'fallback issued a single vision call');
     const body = fetchCalls[0].body as { model: string };
-    assert.equal(body.model, 'gemma3:12b', 'request targeted the vision model');
+    assert.equal(body.model, 'kimi-k3', 'request targeted the vision model');
     // ArchCom 0011b — routing annotation adds a part before model answer.
     const textVals380 = progress.parts
       .filter((p) => p instanceof vscode.LanguageModelTextPart)
@@ -385,10 +390,88 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.ok(textVals380.includes('vision answer'), 'vision answer must be in parts');
   });
 
+  it('pass-through vision stream heals an in-window break silently (OCP-6 window coverage)', async function () {
+    this.timeout(10000); // one hidden-retry backoff (~1s ± jitter)
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
+      'visionFallback.mode': 'pass-through',
+    });
+
+    let fetchCalls = 0;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        // Attempt 1: one text delta (buffered by the pass-through
+        // commit window — the user never sees it), then a socket close
+        // 20ms in, inside the 60ms window → silent retry.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encode('data: {"choices":[{"delta":{"content":"partial vision"}}]}\n\n'),
+            );
+            setTimeout(() => {
+              const err = new Error('read ECONNRESET');
+              (err as { code?: string }).code = 'ECONNRESET';
+              controller.error(err);
+            }, 20);
+          },
+        });
+        return mockResponse(body);
+      }
+      // Attempt 2: the complete vision answer.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"content":"full vision answer"}}]}\n\n'),
+          );
+          controller.enqueue(encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    assert.equal(fetchCalls, 2, 'exactly one hidden in-window retry');
+    const textVals = progress.parts
+      .filter((p) => p instanceof vscode.LanguageModelTextPart)
+      .map((p) => (p as vscode.LanguageModelTextPart).value);
+    // The discarded attempt's fragment must NEVER reach the user, and
+    // the final answer exactly once — no duplicates by construction.
+    assert.ok(!textVals.includes('partial vision'), 'discarded fragment leaked');
+    assert.equal(textVals.filter((v) => v === 'full vision answer').length, 1);
+  });
+
   it('forwards the image as a data URL when the model supports vision', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
 
-    // gemma3:12b is a vision-capable model (gemma3 family marker +
+    // kimi-k3 is a vision-capable model (snapshot vision + /api/show-verified
     // imageInput metadata). The image must be forwarded in the
     // OpenAI request body as an image_url data URL.
     global.fetch = (async (input: string | URL, init?: RequestInit) => {
@@ -408,7 +491,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     const token = new vscode.CancellationTokenSource().token;
 
     await provider.provideLanguageModelChatResponse(
-      chatInfoFor('gemma3:12b'),
+      chatInfoFor('kimi-k3'),
       [imageMsg()],
       {
         modelOptions: {},
@@ -630,7 +713,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — fallback 
     const provider = new OllamaCloudChatProvider(ctx);
     // Refresh the catalog so `list()` returns only the primary model.
     // Without this, the default KNOWN_MODELS snapshot includes
-    // gemma3:12b (vision-capable, cloud) and auto-search would find it.
+    // kimi-k3 (vision-capable, cloud) and auto-search would find it.
     await provider.syncModelCatalog(true);
 
     const progress = makeProgress();
@@ -938,7 +1021,7 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
       ],
       'visionFallback.enabled': true,
-      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
       'visionFallback.mode': 'pass-through',
     });
 
@@ -1025,7 +1108,7 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
       ],
       'visionFallback.enabled': true,
-      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
       'visionFallback.mode': 'pass-through',
     });
 
@@ -2749,5 +2832,179 @@ describe('classifyStreamError — ADR 0008 provider-level mapping', () => {
     assert.ok(result instanceof vscode.LanguageModelError);
     assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
     assert.match(result.message, /соединение прервано/);
+  });
+});
+
+// OCP-2 — retire-path regression: ollama.com now returns HTTP 410 (Gone)
+// for retired models, not 404. The retire counters in provider.ts must
+// fire on BOTH statuses or the model stays in the picker forever. These
+// tests feed a 410 HttpError through a real provideLanguageModelChatResponse
+// call and assert the per-model retire counter incremented.
+describe('OllamaCloudChatProvider — retire path accepts HTTP 410 (OCP-2)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    clearCapabilityCache();
+    setConfig({});
+    vscode.workspace
+      .getConfiguration('ollamaCloud')
+      ._setInspection('preferredEndpoint', null);
+  });
+
+  it('a 410 from /chat/completions increments the per-model retire counter', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Explicit chat endpoint → the 404/410 catch fires on the first
+    // attempt, no fallback round-trips.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+    global.fetch = (async (_input: string | URL, _init?: RequestInit) => {
+      return new Response(
+        JSON.stringify({ error: { message: 'model retired' } }),
+        { status: 410, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof vscode.LanguageModelError, 'throws LanguageModelError');
+        assert.equal((err as vscode.LanguageModelError).code, 'NotFound');
+        return true;
+      },
+    );
+
+    // The 410 must have been counted as a retire signal. gpt-oss:120b
+    // defaults to the 'cloud' connection → retire key "cloud:gpt-oss:120b".
+    // markModel404Once is a per-request guard, so every request that
+    // reaches a live 410 catch increments the counter by one. Explicit
+    // chat mode memoizes the endpoint unavailable after the FIRST 410
+    // (the cached-unavailable short-circuit at provider.ts:1229 throws
+    // before any fetch and intentionally does NOT inflate the counter —
+    // only distinct-request round-trips count). Reset the endpoint memo
+    // between requests so each round-trip reaches the live 410 catch;
+    // three 410s must flip the model retired.
+    assert.equal(
+      isModelKnownRetired('cloud', 'gpt-oss:120b'),
+      false,
+      'first 410: below the 3-distinct-request threshold',
+    );
+    for (let i = 2; i <= 3; i += 1) {
+      // Restore endpoint availability so the next request reaches the
+      // live catch (the memoized short-circuit skips fetch entirely).
+      markChatAvailable('cloud');
+      await assert.rejects(
+        () =>
+          provider.provideLanguageModelChatResponse(
+            chatInfoFor('gpt-oss:120b'),
+            [userMsg('hi')],
+            { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            progress,
+            token,
+          ),
+        () => true,
+      );
+      assert.equal(
+        isModelKnownRetired('cloud', 'gpt-oss:120b'),
+        i >= 3,
+        `request ${i}: counter increments per distinct request; retires at 3`,
+      );
+    }
+    assert.equal(
+      isModelKnownRetired('cloud', 'gpt-oss:120b'),
+      true,
+      'three 410s must retire the model (410 counts as a retire signal — OCP-2)',
+    );
+  });
+
+  it('a 410 from /api/chat (auto) increments the per-model retire counter to retirement', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Auto mode (default) resolves cloud to native /api/chat. Native
+    // 404s increment the per-model counter via markModel404Once on
+    // EVERY distinct request — no cached-unavailable short-circuit for
+    // the model counter (the endpoint auto-recovery counter is a
+    // separate mechanism). Three 410s → the model must flip retired.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    global.fetch = (async (_input: string | URL, _init?: RequestInit) => {
+      return new Response(
+        JSON.stringify({ error: { message: 'model retired' } }),
+        { status: 410, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    for (let i = 1; i <= 2; i += 1) {
+      await assert.rejects(
+        () =>
+          provider.provideLanguageModelChatResponse(
+            chatInfoFor('gpt-oss:120b'),
+            [userMsg('hi')],
+            { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            progress,
+            token,
+          ),
+        () => true,
+      );
+      assert.equal(
+        isModelKnownRetired('cloud', 'gpt-oss:120b'),
+        false,
+        `request ${i}: below the 3-distinct-request threshold`,
+      );
+    }
+    // Request 3 — threshold reached. Before the fix the counter never
+    // incremented on 410 (site at ~1387 gated on 404 only), so this
+    // failed with retired=false.
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      () => true,
+    );
+    assert.equal(
+      isModelKnownRetired('cloud', 'gpt-oss:120b'),
+      true,
+      'three 410s must retire the model (was blind to 410 — bug OCP-2)',
+    );
   });
 });
