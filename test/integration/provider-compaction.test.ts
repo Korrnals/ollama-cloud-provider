@@ -249,7 +249,9 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
 
   it('disabled → NO summarizer calls even over the threshold; messages unchanged', async () => {
     installFetch('ok');
-    // compaction.enabled not set → default false.
+    // v0.19.0 — the default is ON; this test pins the explicit
+    // opt-OUT path (a user setting compaction.enabled=false).
+    configure({ 'compaction.enabled': false });
     const { progress } = await runProvider(bigHistory());
 
     assert.equal(apiChatCalls.length, 0, 'no /api/chat summarizer call');
@@ -260,6 +262,34 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
     assert.ok(
       !progress.parts.some((p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠')),
       'no compaction annotation reported',
+    );
+    // v0.19.0 — the opt-out warning fires at 75% of the window: the
+    // message must state compaction is DISABLED (not invite the user
+    // to "enable" it as if it were off by default).
+    assert.ok(
+      progress.parts.some(
+        (p) =>
+          p instanceof vscode.LanguageModelTextPart &&
+          /Context at \d+%/.test(p.value) &&
+          p.value.includes('Compaction is currently DISABLED'),
+        'opt-out context-inflation warning reported',
+      ),
+    );
+  });
+
+  it('DEFAULT (unset) → compaction is ON: over threshold it fires with no explicit setting', async () => {
+    installFetch('ok');
+    // NOTE: `configure()` here does NOT set compaction.enabled — the
+    // stub's `.get` falls back to the package.json default (true
+    // since v0.19.0), proving the default flip end-to-end.
+    const { progress } = await runProvider(bigHistory());
+
+    assert.equal(apiChatCalls.length, 1, 'compaction fired on the default setting');
+    const chatBody = JSON.stringify(chatCalls[0]!.body);
+    assert.ok(chatBody.includes('[compacted-turns'), 'summary message injected');
+    assert.ok(
+      progress.parts.some((p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠')),
+      'compaction annotation reported',
     );
   });
 

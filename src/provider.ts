@@ -490,6 +490,8 @@ export class OllamaCloudChatProvider
    * v0.12.1 — tracks model ids for which the context-inflation warning
    * has already fired this session. Prevents spamming the user on every
    * turn once the threshold is crossed and compaction is disabled.
+   * v0.19.0 (ArchCom 2026-09-15 T2) — also carries the `${modelId}:unknown-window`
+   * sentinel for the unknown-window no-fire path (one warn per model).
    */
   private readonly contextInflationWarned = new Set<string>();
   /**
@@ -1093,7 +1095,7 @@ export class OllamaCloudChatProvider
       let openaiMessages = convertMessagesToOpenAI(messages);
 
       // v0.13.0 Slice 2 — context compaction (spec:
-      // docs/compaction-spec.md, default OFF). Runs BEFORE the ADR 0007
+      // docs/compaction-spec.md). Runs BEFORE the ADR 0007
       // context filter and BEFORE endpoint dispatch, so the filter
       // operates on the COMPACTED list and the injected summary message
       // (a `role:'system'` OpenAI message) flows through all three
@@ -1101,6 +1103,10 @@ export class OllamaCloudChatProvider
       // the chat — every failure inside `maybeCompact` logs a warning
       // and returns the uncompacted history (the filter path may still
       // truncate; that is the accepted degradation).
+      // v0.19.0 (ArchCom 2026-09-15 T2) — default flipped ON. The
+      // `.get` default below stays `false` only as a defensive
+      // fallback for hosts with a stale settings cache; the shipped
+      // default lives in package.json (`true`).
       openaiMessages = await this.maybeCompact(
         openaiMessages,
         model,
@@ -1832,12 +1838,19 @@ export class OllamaCloudChatProvider
 
   /**
    * v0.13.0 Slice 2 — runs one compaction check over the OpenAI-format
-   * history when `ollamaCloud.compaction.enabled` is on (default off).
-   * Returns the messages to send onward: the compacted array on fire,
-   * the input array otherwise. Called BEFORE the ADR 0007 context
-   * filter and endpoint dispatch, so the filter runs on the COMPACTED
-   * list and the injected summary message (a `role:'system'` OpenAI
-   * message) flows through every endpoint unchanged.
+   * history when `ollamaCloud.compaction.enabled` is on (default ON
+   * since v0.19.0, ArchCom 2026-09-15 T2). Returns the messages to
+   * send onward: the compacted array on fire, the input array
+   * otherwise. Called BEFORE the ADR 0007 context filter and endpoint
+   * dispatch, so the filter runs on the COMPACTED list and the
+   * injected summary message (a `role:'system'` OpenAI message) flows
+   * through every endpoint unchanged.
+   *
+   * Unknown-window safe path (ArchCom invariant 4): when the model's
+   * window is unknown (`maxInputTokens` missing/non-positive),
+   * compaction does NOT fire — the hysteresis has no denominator and
+   * an arbitrary split would evict context the model may still need.
+   * A one-time warning is surfaced instead.
    *
    * Fallback contract: NEVER throws — a summarizer/store failure logs
    * a warning and returns the uncompacted history (the filter path
@@ -1851,16 +1864,27 @@ export class OllamaCloudChatProvider
     progress: vscode.Progress<vscode.LanguageModelResponsePart>,
   ): Promise<OpenAICompatibleMessage[]> {
     const config = vscode.workspace.getConfiguration('ollamaCloud');
-    if (!config.get<boolean>('compaction.enabled', false)) {
-      // v0.12.1 — context-inflation warning (RCA 2026-08-19):
-      // compaction is opt-in (ADR: default off). When the conversation
-      // exceeds 75% of the model's window but compaction is disabled,
+    if (!config.get<boolean>('compaction.enabled', true)) {
+      // v0.19.0 — the default is ON (package.json); reaching here
+      // means the user explicitly opted out. The pre-v0.19
+      // context-inflation warning (RCA 2026-08-19) still applies:
       // surface a ONE-TIME-per-session warning so the user knows their
-      // context is growing unbounded and can enable compaction. The
-      // warning uses `progress.report` (visible in the chat UI) + a
-      // `logger.warn` line (visible in diagnostics). It fires at most
-      // once per modelId per session to avoid spamming.
+      // context is growing unbounded and can re-enable compaction.
       this.warnContextInflationIfNeeded(model, modelId, openaiMessages, progress);
+      return openaiMessages;
+    }
+    // ArchCom 2026-09-15 (invariant 4) — unknown-window safe path:
+    // no window → no compaction, ever. `compactIfNeeded` would
+    // otherwise treat 75% of 0/undefined as a trivially-reached
+    // threshold and evict against a nonsense denominator.
+    const windowTokens = model.maxInputTokens;
+    if (!windowTokens || windowTokens <= 0) {
+      if (!this.contextInflationWarned.has(`${modelId}:unknown-window`)) {
+        this.contextInflationWarned.add(`${modelId}:unknown-window`);
+        logger.warn(
+          `Compaction: model window unknown for ${modelId} (maxInputTokens=${model.maxInputTokens}) — compaction will not fire. The context filter may still truncate.`,
+        );
+      }
       return openaiMessages;
     }
     const store = this.getOrCreateCompactionStore();
@@ -1934,18 +1958,19 @@ export class OllamaCloudChatProvider
 
   /**
    * v0.12.1 — context-inflation warning (RCA 2026-08-19, ADR 0007
-   * complement). When `compaction.enabled` is `false` (the default)
-   * and the conversation exceeds 75% of the model's window, surface a
+   * complement), reworded for the v0.19.0 default flip (ArchCom
+   * 2026-09-15 T2). Reached ONLY when the user explicitly set
+   * `compaction.enabled=false` (the shipped default is ON): when the
+   * conversation exceeds 75% of the model's window, surface a
    * one-time-per-session warning so the user knows their context is
-   * growing unbounded and can enable compaction before hitting the
+   * growing unbounded and can re-enable compaction before hitting the
    * provider's hard context-window ceiling.
    *
    * The warning fires at most once per `modelId` per session (tracked
    * in {@link contextInflationWarned}) to avoid spamming on every turn.
    * It uses `progress.report` (visible in the chat UI as a streaming
    * annotation) + `logger.warn` (visible in diagnostics). It does NOT
-   * enable compaction — that remains a deliberate user opt-in per the
-   * compaction spec's "default off" decision.
+   * enable compaction — that remains the user's decision.
    *
    * Token estimate mirrors `compaction.ts`: `charsPerToken` from the
    * EMA (or the 4-char default), applied to the OpenAI-format request
@@ -1977,10 +2002,10 @@ export class OllamaCloudChatProvider
     const pct = Math.round((usedTokens / windowTokens) * 100);
     const warning =
       `⚠️ Context at ${pct}% of the ${model.name} window (${usedTokens.toLocaleString()}/${windowTokens.toLocaleString()} tokens). ` +
-      'Enable \"Ollama Cloud: Compaction\" (ollamaCloud.compaction.enabled) to summarize older turns and stay under the limit. ' +
+      'Compaction is currently DISABLED (ollamaCloud.compaction.enabled=false) — re-enable it to summarize older turns and stay under the limit. ' +
       'Without compaction, long conversations may hit the provider hard ceiling.';
     logger.warn(
-      `Context inflation: ${modelId} at ${pct}% of window (${usedTokens}/${windowTokens} tokens, ${openaiMessages.length} messages) — compaction disabled. Run 'Ollama Cloud: Set Compaction' or set ollamaCloud.compaction.enabled=true.`,
+      `Context inflation: ${modelId} at ${pct}% of window (${usedTokens}/${windowTokens} tokens, ${openaiMessages.length} messages) — compaction disabled by user setting (default is ON since v0.19.0). Set ollamaCloud.compaction.enabled=true to re-enable.`,
     );
     progress.report(new vscode.LanguageModelTextPart(warning));
   }

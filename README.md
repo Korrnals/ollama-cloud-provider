@@ -178,6 +178,8 @@ Run `Ollama Cloud: Check Connection` to confirm the extension can reach the endp
 | `ollamaCloud.visionFallback.connection` | `""` | Connection id for the vision model. If empty, uses the primary connection. |
 | `ollamaCloud.visionFallback.mode` | `"two-phase"` | Vision fallback mode (v0.13.0+, ADR 0013): `two-phase` (vision model describes image → primary model answers) or `pass-through` (vision model answers directly). See [Vision fallback](#️-vision-fallback). |
 | `ollamaCloud.contextFilter.level` | `"off"` | Context filtering level (ADR 0007): `off` (no filtering), `safe` (structural cleanup — duplicate messages, empty parts, redundant tools, system-prompt whitespace), `aggressive` (safe + context-window truncation + similar-message merging + metadata stripping). See [Context filtering](#context-filtering). Per-connection `contextFilter.level` overrides this global (`auto` inherits). |
+| `ollamaCloud.compaction.enabled` | `true` | Context compaction (default ON since v0.19.0, ArchCom 2026-09-15): when the conversation approaches 75% of the model's context window, older turns are summarized into a checkpoint by a cheap model and the full evicted history is kept locally behind an `ocp-compaction://` pointer. Never fails the chat — on any failure the request proceeds uncompacted. Set `false` to opt out. |
+| `ollamaCloud.compaction.model` | `"gpt-oss:20b"` | Cheap model used ONLY for context summarization when compaction fires, never for chat. |
 
 All settings are `scope: "application"` — workspace folders cannot override them.
 

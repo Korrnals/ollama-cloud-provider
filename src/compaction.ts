@@ -153,6 +153,12 @@ export interface CompactionState {
  * state transition (a `true` result means "fire", after which the
  * machine is discharged and must not fire again until re-armed).
  *
+ * Unknown-window safe path (ArchCom 2026-09-15, invariant 4): when
+ * `windowTokens` is missing or non-positive the hysteresis has no
+ * denominator — 75% of 0/undefined is meaningless, and an arbitrary
+ * zone split would evict context against a nonsense threshold. The
+ * machine NEVER fires without a known window.
+ *
  * Rate guard (slice 1.1): when `state.lastFiredAt` is set and `nowMs`
  * is within `cooldownMs` of it, the fire is refused — protects the
  * summarizer quota against estimate oscillation bugs. `nowMs` defaults
@@ -167,6 +173,7 @@ export function shouldCompact(
   cooldownMs: number = COMPACT_COOLDOWN_MS,
 ): boolean {
   if (!state.armed) return false;
+  if (!Number.isFinite(windowTokens) || windowTokens <= 0) return false;
   if (usedTokens < COMPACT_AT_RATIO * windowTokens) return false;
   const fired = state.lastFiredAt ?? null;
   if (fired !== null) {

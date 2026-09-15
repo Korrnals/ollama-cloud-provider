@@ -581,3 +581,163 @@ describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates
     assert.ok(turn2.includes('what else?'), 'new user text survived');
   });
 });
+
+/**
+ * ArchCom 2026-09-15 G2 — the owner directive's end-to-end invariant:
+ * a long session with an image, after compaction fires, must carry
+ * ZERO image parts and ZERO base64 signatures in the dispatched
+ * payload. The image lives in context ONLY as its text description,
+ * and the description itself is subject to compaction (evictable,
+ * not pinned — invariant 5).
+ *
+ * Topology mirrors compactionOscillation.test.ts: cloud pinned to
+ * `/chat/completions` (SSE), summarizer `/api/chat` (JSON), describe
+ * `/api/chat` (JSON) — both native calls share the /api/chat URL, so
+ * the stub dispatches by request body shape (describe requests carry
+ * `images`; summarizer requests carry `EVICTED BLOCK` in the prompt).
+ * The history exceeds 75% of kimi-k3's 1048576-token window via large
+ * text turns (charsPerToken defaults to 4).
+ */
+describe('unified vision + compaction (ArchCom 2026-09-15) — G2 gate', () => {
+  let originalFetch: typeof fetch;
+  const BASE = 'https://ollama.com/v1';
+
+  // ~640k chars ≈ 160k estimated tokens per user turn at 4 chars/token.
+  // 8 such turns ≈ 1.28M tokens > 75% of kimi-k3's 1048576 window
+  // (fire threshold 786432). EIGHT turns also clear the 6-turn recency
+  // floor, so the splitZones recency quota (25% = 262144 tokens) —
+  // not the turn floor — sizes the recency tail and turns 1–6 stay
+  // evictable.
+  const PAD = 640_000;
+
+  function visionHistory(): vscode.LanguageModelChatRequestMessage[] {
+    const msgs: vscode.LanguageModelChatRequestMessage[] = [];
+    for (let i = 1; i <= 7; i++) {
+      msgs.push(userMsg(`turn${i} ` + 'x'.repeat(PAD)));
+      msgs.push(assistantMsg('answer from primary'));
+    }
+    // Turn 8 carries the SAME image re-sent from history + new text.
+    // In marker mode the describe fires ONCE (first turn) and the
+    // cached description substitutes on every later send.
+    msgs.push(imageMsg(IMG_A, 'and the image again — summarize so far'));
+    msgs.push(assistantMsg('answer from primary'));
+    msgs.push(userMsg('final question'));
+    return msgs;
+  }
+
+  let describeCalls: Array<Record<string, unknown>> = [];
+  let summarizerCalls: Array<Record<string, unknown>> = [];
+  let chatCalls2: Array<Record<string, unknown>> = [];
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    clearImageDescriptionCache();
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      baseUrl: BASE,
+      allowedBaseUrls: [BASE],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE, preferredEndpoint: 'chat' },
+      ],
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      // Compaction default is ON since v0.19.0 — left UNSET here so
+      // the gate exercises the flipped default end-to-end.
+    });
+    describeCalls = [];
+    summarizerCalls = [];
+    chatCalls2 = [];
+    originalFetch = global.fetch;
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        const messages = (parsed.messages as Array<Record<string, unknown>>) ?? [];
+        const isDescribe = messages.some((m) => 'images' in m);
+        if (isDescribe) {
+          describeCalls.push(parsed);
+          return new Response(
+            JSON.stringify({ message: { content: 'a red square with text' } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        summarizerCalls.push(parsed);
+        return new Response(
+          JSON.stringify({ message: { content: 'CHECKPOINT SUMMARY' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      chatCalls2.push(parsed);
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    clearImageDescriptionCache();
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({});
+    for (const dir of storageDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('after compaction fires, the payload has ZERO image parts and ZERO base64 signatures', async () => {
+    const ctx = makeMockContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      visionHistory(),
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    // The describe fired exactly once (one unique image, budget ok).
+    assert.equal(describeCalls.length, 1, 'exactly one describe call');
+    // Compaction fired on the DEFAULT (unset) setting: one summarizer
+    // call over the 75% threshold.
+    assert.equal(summarizerCalls.length, 1, 'compaction fired (default ON)');
+    // The primary dispatched.
+    assert.equal(chatCalls2.length, 1, 'primary dispatched');
+
+    // G2 invariant: ZERO image bytes in the dispatched payload.
+    const serialized = JSON.stringify(chatCalls2[0]);
+    assert.ok(
+      !serialized.includes('image_url'),
+      'zero image_url parts after compaction',
+    );
+    assert.ok(
+      !serialized.includes('base64,'),
+      'zero base64 data-URL signatures after compaction',
+    );
+    // The evicted early turns are gone (compacted), the recency tail
+    // and the description text remain.
+    assert.ok(!serialized.includes('turn1 '), 'evicted turn1 removed');
+    assert.ok(
+      serialized.includes('[Image description from'),
+      'the image description survived compaction in the payload',
+    );
+    assert.ok(serialized.includes('final question'), 'recency tail intact');
+    assert.ok(
+      serialized.includes('[compacted-turns'),
+      'summary checkpoint injected',
+    );
+  });
+});
