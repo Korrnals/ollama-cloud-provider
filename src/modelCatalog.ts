@@ -1018,10 +1018,17 @@ export function inferVersion(id: string, family: string): string {
 export function inferMaxInputTokens(id: string): number {
   if (
     id.startsWith('deepseek-v4-') ||
-    id.startsWith('gemini-3-flash-preview') ||
-    id.startsWith('nemotron-3-nano')
+    id.startsWith('deepseek-v4.1') ||
+    id.startsWith('gemini-3-flash-preview')
   ) {
     return 1048576;
+  }
+  // OCP-3 review sync (2026-09-15): nemotron-3-nano live-verified at
+  // 262144 — the former 1048576 was a 4x OVER-advertise (context
+  // overflow risk for unknown nano variants before the /api/show
+  // probe resolves them).
+  if (id.startsWith('nemotron-3-nano')) {
+    return 262144;
   }
   if (id.startsWith('deepseek-')) {
     return 163840;
@@ -1037,16 +1044,19 @@ export function inferMaxInputTokens(id: string): number {
     return 262144;
   }
   if (id.startsWith('glm-5.2')) {
-    return 1000000;
+    return 1048576;
   }
   if (id.startsWith('glm-')) {
     return 202752;
   }
   if (id.startsWith('minimax-m3')) {
-    return 524288;
+    return 512000;
   }
+  // Review sync: base minimax- heuristic follows the live m2.7
+  // (196608); retired m2/m2.1/m2.5 (204800) are pruned from the
+  // snapshot.
   if (id.startsWith('minimax-')) {
-    return 204800;
+    return 196608;
   }
   if (id.startsWith('gpt-oss')) {
     return 131072;
@@ -1117,6 +1127,7 @@ export function inferMaxOutputTokens(id: string): number {
 export function inferImageInput(id: string): boolean {
   return (
     id.includes('-vl:') ||
+    id.startsWith('deepseek-v4.1') ||
     id.startsWith('gemma3:') ||
     id.startsWith('gemma4:') ||
     id.startsWith('kimi-k2.5') ||

@@ -1305,7 +1305,7 @@ export class OllamaCloudChatProvider
               throw endpointExplicitUnavailableError('responses', connectionId);
             }
             logger.info(
-              `Auto-mode fallback: /v1/responses returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
+              `Auto-mode fallback: /v1/responses returned ${error.status} for connection "${connectionId}" — retrying on /chat/completions`,
             );
             // fall through to /chat/completions below
           } else {
@@ -1405,7 +1405,7 @@ export class OllamaCloudChatProvider
               markNativeChatUnavailable(connectionId);
             } else {
               logger.info(
-                `Auto-mode: /api/chat returned 404 for connection "${connectionId}" — will retry native on next request (see capability cache log for 404 count)`,
+                `Auto-mode: /api/chat returned ${error.status} for connection "${connectionId}" — will retry native on next request (see capability cache log for 404 count)`,
               );
               // Do NOT fall through to chat yet — retry native on next request.
               // Only after 3×404 do we switch (markNativeChatUnavailable above).
@@ -1413,7 +1413,7 @@ export class OllamaCloudChatProvider
               throw error;
             }
             logger.info(
-              `Auto-mode fallback: /api/chat returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
+              `Auto-mode fallback: /api/chat returned ${error.status} for connection "${connectionId}" — retrying on /chat/completions`,
             );
             // fall through to the /chat/completions path below
           } else {
@@ -1481,7 +1481,7 @@ export class OllamaCloudChatProvider
               throw endpointExplicitUnavailableError('responses', connectionId);
             }
             logger.info(
-              `Auto-mode fallback: /v1/responses returned 404 for connection "${connectionId}" — retrying on /chat/completions`,
+              `Auto-mode fallback: /v1/responses returned ${error.status} for connection "${connectionId}" — retrying on /chat/completions`,
             );
             // fall through to /chat/completions below
           } else {
@@ -1534,7 +1534,7 @@ export class OllamaCloudChatProvider
               throw endpointExplicitUnavailableError('chat', connectionId);
             }
             logger.info(
-              `Auto-mode fallback: /chat/completions returned 404 for connection "${connectionId}" — retrying on /v1/responses`,
+              `Auto-mode fallback: /chat/completions returned ${error.status} for connection "${connectionId}" — retrying on /v1/responses`,
             );
             // fall through to /v1/responses below
           } else {
@@ -1594,7 +1594,7 @@ export class OllamaCloudChatProvider
             // from the picker after 3 distinct-request 404s.
             markModel404Once();
             logger.info(
-              `/v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
+              `/v1/responses also returned ${error.status} for connection "${connectionId}" — both endpoints unavailable`,
             );
           }
           throw error;

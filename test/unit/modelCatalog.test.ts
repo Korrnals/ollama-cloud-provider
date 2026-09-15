@@ -128,20 +128,21 @@ describe('modelCatalog.inferMaxInputTokens', () => {
     assert.equal(inferMaxInputTokens('kimi-k2.6'), 262144);
   });
 
-  it('returns 1000000 for glm-5.2', () => {
-    assert.equal(inferMaxInputTokens('glm-5.2'), 1000000);
+  // P2-1 review sync (2026-09-15): live-verified 1048576.
+  it('returns 1048576 for glm-5.2', () => {
+    assert.equal(inferMaxInputTokens('glm-5.2'), 1048576);
   });
 
   it('returns 202752 for glm-* (non-5.2)', () => {
     assert.equal(inferMaxInputTokens('glm-4.6'), 202752);
   });
 
-  it('returns 524288 for minimax-m3*', () => {
-    assert.equal(inferMaxInputTokens('minimax-m3'), 524288);
+  it('returns 512000 for minimax-m3*', () => {
+    assert.equal(inferMaxInputTokens('minimax-m3'), 512000);
   });
 
-  it('returns 204800 for minimax-* (non-m3)', () => {
-    assert.equal(inferMaxInputTokens('minimax-m2'), 204800);
+  it('returns 196608 for minimax-* (non-m3, follows live m2.7)', () => {
+    assert.equal(inferMaxInputTokens('minimax-m2'), 196608);
   });
 
   it('returns 131072 for gpt-oss*', () => {
