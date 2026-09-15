@@ -328,9 +328,9 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
   it('routes to vision fallback when enabled and primary cannot handle image', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
     // Enable the pass-through fallback (ADR 0004). The configured
-    // vision model is gemma3:12b — vision-capable, lives on the cloud
+    // vision model is kimi-k3 — vision-capable, lives on the cloud
     // connection. The primary (gpt-oss:120b) cannot handle images, so
-    // the provider must route the turn to gemma3:12b instead of
+    // the provider must route the turn to kimi-k3 instead of
     // throwing. Pin the cloud connection to /chat/completions so the
     // mock's chat-format SSE stream is consumed correctly (the test
     // asserts the fallback fires, not which endpoint is used).
@@ -346,7 +346,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
       ],
       'visionFallback.enabled': true,
-      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
       'visionFallback.mode': 'pass-through',
     });
 
@@ -378,11 +378,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     );
 
     // The fallback fired: fetch was called exactly once, targeting
-    // the vision model (gemma3:12b), not the primary. The user sees
+    // the vision model (kimi-k3), not the primary. The user sees
     // the vision model's streamed text, not the throw.
     assert.equal(fetchCalls.length, 1, 'fallback issued a single vision call');
     const body = fetchCalls[0].body as { model: string };
-    assert.equal(body.model, 'gemma3:12b', 'request targeted the vision model');
+    assert.equal(body.model, 'kimi-k3', 'request targeted the vision model');
     // ArchCom 0011b — routing annotation adds a part before model answer.
     const textVals380 = progress.parts
       .filter((p) => p instanceof vscode.LanguageModelTextPart)
@@ -393,7 +393,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
   it('forwards the image as a data URL when the model supports vision', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
 
-    // gemma3:12b is a vision-capable model (gemma3 family marker +
+    // kimi-k3 is a vision-capable model (snapshot vision + /api/show-verified
     // imageInput metadata). The image must be forwarded in the
     // OpenAI request body as an image_url data URL.
     global.fetch = (async (input: string | URL, init?: RequestInit) => {
@@ -413,7 +413,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     const token = new vscode.CancellationTokenSource().token;
 
     await provider.provideLanguageModelChatResponse(
-      chatInfoFor('gemma3:12b'),
+      chatInfoFor('kimi-k3'),
       [imageMsg()],
       {
         modelOptions: {},
@@ -635,7 +635,7 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — fallback 
     const provider = new OllamaCloudChatProvider(ctx);
     // Refresh the catalog so `list()` returns only the primary model.
     // Without this, the default KNOWN_MODELS snapshot includes
-    // gemma3:12b (vision-capable, cloud) and auto-search would find it.
+    // kimi-k3 (vision-capable, cloud) and auto-search would find it.
     await provider.syncModelCatalog(true);
 
     const progress = makeProgress();
@@ -943,7 +943,7 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
       ],
       'visionFallback.enabled': true,
-      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
       'visionFallback.mode': 'pass-through',
     });
 
@@ -1030,7 +1030,7 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
         { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
       ],
       'visionFallback.enabled': true,
-      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
       'visionFallback.mode': 'pass-through',
     });
 
