@@ -483,3 +483,145 @@ describe('visionFallback.executePassThrough', () => {
     }
   });
 });
+
+// OCP-2 — retire-path regression for the vision pass-through dispatch
+// (visionFallback.ts sites at ~471/491/509). Cloud returns HTTP 410 for
+// retired models; the endpoint-fallback catch must treat 410 like 404
+// and surface the error instead of silently swallowing it.
+describe('visionFallback.executePassThrough — 410 retire handling (OCP-2)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    setConfig({
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/gemma3:12b',
+      baseUrl: 'https://ollama.com/v1',
+      allowedBaseUrls: ['https://ollama.com/v1'],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+    });
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    setConfig({});
+  });
+
+  function makeMockContext() {
+    const secrets = new Map<string, string>([
+      ['ollamaCloud.apiKey', 'sk-test-key'],
+    ]);
+    return {
+      subscriptions: [] as { dispose(): unknown }[],
+      secrets: {
+        get: (key: string) => Promise.resolve(secrets.get(key)),
+        store: (_key: string, value: string) => {
+          secrets.set('ollamaCloud.apiKey', value);
+          return Promise.resolve();
+        },
+        delete: () => Promise.resolve(),
+        onDidChange: () => ({ dispose: () => undefined }),
+      },
+      extensionPath: '/test/extension-path',
+      extensionUri: {
+        toString: () => 'file:///test/extension-path',
+        fsPath: '/test/extension-path',
+      },
+    } as unknown as vscode.ExtensionContext;
+  }
+
+  function makeProgress(): vscode.Progress<vscode.LanguageModelResponsePart> & {
+    parts: vscode.LanguageModelResponsePart[];
+  } {
+    const parts: vscode.LanguageModelResponsePart[] = [];
+    return {
+      parts,
+      report: (part: vscode.LanguageModelResponsePart): void => {
+        parts.push(part);
+      },
+    };
+  }
+
+  function streamFromChunks(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) {
+          controller.enqueue(chunk);
+        }
+        controller.close();
+      },
+    });
+  }
+
+  function encode(s: string): Uint8Array {
+    return new TextEncoder().encode(s);
+  }
+
+  it('a 410 from /v1/responses propagates as LanguageModelError (retire-visible)', async () => {
+    const { AuthManager } = await import('../../src/auth.js');
+    const authManager = new AuthManager(makeMockContext());
+    const primary = makeModel('ollama-cloud/gpt-oss:120b', 'cloud', false);
+    const vision = makeModel('ollama-cloud/gemma3:12b', 'cloud', true);
+    const catalog = [primary, vision];
+    const connections: ConnectionConfig[] = [];
+
+    // Auto → resolves to 'responses' primary (see dispatch comment).
+    // Feed 410 on /responses. The catch must treat 410 as the 404 class:
+    // log the fallback decision, fall through to /chat/completions.
+    const statuses: number[] = [];
+    global.fetch = (async (input: string | URL, _init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const status = url.endsWith('/responses') ? 410 : 200;
+      statuses.push(status);
+      if (status === 410) {
+        return new Response(
+          JSON.stringify({ error: { message: 'model retired' } }),
+          { status: 410, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"pic"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    // Current (buggy) code: 410 is NOT in the 404 gate → the error is
+    // rethrown at the first catch with NO fallback to /chat/completions.
+    // Fixed code: 410 falls through to chat → the chat SSE stream
+    // succeeds and the pass-through completes.
+    await executePassThrough({
+      primaryModel: primary,
+      primaryConnection: undefined,
+      messages: [imageMsg()],
+      options: {} as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+      authManager,
+      catalog,
+      connections,
+    });
+
+    assert.ok(
+      statuses.includes(200),
+      'must fall back to /chat/completions after 410 on /responses (OCP-2)',
+    );
+    assert.ok(
+      statuses.includes(410),
+      'the 410 must have been served by the /responses attempt',
+    );
+    // The vision answer was surfaced to the user (pass-through worked).
+    assert.ok(
+      progress.parts.some(
+        (p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('pic'),
+      ),
+      'chat fallback answered the user',
+    );
+  });
+});

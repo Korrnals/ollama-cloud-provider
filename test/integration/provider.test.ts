@@ -7,7 +7,12 @@ import {
   MidStreamError,
   ZeroByteSocketCloseError,
 } from '../../src/retry.js';
-import { clearCapabilityCache, markResponsesUnavailable } from '../../src/capabilityCache.js';
+import {
+  clearCapabilityCache,
+  isModelKnownRetired,
+  markChatAvailable,
+  markResponsesUnavailable,
+} from '../../src/capabilityCache.js';
 import { logger } from '../../src/logger.js';
 
 const BASE_URL = 'https://ollama.com/v1';
@@ -2749,5 +2754,179 @@ describe('classifyStreamError — ADR 0008 provider-level mapping', () => {
     assert.ok(result instanceof vscode.LanguageModelError);
     assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
     assert.match(result.message, /соединение прервано/);
+  });
+});
+
+// OCP-2 — retire-path regression: ollama.com now returns HTTP 410 (Gone)
+// for retired models, not 404. The retire counters in provider.ts must
+// fire on BOTH statuses or the model stays in the picker forever. These
+// tests feed a 410 HttpError through a real provideLanguageModelChatResponse
+// call and assert the per-model retire counter incremented.
+describe('OllamaCloudChatProvider — retire path accepts HTTP 410 (OCP-2)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    clearCapabilityCache();
+    setConfig({});
+    vscode.workspace
+      .getConfiguration('ollamaCloud')
+      ._setInspection('preferredEndpoint', null);
+  });
+
+  it('a 410 from /chat/completions increments the per-model retire counter', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Explicit chat endpoint → the 404/410 catch fires on the first
+    // attempt, no fallback round-trips.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+    });
+    global.fetch = (async (_input: string | URL, _init?: RequestInit) => {
+      return new Response(
+        JSON.stringify({ error: { message: 'model retired' } }),
+        { status: 410, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof vscode.LanguageModelError, 'throws LanguageModelError');
+        assert.equal((err as vscode.LanguageModelError).code, 'NotFound');
+        return true;
+      },
+    );
+
+    // The 410 must have been counted as a retire signal. gpt-oss:120b
+    // defaults to the 'cloud' connection → retire key "cloud:gpt-oss:120b".
+    // markModel404Once is a per-request guard, so every request that
+    // reaches a live 410 catch increments the counter by one. Explicit
+    // chat mode memoizes the endpoint unavailable after the FIRST 410
+    // (the cached-unavailable short-circuit at provider.ts:1229 throws
+    // before any fetch and intentionally does NOT inflate the counter —
+    // only distinct-request round-trips count). Reset the endpoint memo
+    // between requests so each round-trip reaches the live 410 catch;
+    // three 410s must flip the model retired.
+    assert.equal(
+      isModelKnownRetired('cloud', 'gpt-oss:120b'),
+      false,
+      'first 410: below the 3-distinct-request threshold',
+    );
+    for (let i = 2; i <= 3; i += 1) {
+      // Restore endpoint availability so the next request reaches the
+      // live catch (the memoized short-circuit skips fetch entirely).
+      markChatAvailable('cloud');
+      await assert.rejects(
+        () =>
+          provider.provideLanguageModelChatResponse(
+            chatInfoFor('gpt-oss:120b'),
+            [userMsg('hi')],
+            { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            progress,
+            token,
+          ),
+        () => true,
+      );
+      assert.equal(
+        isModelKnownRetired('cloud', 'gpt-oss:120b'),
+        i >= 3,
+        `request ${i}: counter increments per distinct request; retires at 3`,
+      );
+    }
+    assert.equal(
+      isModelKnownRetired('cloud', 'gpt-oss:120b'),
+      true,
+      'three 410s must retire the model (410 counts as a retire signal — OCP-2)',
+    );
+  });
+
+  it('a 410 from /api/chat (auto) increments the per-model retire counter to retirement', async () => {
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    // Auto mode (default) resolves cloud to native /api/chat. Native
+    // 404s increment the per-model counter via markModel404Once on
+    // EVERY distinct request — no cached-unavailable short-circuit for
+    // the model counter (the endpoint auto-recovery counter is a
+    // separate mechanism). Three 410s → the model must flip retired.
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'auto' },
+      ],
+    });
+    global.fetch = (async (_input: string | URL, _init?: RequestInit) => {
+      return new Response(
+        JSON.stringify({ error: { message: 'model retired' } }),
+        { status: 410, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    for (let i = 1; i <= 2; i += 1) {
+      await assert.rejects(
+        () =>
+          provider.provideLanguageModelChatResponse(
+            chatInfoFor('gpt-oss:120b'),
+            [userMsg('hi')],
+            { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+            progress,
+            token,
+          ),
+        () => true,
+      );
+      assert.equal(
+        isModelKnownRetired('cloud', 'gpt-oss:120b'),
+        false,
+        `request ${i}: below the 3-distinct-request threshold`,
+      );
+    }
+    // Request 3 — threshold reached. Before the fix the counter never
+    // incremented on 410 (site at ~1387 gated on 404 only), so this
+    // failed with retired=false.
+    await assert.rejects(
+      () =>
+        provider.provideLanguageModelChatResponse(
+          chatInfoFor('gpt-oss:120b'),
+          [userMsg('hi')],
+          { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+          progress,
+          token,
+        ),
+      () => true,
+    );
+    assert.equal(
+      isModelKnownRetired('cloud', 'gpt-oss:120b'),
+      true,
+      'three 410s must retire the model (was blind to 410 — bug OCP-2)',
+    );
   });
 });

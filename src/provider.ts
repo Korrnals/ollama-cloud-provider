@@ -1289,7 +1289,7 @@ export class OllamaCloudChatProvider
           );
           return; // success — no fallback needed
         } catch (error) {
-          if (error instanceof HttpError && error.status === 404) {
+          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
             // Fix 2 — track per-model 404s so a retired model is hidden
@@ -1384,7 +1384,7 @@ export class OllamaCloudChatProvider
           );
           return; // success — no fallback needed
         } catch (error) {
-          if (error instanceof HttpError && error.status === 404) {
+          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
             // v0.9.0 Fix 3 (corrected) — track 404s for auto-recovery.
             // Do NOT mark unavailable on first 404 — that would switch
             // immediately, bypassing the 3×404 threshold. Instead:
@@ -1465,7 +1465,7 @@ export class OllamaCloudChatProvider
           );
           return; // success — no fallback needed
         } catch (error) {
-          if (error instanceof HttpError && error.status === 404) {
+          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
             // Fix 2 — track per-model 404s so a retired model is hidden
@@ -1520,7 +1520,7 @@ export class OllamaCloudChatProvider
           );
           return; // success — no fallback needed
         } catch (error) {
-          if (error instanceof HttpError && error.status === 404) {
+          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markChatUnavailable(connectionId);
             // Fix 2 — track per-model 404s so a retired model is hidden
@@ -1587,7 +1587,7 @@ export class OllamaCloudChatProvider
           );
           return;
         } catch (error) {
-          if (error instanceof HttpError && error.status === 404) {
+          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
             // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
             markResponsesUnavailable(connectionId);
             // Fix 2 — track per-model 404s so a retired model is hidden

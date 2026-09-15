@@ -468,7 +468,7 @@ export async function executePassThrough(
       await runResponsesStream();
       return; // success — no fallback needed
     } catch (error) {
-      if (error instanceof HttpError && error.status === 404) {
+      if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
         markResponsesUnavailable(connectionId);
         logger.info(
           `Vision fallback: /v1/responses returned 404 for connection "${connectionId}" — falling back to /chat/completions`,
@@ -488,7 +488,7 @@ export async function executePassThrough(
       markChatAvailable(connectionId);
       return;
     } catch (error) {
-      if (error instanceof HttpError && error.status === 404) {
+      if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
         markChatUnavailable(connectionId);
         logger.info(
           `Vision fallback: /chat/completions returned 404 for connection "${connectionId}" — falling back to /v1/responses`,
@@ -506,7 +506,7 @@ export async function executePassThrough(
       await runResponsesStream();
       return;
     } catch (error) {
-      if (error instanceof HttpError && error.status === 404) {
+      if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
         markResponsesUnavailable(connectionId);
         logger.info(
           `Vision fallback: /v1/responses also returned 404 for connection "${connectionId}" — both endpoints unavailable`,
