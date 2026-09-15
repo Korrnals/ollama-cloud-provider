@@ -390,6 +390,84 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     assert.ok(textVals380.includes('vision answer'), 'vision answer must be in parts');
   });
 
+  it('pass-through vision stream heals an in-window break silently (OCP-6 window coverage)', async function () {
+    this.timeout(10000); // one hidden-retry backoff (~1s ± jitter)
+    const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
+    clearCapabilityCache();
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      maxRetries: 0,
+      apiKey: '',
+      visionModels: [],
+      connections: [
+        { id: 'cloud', type: 'cloud', baseUrl: BASE_URL, preferredEndpoint: 'chat' },
+      ],
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/kimi-k3',
+      'visionFallback.mode': 'pass-through',
+    });
+
+    let fetchCalls = 0;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        // Attempt 1: one text delta (buffered by the pass-through
+        // commit window — the user never sees it), then a socket close
+        // 20ms in, inside the 60ms window → silent retry.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              encode('data: {"choices":[{"delta":{"content":"partial vision"}}]}\n\n'),
+            );
+            setTimeout(() => {
+              const err = new Error('read ECONNRESET');
+              (err as { code?: string }).code = 'ECONNRESET';
+              controller.error(err);
+            }, 20);
+          },
+        });
+        return mockResponse(body);
+      }
+      // Attempt 2: the complete vision answer.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(
+            encode('data: {"choices":[{"delta":{"content":"full vision answer"}}]}\n\n'),
+          );
+          controller.enqueue(encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(ctx);
+    const progress = makeProgress();
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg()],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress,
+      token,
+    );
+
+    assert.equal(fetchCalls, 2, 'exactly one hidden in-window retry');
+    const textVals = progress.parts
+      .filter((p) => p instanceof vscode.LanguageModelTextPart)
+      .map((p) => (p as vscode.LanguageModelTextPart).value);
+    // The discarded attempt's fragment must NEVER reach the user, and
+    // the final answer exactly once — no duplicates by construction.
+    assert.ok(!textVals.includes('partial vision'), 'discarded fragment leaked');
+    assert.equal(textVals.filter((v) => v === 'full vision answer').length, 1);
+  });
+
   it('forwards the image as a data URL when the model supports vision', async () => {
     const { ctx } = makeMockContext({ 'ollamaCloud.apiKey': 'sk-test-key' });
 

@@ -5,6 +5,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+### Fixed
+- **Catalog synced with live Ollama Cloud state (slice catalog-sync-0.17)** — 27 retired models (HTTP 410) pruned from the snapshot; kimi-k3 context corrected 262144→1048576 and nemotron-3-nano:30b 1048576→262144 (both live-verified via `/api/show`); added `deepseek-v4.1-flash` (vision+thinking+tools), `deepseek-v4-flash:0731`, `deepseek-v4-pro:0813`; minor context alignment (glm-5.2, minimax-m2.7/m3, deepseek-v4-*); HTTP 410 now retires a model from the picker alongside 404. The picker no longer offers 27 dead models between refreshes.
+
+### Added
+- **Test-debt closed (OCP-6)**: responsesClient hidden-retry resets `pendingEvent` (mirror of the ollamaClient P1-1 test); pass-through vision streams verified to heal an in-window break silently (commit-window coverage).
+
 ## [0.16.1] - 2026-09-15
 
 P3 stream polish: every zero-byte close now follows the unified one-extra-visible-attempt policy (P3-2), and the commit-window controller is the single owner of the hidden-retry counter with honest cancelled-retry diagnostics (P3-4) — plus README streaming/model-sync sync with v0.16.0 behavior and deterministic (deflaked) boundary-race test coverage.
