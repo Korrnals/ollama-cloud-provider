@@ -51,17 +51,16 @@ export function resolveVisionHistoryMode(): VisionHistoryMode {
 
 const MARKER_TEMPLATE =
   (hash: string) =>
-  `[Image ${hash} — already analyzed earlier in this conversation; the assistant's analysis is in the history above]`;
+  `[Image ${hash} — duplicate of an image already sent in this session; if you cannot find its analysis in the history above, ask the user to re-attach it]`;
 
 /**
- * Rewrites `messages` for the native vision path: first-send hashes
- * pass through RAW and are recorded; repeat hashes from history are
- * substituted with the marker text. Returns the ORIGINAL array
- * (unwrapped copy is not needed — callers treat it as read-only)
- * when the mode is `'raw'` or when no user message carries images.
+ * Rewrites `messages`: first-send hashes pass through RAW and are
+ * recorded; repeat hashes are substituted with the marker text.
+ * Mode filtering (`'marker'` vs `'raw'`) is the CALLER's
+ * responsibility — this function always applies the lifecycle.
  *
- * The result is a NEW array with NEW message objects where a
- * substitution happened; untouched messages are shared by reference.
+ * Returns a NEW array; untouched messages are shared by reference
+ * (message objects are copied only where a substitution happened).
  */
 export function applyVisionHistoryLifecycle(
   messages: readonly vscode.LanguageModelChatRequestMessage[],

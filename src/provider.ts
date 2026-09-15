@@ -913,10 +913,20 @@ export class OllamaCloudChatProvider
             .getConfiguration('ollamaCloud')
             .get<'two-phase' | 'pass-through'>('visionFallback.mode', 'two-phase');
           if (fallbackMode === 'pass-through') {
+            // ADR 0013 lifecycle — pass-through streams the VISION
+            // model's answer directly, but the request it sends still
+            // carries the user history (images included). Apply the
+            // re-send lifecycle here too: first RAW send reaches the
+            // vision model; repeats become markers (same ~2M/turn
+            // inflation fix as the primary dispatch — review P1-2).
+            const passThroughMessages =
+              resolveVisionHistoryMode() === 'marker'
+                ? applyVisionHistoryLifecycle(messages, this.sentImageHashes)
+                : messages;
             return await executePassThrough({
               primaryModel: model,
               primaryConnection: connection ?? cloudConnection,
-              messages,
+              messages: passThroughMessages,
               options,
               progress,
               token,

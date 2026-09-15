@@ -252,8 +252,6 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — happy pat
  * images. These tests pin both paths.
  */
 describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision gate', () => {
-
-  const ORIGINAL_FETCH_HOLDER = { fetch: globalThis.fetch };
   let originalFetch: typeof fetch;
   let fetchCalls: Array<{ url: string; body: unknown }>;
 
@@ -644,7 +642,8 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     );
     assert.ok(turn2.includes('what else?'), 'the new user text survived');
 
-    global.fetch = ORIGINAL_FETCH_HOLDER.fetch;
+    originalFetch = globalThis.fetch;
+    // afterEach in this describe restores `originalFetch`.
   });
 
   it('cloud models honor the GLOBAL visionModels override (ArchCom 2026-09-14 P0 fix)', async () => {
