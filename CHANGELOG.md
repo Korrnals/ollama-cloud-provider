@@ -5,6 +5,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-15
+
+Image re-send lifecycle (ADR 0013 extension) — the RCA fix for sessions bloating to ~2.5M characters, which starved subagent delegations into "no output" crashes: the first send of an image goes to the model RAW (no quality loss on the turn that matters), every subsequent re-send of the same image from history is replaced with a short in-band text marker (~100 chars), pass-through vision is covered, and the new `ollamaCloud.visionHistory.mode` setting (`marker` default | `raw` restores the old behaviour) provides the opt-out.
+
 ### Fixed
 - **History image re-send inflation (ADR 0013 lifecycle extension)** — the root cause of sessions bloating to ~2.5M characters (which starved subagent delegations into "no output" crashes). VS Code re-sends the full conversation history — images included — on EVERY turn; until now every vision-capable request re-uploaded the same screenshot's ~2M base64 characters again and again. The first send of an image now goes to the model RAW (no quality loss on the turn that matters); every subsequent re-send of the same image from history is replaced with a short in-band text marker (~100 chars). Sessions with screenshots stop growing by megabytes per turn. New opt-out setting `ollamaCloud.visionHistory.mode` (`marker` default | `raw` restores the old behaviour). Two-phase vision (text-only primary models) is unchanged — its history rewrite already substitutes descriptions.
 
