@@ -50,7 +50,7 @@
 
 import * as vscode from 'vscode';
 import { logger } from './logger.js';
-import { hasImageParts, isImageDataPart } from './convertPrimitives.js';
+import { isImageDataPart } from './convertPrimitives.js';
 import { sha256ShortHex } from './visionTwoPhase.js';
 
 // NOTE (circular import, deliberate and safe): visionTwoPhase.ts
@@ -87,63 +87,6 @@ const MARKER_TEMPLATE =
  */
 export const degradedImageMarker = (hash: string): string =>
   `[Image ${hash} — attached image could not be described (no vision model available or the description failed); if you need its content, ask the user to re-attach it]`;
-
-/**
- * ArchCom 2026-09-15 variant (b) — full-history degradation rewrite.
- * Replaces EVERY image part with the degraded marker (degradation
- * must not be silence and must not leak image bytes). Returns the
- * per-image result map so the caller can log which hashes degraded.
- * Returns `null` when the history carries no image parts (caller
- * skips the rewrite).
- */
-export function degradeImagesToMarkers(
-  messages: readonly vscode.LanguageModelChatRequestMessage[],
-): { messages: vscode.LanguageModelChatRequestMessage[]; degradedHashes: string[] } | null {
-  const degradedHashes: string[] = [];
-  const result: vscode.LanguageModelChatRequestMessage[] = [];
-
-  for (const message of messages) {
-    if (!message) {
-      continue;
-    }
-    const isUserWithImages =
-      message.role === vscode.LanguageModelChatMessageRole.User &&
-      hasImageParts(message.content);
-    if (!isUserWithImages) {
-      result.push(message);
-      continue;
-    }
-
-    const newContent: Array<vscode.LanguageModelInputPart | unknown> = [];
-    for (const part of message.content) {
-      if (!isImageDataPart(part)) {
-        newContent.push(part);
-        continue;
-      }
-      const dataPart = part as vscode.LanguageModelDataPart;
-      const data = dataPart.data;
-      const hash =
-        data && data.length > 0
-          ? sha256ShortHex(Buffer.from(data))
-          : 'no-image';
-      degradedHashes.push(hash);
-      newContent.push(
-        new vscode.LanguageModelTextPart(`\n\n${degradedImageMarker(hash)}`),
-      );
-    }
-    if (newContent.length === 0) {
-      // Image-only message whose every part became a marker cannot be
-      // empty — the markers are text parts. Defensive guard only.
-      continue;
-    }
-    result.push({ ...message, content: newContent });
-  }
-
-  if (degradedHashes.length === 0) {
-    return null;
-  }
-  return { messages: result, degradedHashes };
-}
 
 /**
  * Rewrites `messages`: first-send hashes pass through RAW and are

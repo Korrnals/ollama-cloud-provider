@@ -213,7 +213,6 @@ export interface TwoPhaseParams {
    * failure still throws — the text-only primary could not answer an
    * image turn at all.
    */
-  readonly degradeOnFailure?: boolean;
 }
 
 /**
@@ -224,10 +223,10 @@ export interface TwoPhaseParams {
  * - `visionModelName` — the vision model that produced the
  *   description (for logging / disclosure).
  * - `degradedHashes` — images that degraded to the ADR 0013 marker
- *   cycle (ArchCom 2026-09-15 variant (b)): describe failure, empty
- *   description, or per-turn budget exhaustion. Only populated in
- *   `degradeOnFailure` mode; the legacy text-only path throws
- *   instead and leaves this empty.
+ *   cycle this turn (per-turn budget exhaustion). Never persisted:
+ *   the next turn retries the honest describe (review P1-2). The
+ *   legacy text-only path throws on hard failures and only reports
+ *   budget-excess hashes here.
  */
 export interface TwoPhaseResult {
   readonly messages: vscode.LanguageModelChatRequestMessage[];
@@ -463,21 +462,10 @@ export async function executeTwoPhaseVision(
             : failure instanceof Error
               ? failure.message
               : String(failure);
-      // ArchCom 2026-09-15 variant (b), invariant 2 — degradation,
-      // not silence and not a dead turn. For a VISION-CAPABLE
-      // primary (degradeOnFailure), a failed/empty describe degrades
-      // the image to the ADR 0013 marker cycle with a warning log;
-      // the primary still answers the turn and no image bytes leak
-      // into the payload. For a TEXT-ONLY primary (legacy contract)
-      // the error still throws — the user gets a clear error, not a
-      // silent text-only fallback (ADR 0004 #9).
-      if (params.degradeOnFailure) {
-        logger.warn(
-          `vision two-phase: describe failed (hash=${hash}) — ${detail}. Image degraded to marker (degradation mode for vision-capable primary).`,
-        );
-        degradedHashes.push(hash);
-        continue;
-      }
+      // Variant-(b) degradation (degradeOnFailure) was REMOVED with
+      // variant (v) (2026-09-15): a vision-capable primary now keeps
+      // direct sight (no describe at all), and the text-only primary
+      // keeps the legacy describe-all-or-throw contract.
       if (failure) {
         throw new Error(`Vision two-phase: vision model call failed — ${detail}`);
       }

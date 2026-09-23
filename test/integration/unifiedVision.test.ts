@@ -12,17 +12,15 @@ import { logger } from '../../src/logger.js';
  * ArchCom 2026-09-15 "unified vision descriptions" (variant (b)) —
  * integration gates G1–G2 of the committee protocol.
  *
- * Owner directive: an image must NOT live in the context as raw
- * bytes in ANY outcome — only a text description, which is itself
- * subject to compaction. Invariant 1: the two-phase describe runs
- * for EVERY primary with images, INCLUDING vision-capable primaries
- * (the primary never receives an image part, except the raw
- * opt-out's FIRST send). Invariant 2: degradation, not silence —
- * describe failure / no vision model / budget exhaustion degrades
- * to the ADR 0013 marker cycle with a warning log, never a throw and
- * never raw bytes. Invariant 3: describe budget ≤4 fresh calls per
- * turn. Invariant 6: zero image parts in every outgoing payload in
- * marker mode.
+ * Variant (v), field fix 2026-09-15 — supersedes variant (b) for
+ * vision-capable primaries. Owner field report: variant (b) stripped
+ * a vision-capable primary (glm-5.3-flash) of direct sight. The
+ * contract now: a VISION-CAPABLE primary sees the image RAW on the
+ * first send (v0.18 marker lifecycle replaces every history re-send
+ * with an in-band marker); a TEXT-ONLY primary still goes through
+ * two-phase describe (budget ≤4/turn; a transient describe failure
+ * throws and is never cached). The pass-through fallback is the
+ * single documented raw exception (ADR 0015).
  *
  * Topology mirrors provider.test.ts: cloud connection pinned to
  * `preferredEndpoint: 'chat'`. The fetch stub dispatches by URL:
@@ -208,52 +206,8 @@ function installFetch(describe: 'ok' | 'fail' | 'empty' = 'ok'): void {
   }) as typeof fetch;
 }
 
-/** No image_url / no base64 image signature anywhere in a dispatched body. */
-function assertZeroImageBytes(body: Record<string, unknown>, label: string): void {
-  const serialized = JSON.stringify(body);
-  assert.ok(
-    !serialized.includes('image_url'),
-    `${label}: zero image_url parts in the payload`,
-  );
-  assert.ok(
-    !serialized.includes('base64,'),
-    `${label}: zero base64 data-URL signatures in the payload`,
-  );
-}
 
-/**
- * Warn/error capture — mirrors commitWindow.test.ts: `logger.warn`
- * always pushes into the diagnostics ring buffer, so
- * `logger.getRecentErrors()` is observable without touching the
- * OutputChannel. `startLogCapture()` drains the buffer before the
- * turn; the assertions read it after.
- */
-function startLogCapture(): void {
-  logger.getRecentErrors().splice(0);
-}
-
-async function runProvider(
-  ctx: vscode.ExtensionContext,
-  apiModel: string,
-  messages: vscode.LanguageModelChatRequestMessage[],
-): Promise<{ progress: ReturnType<typeof makeProgress> }> {
-  const provider = new OllamaCloudChatProvider(ctx);
-  const progress = makeProgress();
-  const token = new vscode.CancellationTokenSource().token;
-  await provider.provideLanguageModelChatResponse(
-    chatInfoFor(apiModel),
-    messages,
-    {
-      modelOptions: {},
-      justification: 'test',
-    } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-    progress,
-    token,
-  );
-  return { progress };
-}
-
-describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates', () => {
+describe('vision-primary image lifecycle (variant (v) — field fix 2026-09-15) — G1 gates', () => {
   let originalFetch: typeof fetch;
 
   beforeEach(() => {
@@ -284,138 +238,12 @@ describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates
     }
   });
 
-  it('G1: vision-capable primary in marker mode → describe fires, primary receives ZERO image bytes and the description text', async () => {
+  it('G1: vision-capable primary in marker mode → RAW first send, NO describe call, zero describe requests', async () => {
     installFetch('ok');
     const ctx = makeMockContext();
-
-    const { progress } = await runProvider(ctx, 'kimi-k3', [imageMsg(IMG_A)]);
-
-    // The describe fired: exactly one /api/chat vision call.
-    assert.equal(
-      apiChatCalls.length,
-      1,
-      'exactly one vision describe call for one image',
-    );
-    const describeBody = apiChatCalls[0]!.body as {
-      model: string;
-      messages: Array<{ role: string; content: string; images?: string[] }>;
-      stream: boolean;
-    };
-    assert.equal(describeBody.model, 'minimax-m3', 'describe targeted the vision model');
-    assert.equal(describeBody.stream, false, 'describe is non-streaming');
-    assert.equal(
-      describeBody.messages[0]!.images?.length,
-      1,
-      'describe carried the image bytes',
-    );
-    assert.ok(
-      describeBody.messages[0]!.content.includes('Describe this image'),
-      'describe used the fixed VISION_DESCRIBE_PROMPT',
-    );
-
-    // The primary got ONE request, targeted at kimi-k3, with ZERO
-    // image bytes — the description replaced the image part.
-    assert.equal(chatCalls.length, 1, 'exactly one primary dispatch');
-    assert.equal(
-      (chatCalls[0]!.body as { model: string }).model,
-      'kimi-k3',
-      'the PRIMARY model answered the turn',
-    );
-    assertZeroImageBytes(chatCalls[0]!.body, 'primary payload');
-    const serialized = JSON.stringify(chatCalls[0]!.body);
-    assert.ok(
-      serialized.includes('[Image description from MiniMax M3'),
-      'the description (with injection delimiter) is in the payload',
-    );
-    assert.ok(
-      serialized.includes('a red square with text'),
-      'the vision description text reached the primary',
-    );
-
-    // Annotation visible (never silent routing).
-    assert.ok(
-      progress.parts.some(
-        (p) =>
-          p instanceof vscode.LanguageModelTextPart &&
-          p.value.includes('Describing image'),
-      ),
-      'the "Describing image" annotation fired',
-    );
-  });
-
-  it('G1: re-send of the same image → describe NOT called again (cache hit), still zero image bytes', async () => {
-    installFetch('ok');
-    const ctx = makeMockContext();
-
-    // Turn 1: describe fires.
-    await runProvider(ctx, 'kimi-k3', [imageMsg(IMG_A)]);
-    assert.equal(apiChatCalls.length, 1, 'turn 1: one describe call');
-
-    // Turn 2: VS Code re-sends the same history + a new text message.
-    await runProvider(ctx, 'kimi-k3', [
-      imageMsg(IMG_A),
-      assistantMsg('answer from primary'),
-      userMsg('and the layout?'),
-    ]);
-
-    // Cache hit: NO new describe call.
-    assert.equal(
-      apiChatCalls.length,
-      1,
-      'turn 2: NO additional describe call (persistent cache hit)',
-    );
-    assert.equal(chatCalls.length, 2, 'turn 2: primary dispatched');
-    assertZeroImageBytes(chatCalls[1]!.body, 'turn 2 payload');
-    const serialized = JSON.stringify(chatCalls[1]!.body);
-    assert.ok(
-      serialized.includes('[Image description from MiniMax M3'),
-      'the cached description substituted for the image',
-    );
-    assert.ok(serialized.includes('and the layout?'), 'new user text survived');
-  });
-
-  it('G1: no vision model resolvable (catalog stripped) → FULL marker degradation, not raw, not a throw', async () => {
-    // Strip the catalog to ONLY the primary (kimi-k3) — no
-    // vision-capable describe model can resolve, configured or auto.
-    let refreshCount = 0;
-    global.fetch = (async (input: string | URL, init?: { body?: unknown }) => {
-      const url = typeof input === 'string' ? input : input.toString();
-      if (url.endsWith('/models')) {
-        refreshCount += 1;
-        return new Response(
-          JSON.stringify({ data: [{ id: 'kimi-k3' }] }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        );
-      }
-      // Chat stream for the primary dispatch.
-      const parsed = init?.body
-        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
-        : {};
-      chatCalls.push({ url, body: parsed });
-      return new Response(
-        streamFromChunks([
-          encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}\n'),
-          encode('data: [DONE]\n'),
-        ]),
-        { status: 200 },
-      );
-    }) as typeof fetch;
-
-    const ctx = makeMockContext();
-    configure({
-      'visionHistory.mode': 'marker',
-      // A configured visionFallback.model that the stripped catalog
-      // cannot resolve, and the auto path finds nothing either.
-      'visionFallback.model': 'ollama-cloud/minimax-m3',
-    });
     const provider = new OllamaCloudChatProvider(ctx);
-    await provider.syncModelCatalog(true);
-    assert.ok(refreshCount >= 1, 'catalog was refreshed to the stripped list');
-
-    startLogCapture();
-    const progress = makeProgress();
     const token = new vscode.CancellationTokenSource().token;
-    // MUST NOT reject — degradation, not a throw.
+
     await provider.provideLanguageModelChatResponse(
       chatInfoFor('kimi-k3'),
       [imageMsg(IMG_A)],
@@ -423,107 +251,161 @@ describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates
         modelOptions: {},
         justification: 'test',
       } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-      progress,
+      makeProgress(),
       token,
     );
 
-    // No describe call fired at all.
-    assert.equal(apiChatCalls.length, 0, 'no describe call (no vision model)');
-    // The primary dispatched with ZERO image bytes and the degraded marker.
-    assert.equal(chatCalls.length, 1, 'primary dispatched');
-    const serialized = JSON.stringify(chatCalls[0]!.body);
-    assert.ok(!serialized.includes('image_url'), 'zero image_url parts');
-    assert.ok(!serialized.includes('base64,'), 'zero base64 signatures');
-    assert.ok(
-      serialized.includes('could not be described'),
-      'the degraded marker text is in the payload',
+    // Variant (v): the vision-capable primary SEES the image on the
+    // first send — no describe round-trip to a second model.
+    assert.equal(chatCalls.length, 1, 'exactly one primary dispatch');
+    assert.equal(
+      (chatCalls[0]!.body as { model: string }).model,
+      'kimi-k3',
+      'the primary itself answered',
     );
-    // Degradation was logged (not silent).
-    assert.ok(
-      logger
-        .getRecentErrors()
-        .some((line) => /degraded to markers/i.test(line)),
-      'the degradation was logger.warn-ed',
-    );
-  });
-
-  it('G1: describe call fails (vision-primary) → marker degradation, turn still completes, no throw', async () => {
-    installFetch('fail');
-    const ctx = makeMockContext();
-    startLogCapture();
-
-    const { progress } = await runProvider(ctx, 'kimi-k3', [imageMsg(IMG_A)]);
-
-    // One describe attempt was made (per-call retry may re-attempt
-    // socket errors, but a 500 is non-retryable → single call).
-    assert.equal(apiChatCalls.length, 1, 'one describe attempt');
-    assert.equal(chatCalls.length, 1, 'primary dispatched after degradation');
-    assertZeroImageBytes(chatCalls[0]!.body, 'primary payload');
     const serialized = JSON.stringify(chatCalls[0]!.body);
     assert.ok(
-      serialized.includes('could not be described'),
-      'degraded marker in payload',
+      serialized.includes('image_url') || serialized.includes('images'),
+      'the primary received the raw image',
     );
-    // The turn completed — the primary's answer streamed.
-    assert.ok(
-      progress.parts.some(
-        (p) =>
-          p instanceof vscode.LanguageModelTextPart &&
-          p.value.includes('answer from primary'),
-      ),
-      'the primary answered the degraded turn',
-    );
-    assert.ok(
-      logger.getRecentErrors().some((line) => /describe failed/i.test(line)),
-      'the describe failure was logged',
-    );
+    // No describe traffic at all — the describe budget belongs to
+    // text-only primaries only.
+    assert.equal(apiChatCalls.length, 0, 'no describe call for a vision primary');
   });
 
-  it('G1: budget — 5 new images in ONE turn → exactly 4 describe calls, the 5th degrades to a marker', async () => {
+  it('G1: re-send of the same image → history repeat is a marker, not pixels (v0.18 lifecycle)', async () => {
     installFetch('ok');
     const ctx = makeMockContext();
-    startLogCapture();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+    const call = (msgs: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        msgs,
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
 
-    await runProvider(ctx, 'kimi-k3', [
-      imageMsg(IMG_A, 'first'),
-      imageMsg(IMG_B, 'second'),
-      imageMsg(IMG_C, 'third'),
-      imageMsg(IMG_D, 'fourth'),
-      imageMsg(IMG_E, 'fifth'),
+    await call([imageMsg(IMG_A)]);
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('answer from primary'),
+      userMsg('what else?'),
     ]);
 
-    // Exactly 4 fresh describes (the budget); the 5th image degraded.
+    assert.equal(chatCalls.length, 2);
+    const turn2 = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(
+      !turn2.includes('image_url'),
+      'the history re-send of the same image became a marker',
+    );
+    assert.ok(turn2.includes('[Image'), 'marker text present');
+    assert.ok(turn2.includes('what else?'), 'new user text survived');
+  });
+
+  it('G1: text-only primary in marker mode → two-phase describe still fires (the owner directive channel)', async () => {
+    installFetch('ok');
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
+    const ctx = makeMockContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg(IMG_A)],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      token,
+    );
+
+    // The describe round-trip belongs to text-only primaries.
+    assert.equal(apiChatCalls.length, 1, 'one describe call to the vision model');
     assert.equal(
-      apiChatCalls.length,
-      4,
-      `exactly DESCRIBE_BUDGET_PER_TURN (4) describe calls, got ${apiChatCalls.length}`,
+      (apiChatCalls[0]!.body as { model: string }).model,
+      'minimax-m3',
+      'describe targeted the configured vision model',
     );
-    assert.equal(chatCalls.length, 1, 'one primary dispatch');
     const serialized = JSON.stringify(chatCalls[0]!.body);
-    assert.ok(!serialized.includes('image_url'), 'zero image_url parts');
-    assert.ok(!serialized.includes('base64,'), 'zero base64 signatures');
-    // 4 descriptions + 1 degraded marker present.
-    const descriptionCount = (serialized.match(/\[Image description from/g) ?? [])
-      .length;
-    assert.equal(descriptionCount, 4, 'four described images in the payload');
     assert.ok(
-      serialized.includes('could not be described'),
-      'the budget-excess image degraded to a marker',
+      !serialized.includes('image_url') && !serialized.includes('images'),
+      'the text-only primary received ZERO image bytes',
     );
     assert.ok(
-      logger
-        .getRecentErrors()
-        // P3-2: the warn uses a template literal now — assert the real
-        // message text with the budget value interpolated.
-        .some((line) => /describe budget \(4 per turn\) exceeded/.test(line)),
-      'the budget overrun was logged',
+      serialized.includes('[Image description'),
+      'the description text reached the primary',
     );
   });
 
-  it('G1: transient describe failure does NOT poison the image — next turn gets an honest describe (review P1-2)', async () => {
+  it('G1: text-only primary — describe budget 5 new images → exactly 4 describes, the 5th degrades to a marker (ADR 0015 inv.3)', async () => {
+    installFetch('ok');
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
+    const ctx = makeMockContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+
+    // Five distinct images on ONE turn against a text-only primary.
+    const content: Array<vscode.LanguageModelInputPart | unknown> = [
+      new vscode.LanguageModelTextPart('five screenshots'),
+    ];
+    for (const img of [IMG_A, IMG_B, IMG_C, IMG_D, IMG_E]) {
+      content.push(
+        new vscode.LanguageModelDataPart(new Uint8Array(img), 'image/png'),
+      );
+    }
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [
+        {
+          role: vscode.LanguageModelChatMessageRole.User,
+          content,
+          name: undefined,
+        } as vscode.LanguageModelChatRequestMessage,
+      ],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      token,
+    );
+
+    // ADR 0015 invariant 3: at most DESCRIBE_BUDGET_PER_TURN (4)
+    // describe calls; the excess image degrades to a marker.
+    assert.equal(apiChatCalls.length, 4, 'exactly 4 describe calls (budget)');
+    const dispatched = JSON.stringify(chatCalls[0]!.body);
+    assert.ok(!dispatched.includes('image_url'), 'zero image bytes in the payload');
+    assert.ok(
+      dispatched.includes('[Image'),
+      'the over-budget image is represented by a marker',
+    );
+  });
+
+  it('G1: text-only primary — a transient describe failure does NOT poison the image; the next turn retries the honest describe (review P1-2)', async () => {
     let describeCalls = 0;
     let describeFails = true;
-    configure();
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
     const chatBodies: Array<Record<string, unknown>> = [];
     global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
       const urlStr = String(url);
@@ -554,7 +436,7 @@ describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates
     const token = new vscode.CancellationTokenSource().token;
     const call = () =>
       provider.provideLanguageModelChatResponse(
-        chatInfoFor('kimi-k3'),
+        chatInfoFor('gpt-oss:120b'),
         [imageMsg(IMG_A)],
         {
           modelOptions: {},
@@ -564,27 +446,31 @@ describe('unified vision describe (ArchCom 2026-09-15, variant (b)) — G1 gates
         token,
       );
 
-    // Turn 1: describe returns 500 — degrade to a marker THIS turn
-    // (zero bytes leak), but nothing is remembered in the cache.
-    await call();
-    assert.equal(describeCalls, 1, 'turn 1: describe attempted');
-    assertZeroImageBytes(chatBodies[0] as Record<string, unknown>, 'turn 1 degraded');
-    assert.ok(
-      JSON.stringify(chatBodies[0]).includes('[Image'),
-      'turn 1 marker present',
+    // Turn 1: describe fails → the legacy text-primary contract
+    // THROWS (describe-all-or-error); the failed description is NOT
+    // cached, so no poisoned marker exists anywhere.
+    await assert.rejects(
+      () => call(),
+      /vision model call failed/,
+      'turn 1: the legacy text-only contract throws on describe failure',
     );
+    assert.equal(describeCalls, 1, 'exactly one failed describe attempt');
 
-    // Turn 2: SAME image — describe must be RETRIED (the failed
-    // marker was never cached); the payload carries the description.
+    // Turn 2: same image — the describe is RETRIED from scratch (the
+    // failure was never cached): the payload carries the honest
+    // description and zero raw bytes.
     describeFails = false;
     await call();
-    assert.equal(describeCalls, 2, 'turn 2: describe retried, not a poisoned cache hit');
-    const serialized2 = JSON.stringify(chatBodies[1]);
+    assert.equal(describeCalls, 2, 'describe retried on the next turn');
+    assert.equal(chatBodies.length, 1, 'one dispatched payload recorded');
     assert.ok(
-      serialized2.includes('a fresh honest description'),
+      JSON.stringify(chatBodies[0]).includes('a fresh honest description'),
       'turn 2 payload carries the honest description',
     );
-    assertZeroImageBytes(chatBodies[1] as Record<string, unknown>, 'turn 2 still zero bytes');
+    assert.ok(
+      !JSON.stringify(chatBodies[0]).includes('image_url'),
+      'still zero raw bytes',
+    );
   });
 
   it('G1: raw mode — vision-capable primary receives the image part on the FIRST send (v0.18 behaviour preserved)', async () => {
@@ -776,31 +662,40 @@ describe('unified vision + compaction (ArchCom 2026-09-15) — G2 gate', () => {
       token,
     );
 
-    // The describe fired exactly once (one unique image, budget ok).
-    assert.equal(describeCalls.length, 1, 'exactly one describe call');
+    // Variant (v): a vision-capable primary sees the image raw on the
+    // first send — NO describe round-trip. The owner invariant is
+    // still held END-TO-END by the marker lifecycle + compaction: the
+    // payload after compaction carries zero image parts and zero
+    // base64 (asserted below).
+    assert.equal(describeCalls.length, 0, 'no describe call for a vision primary');
     // Compaction fired on the DEFAULT (unset) setting: one summarizer
     // call over the 75% threshold.
     assert.equal(summarizerCalls.length, 1, 'compaction fired (default ON)');
     // The primary dispatched.
     assert.equal(chatCalls2.length, 1, 'primary dispatched');
 
-    // G2 invariant: ZERO image bytes in the dispatched payload.
+    // G2 invariant (variant (v) topology): the vision primary sees the
+    // image raw on the FIRST send (recency); compaction evicts the
+    // padded early turns; NO image part survives anywhere else in the
+    // payload (the lifecycle marker replaced the history re-send, and
+    // the marker text compacts like any text).
+    const body = chatCalls2[0] as { messages?: Array<{ role: string; content: unknown }> };
+    const imageParts = (body.messages ?? []).filter(
+      (m) =>
+        m.role === 'user' &&
+        Array.isArray((m as { content?: unknown[] }).content) &&
+        ((m as { content?: Array<Record<string, unknown>> }).content ?? []).some(
+          (p) => (p as { type?: string }).type === 'image_url',
+        ),
+    );
+    assert.equal(imageParts.length, 1, 'exactly ONE image part (the first-send, recency)');
     const serialized = JSON.stringify(chatCalls2[0]);
-    assert.ok(
-      !serialized.includes('image_url'),
-      'zero image_url parts after compaction',
-    );
-    assert.ok(
-      !serialized.includes('base64,'),
-      'zero base64 data-URL signatures after compaction',
-    );
-    // The evicted early turns are gone (compacted), the recency tail
-    // and the description text remain.
+    // No base64 duplication beyond the single first-send part, and no
+    // duplicated text channel: the marker text must NOT coexist with
+    // the raw part for the same hash.
+    assert.ok(!serialized.includes('[Image '), 'no marker for the first-send image');
+    // The evicted early turns are gone (compacted).
     assert.ok(!serialized.includes('turn1 '), 'evicted turn1 removed');
-    assert.ok(
-      serialized.includes('[Image description from'),
-      'the image description survived compaction in the payload',
-    );
     assert.ok(serialized.includes('final question'), 'recency tail intact');
     assert.ok(
       serialized.includes('[compacted-turns'),
