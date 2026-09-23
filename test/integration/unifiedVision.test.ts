@@ -12,17 +12,15 @@ import { logger } from '../../src/logger.js';
  * ArchCom 2026-09-15 "unified vision descriptions" (variant (b)) —
  * integration gates G1–G2 of the committee protocol.
  *
- * Owner directive: an image must NOT live in the context as raw
- * bytes in ANY outcome — only a text description, which is itself
- * subject to compaction. Invariant 1: the two-phase describe runs
- * for EVERY primary with images, INCLUDING vision-capable primaries
- * (the primary never receives an image part, except the raw
- * opt-out's FIRST send). Invariant 2: degradation, not silence —
- * describe failure / no vision model / budget exhaustion degrades
- * to the ADR 0013 marker cycle with a warning log, never a throw and
- * never raw bytes. Invariant 3: describe budget ≤4 fresh calls per
- * turn. Invariant 6: zero image parts in every outgoing payload in
- * marker mode.
+ * Variant (v), field fix 2026-09-15 — supersedes variant (b) for
+ * vision-capable primaries. Owner field report: variant (b) stripped
+ * a vision-capable primary (glm-5.3-flash) of direct sight. The
+ * contract now: a VISION-CAPABLE primary sees the image RAW on the
+ * first send (v0.18 marker lifecycle replaces every history re-send
+ * with an in-band marker); a TEXT-ONLY primary still goes through
+ * two-phase describe (budget ≤4/turn; a transient describe failure
+ * throws and is never cached). The pass-through fallback is the
+ * single documented raw exception (ADR 0015).
  *
  * Topology mirrors provider.test.ts: cloud connection pinned to
  * `preferredEndpoint: 'chat'`. The fetch stub dispatches by URL:
