@@ -146,6 +146,10 @@ function imageMsg(
 
 /** PNG-magic test images (distinct bytes → distinct hashes). */
 const IMG_A = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const IMG_B = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46];
+const IMG_C = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00];
+const IMG_D = [0x42, 0x4d, 0x3a, 0x00, 0x00, 0x00, 0x00, 0x00];
+const IMG_E = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
 
 function makeProgress(): vscode.Progress<vscode.LanguageModelResponsePart> & {
   parts: vscode.LanguageModelResponsePart[];
@@ -343,6 +347,131 @@ describe('vision-primary image lifecycle (variant (v) — field fix 2026-09-15) 
     assert.ok(
       serialized.includes('[Image description'),
       'the description text reached the primary',
+    );
+  });
+
+  it('G1: text-only primary — describe budget 5 new images → exactly 4 describes, the 5th degrades to a marker (ADR 0015 inv.3)', async () => {
+    installFetch('ok');
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
+    const ctx = makeMockContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+
+    // Five distinct images on ONE turn against a text-only primary.
+    const content: Array<vscode.LanguageModelInputPart | unknown> = [
+      new vscode.LanguageModelTextPart('five screenshots'),
+    ];
+    for (const img of [IMG_A, IMG_B, IMG_C, IMG_D, IMG_E]) {
+      content.push(
+        new vscode.LanguageModelDataPart(new Uint8Array(img), 'image/png'),
+      );
+    }
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [
+        {
+          role: vscode.LanguageModelChatMessageRole.User,
+          content,
+          name: undefined,
+        } as vscode.LanguageModelChatRequestMessage,
+      ],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      token,
+    );
+
+    // ADR 0015 invariant 3: at most DESCRIBE_BUDGET_PER_TURN (4)
+    // describe calls; the excess image degrades to a marker.
+    assert.equal(apiChatCalls.length, 4, 'exactly 4 describe calls (budget)');
+    const dispatched = JSON.stringify(chatCalls[0]!.body);
+    assert.ok(!dispatched.includes('image_url'), 'zero image bytes in the payload');
+    assert.ok(
+      dispatched.includes('[Image'),
+      'the over-budget image is represented by a marker',
+    );
+  });
+
+  it('G1: text-only primary — a transient describe failure does NOT poison the image; the next turn retries the honest describe (review P1-2)', async () => {
+    let describeCalls = 0;
+    let describeFails = true;
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
+    const chatBodies: Array<Record<string, unknown>> = [];
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        describeCalls += 1;
+        if (describeFails) {
+          return new Response('vision upstream overloaded', { status: 500 });
+        }
+        return new Response(
+          JSON.stringify({ message: { content: 'a fresh honest description' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      chatBodies.push(parsed);
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const token = new vscode.CancellationTokenSource().token;
+    const call = () =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        [imageMsg(IMG_A)],
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+
+    // Turn 1: describe fails → the legacy text-primary contract
+    // THROWS (describe-all-or-error); the failed description is NOT
+    // cached, so no poisoned marker exists anywhere.
+    await assert.rejects(
+      () => call(),
+      /vision model call failed/,
+      'turn 1: the legacy text-only contract throws on describe failure',
+    );
+    assert.equal(describeCalls, 1, 'exactly one failed describe attempt');
+
+    // Turn 2: same image — the describe is RETRIED from scratch (the
+    // failure was never cached): the payload carries the honest
+    // description and zero raw bytes.
+    describeFails = false;
+    await call();
+    assert.equal(describeCalls, 2, 'describe retried on the next turn');
+    assert.equal(chatBodies.length, 1, 'one dispatched payload recorded');
+    assert.ok(
+      JSON.stringify(chatBodies[0]).includes('a fresh honest description'),
+      'turn 2 payload carries the honest description',
+    );
+    assert.ok(
+      !JSON.stringify(chatBodies[0]).includes('image_url'),
+      'still zero raw bytes',
     );
   });
 
