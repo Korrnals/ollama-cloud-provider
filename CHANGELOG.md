@@ -3,7 +3,12 @@
 All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
-## [Unreleased]
+## [0.19.1] - 2026-09-15
+
+PATCH regression fix on 0.19.0 — direct sight for vision-capable primaries restored.
+
+### Fixed
+- **Vision-capable primaries see images directly again (variant (v))** — v0.19.0 unjustly applied the unified describe to ALL primaries; a vision-capable primary (e.g. `glm-5.3-flash`) now sees the image directly again on the first send (variant (v) supersedes variant (b) for vision-capable primaries), so images are not described away before the model that can look at them gets them. The text-only describe path is unchanged; dead variant-(b) code removed; test doc-head updated to variant (v).
 
 ## [0.19.0] - 2026-09-15
 
