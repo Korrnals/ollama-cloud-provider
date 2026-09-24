@@ -198,6 +198,10 @@ function requestDirect(
   const parsed = new URL(url);
   const transport = parsed.protocol === 'https:' ? https : http;
   return new Promise<HttpResponse>((resolve, reject) => {
+    // Assigned by `wireRequestLifecycle` below (the req must exist
+    // first). The response callback marks the lifecycle BEFORE
+    // resolving — see `wireRequestLifecycle` for why.
+    let markResponseReceived: () => void = () => undefined;
     const req = transport.request(
       url,
       {
@@ -205,10 +209,11 @@ function requestDirect(
         headers: options.headers,
       },
       (res) => {
+        markResponseReceived();
         resolve(buildResponse(res, parsed));
       },
     );
-    wireRequestLifecycle(req, options, url, reject);
+    markResponseReceived = wireRequestLifecycle(req, options, url, reject);
     if (options.body !== undefined) {
       req.write(options.body);
     }
@@ -232,6 +237,10 @@ function requestViaHttpProxy(
   const proxyPort = parsedProxy.port || '80';
 
   return new Promise<HttpResponse>((resolve, reject) => {
+    // Assigned by `wireRequestLifecycle` below (the req must exist
+    // first). The response callback marks the lifecycle BEFORE
+    // resolving — see `wireRequestLifecycle` for why.
+    let markResponseReceived: () => void = () => undefined;
     // Absolute-URI form: the proxy forwards to the target.
     const req = http.request(
       {
@@ -242,10 +251,11 @@ function requestViaHttpProxy(
         headers: options.headers,
       },
       (res) => {
+        markResponseReceived();
         resolve(buildResponse(res, parsedTarget));
       },
     );
-    wireRequestLifecycle(req, options, url, reject);
+    markResponseReceived = wireRequestLifecycle(req, options, url, reject);
     if (options.body !== undefined) {
       req.write(options.body);
     }
@@ -278,6 +288,7 @@ function requestViaTlsConnectTunnel(
   };
 
   return new Promise<HttpResponse>((resolve, reject) => {
+    let markResponseReceived: () => void = () => undefined;
     const connectReq = http.request(
       {
         host: proxyHost,
@@ -313,10 +324,11 @@ function requestViaTlsConnectTunnel(
             createConnection: () => socket,
           },
           (res) => {
+            markResponseReceived();
             resolve(buildResponse(res, parsedTarget));
           },
         );
-        wireRequestLifecycle(tlsReq, options, url, reject);
+        markResponseReceived = wireRequestLifecycle(tlsReq, options, url, reject);
         if (options.body !== undefined) {
           tlsReq.write(options.body);
         }
@@ -333,15 +345,52 @@ function requestViaTlsConnectTunnel(
  * body buffering for non-streaming consumers. Centralised so the three
  * request paths (direct / http-proxy / tls-tunnel) share one
  * implementation.
+ *
+ * Returns a `markResponseReceived` callback the transport path MUST
+ * invoke from its response callback, BEFORE `resolve(buildResponse(...))`.
+ *
+ * RCA 2026-09-24 (TLS BAD_DECRYPT log noise): Node's `ClientRequest`
+ * can emit a late `error` AFTER the response has fully resolved — e.g.
+ * the Chromium/Electron network stack (which VS Code's intercept layer
+ * can back `https.request` with) surfaces a BoringSSL teardown
+ * artifact (`OPENSSL_internal:BAD_DECRYPT`) for a request that already
+ * returned 200. Before this marker such errors logged as WARN and were
+ * indistinguishable from real request failures (up to 740 WARN lines a
+ * day, zero functional impact). Semantics now:
+ *   - error BEFORE response  → WARN + reject (unchanged);
+ *   - error AFTER response   → logger.debug only, no WARN, no reject
+ *     (the promise is already resolved; `reject` is a no-op).
  */
-function wireRequestLifecycle(
+export function wireRequestLifecycle(
   req: http.ClientRequest,
   options: HttpRequestOptions,
   url: string,
   reject: (error: Error) => void,
-): void {
+): () => void {
   let settled = false;
+  // Set by `markResponseReceived` from the transport's response
+  // callback. Distinct from `settled` (which fail() sets on the
+  // pre-response path) so post-response errors can be classified as
+  // teardown artifacts instead of request failures.
+  let responseReceived = false;
+
   const fail = (error: Error): void => {
+    // Post-response error (RCA 2026-09-24): the promise is already
+    // resolved — `reject()` would be a no-op. Keep the noise out of
+    // WARN: log at debug only.
+    if (responseReceived) {
+      const message = error.message ?? '';
+      // RCA option (d): tag BoringSSL teardown artifacts so future
+      // diagnostics can grep for them distinctly.
+      const artifactTag =
+        /OPENSSL_internal|third_party\/boringssl/.test(message)
+          ? ' (boringssl teardown artifact)'
+          : '';
+      logger.debug(
+        `httpClient: post-response error on settled request (teardown artifact)${artifactTag} — suppressed: ${message || error.name || 'unknown error'}`,
+      );
+      return;
+    }
     if (settled) {
       return;
     }
@@ -384,14 +433,16 @@ function wireRequestLifecycle(
       // destroy synchronously so the socket is torn down immediately
       req.destroy(err);
       fail(err);
-      return;
+      return () => undefined;
     }
     signal.addEventListener(
       'abort',
       () => {
-        if (settled) {
-          return;
-        }
+        // The socket must be destroyed EVEN when the response already
+        // arrived: aborting mid-stream still has to tear the socket
+        // down (streaming clients rely on this). The `settled` /
+        // `responseReceived` checks only decide whether `fail()` logs
+        // a WARN + rejects — never whether cleanup happens.
         const err = new Error('The operation was aborted');
         err.name = 'AbortError';
         req.destroy(err);
@@ -400,6 +451,10 @@ function wireRequestLifecycle(
       { once: true },
     );
   }
+
+  return () => {
+    responseReceived = true;
+  };
 }
 
 /**
