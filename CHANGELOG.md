@@ -3,12 +3,14 @@
 All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
-## [Unreleased]
+## [0.20.0] - 2026-09-24
+
+MINOR release — post-response teardown-error noise silenced (logging behavior changed; RCA day).
 
 ### Fixed
 - **Post-response TLS teardown errors no longer logged as WARN (BAD_DECRYPT noise)** — `wireRequestLifecycle` in the native HTTP client now marks the request as response-received on the success path (the marker was only set on the failure path, so late `error` events on an already-answered request passed the settled check and logged WARN). A post-response error is logged at debug level only — tagged `(boringssl teardown artifact)` when the message matches the BoringSSL `OPENSSL_internal` shape — and never rejects (the promise is already resolved). 740 WARN lines/day silenced at peak; functional impact was zero (no request failed, no retry was spent). Pre-response errors keep the WARN + reject path; mid-stream abort still destroys the socket.
 
-## [0.19.1] - 2026-09-15
+## [Unreleased]
 
 PATCH regression fix on 0.19.0 — direct sight for vision-capable primaries restored.
 
