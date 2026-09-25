@@ -10,6 +10,7 @@ import {
   isSocketCloseError,
   withRetry,
 } from '../../src/retry.js';
+import { SsrfDnsError } from '../../src/ssrfGuard.js';
 
 function setConfig(values: Record<string, unknown>): void {
   vscode.workspace.getConfiguration('ollamaCloud')._replace(values);
@@ -277,6 +278,18 @@ describe('retry — socket-close error detection (ADR 0008 Phase 2 level-4)', ()
         isSocketCloseError(new ConnectionInterruptedError(3)),
         false,
       );
+      // v0.20.1 — SsrfDnsError carries a libuv DNS `code` (ENOTFOUND /
+      // EAI_AGAIN) that would match SOCKET_CLOSE_CODES; it is classified
+      // by its own SsrfDnsError branch instead of being re-wrapped as a
+      // socket close ("закрыто сервером"), which misnames the cause.
+      assert.strictEqual(
+        isSocketCloseError(new SsrfDnsError('ENOTFOUND', 'ollama.com')),
+        false,
+      );
+      assert.strictEqual(
+        isSocketCloseError(new SsrfDnsError('EAI_AGAIN', 'ollama.com')),
+        false,
+      );
     });
 
     it('does NOT match an unrelated plain Error', () => {
@@ -356,6 +369,33 @@ describe('retry — socket-close error detection (ADR 0008 Phase 2 level-4)', ()
       assert.strictEqual(
         defaultRetryOn(new ZeroByteSocketCloseError()),
         true,
+      );
+    });
+  });
+
+  // v0.20.1 (RCA: transient DNS ENOTFOUND on ollama.com killed the turn
+  // AND poisoned the vision lifecycle) — the SSRF guard's typed DNS
+  // failure is retryable at the connect phase for the two classic
+  // resolver-blip codes; any other code stays terminal.
+  describe('defaultRetryOn — SsrfDnsError classification (v0.20.1)', () => {
+    it('retries SsrfDnsError ENOTFOUND (transient DNS blip)', () => {
+      assert.strictEqual(
+        defaultRetryOn(new SsrfDnsError('ENOTFOUND', 'ollama.com')),
+        true,
+      );
+    });
+
+    it('retries SsrfDnsError EAI_AGAIN (temporary resolver failure)', () => {
+      assert.strictEqual(
+        defaultRetryOn(new SsrfDnsError('EAI_AGAIN', 'ollama.com')),
+        true,
+      );
+    });
+
+    it('does NOT retry SsrfDnsError with a non-transient code', () => {
+      assert.strictEqual(
+        defaultRetryOn(new SsrfDnsError('NXDOMAIN', 'ollama.com')),
+        false,
       );
     });
   });

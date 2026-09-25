@@ -3,6 +3,7 @@ import { strict as assertStrict } from 'node:assert';
 import {
   SsrfGuard,
   SsrfBlockedError,
+  SsrfDnsError,
   createProductionSsrfGuard,
   type DnsResolver,
 } from '../../src/ssrfGuard.js';
@@ -417,16 +418,55 @@ describe('SsrfGuard (v0.12.0 ADR 0012)', () => {
   });
 
   describe('handles DNS resolution failure', () => {
-    it('surfaces ENOTFOUND as a plain Error (not SsrfBlockedError)', async () => {
+    // v0.20.1 — the two classic resolver-failure codes throw the TYPED
+    // SsrfDnsError (retryable at the connect phase, human message via
+    // classifyStreamError); every other DNS error keeps the plain
+    // Error shape.
+    it('surfaces ENOTFOUND as SsrfDnsError (code + hostname carried)', async () => {
       const dnsError = Object.assign(new Error('getaddrinfo ENOTFOUND bad.host'), {
         code: 'ENOTFOUND',
       });
       const guard = new SsrfGuard(throwingResolver(dnsError));
+      let caught: unknown;
+      try {
+        await guard.assertUrlAllowed('https://bad.host.nonexistent/api');
+      } catch (error) {
+        caught = error;
+      }
+      assert.ok(caught instanceof SsrfDnsError, 'ENOTFOUND must throw SsrfDnsError');
+      assert.equal(caught.code, 'ENOTFOUND');
+      assert.equal(caught.hostname, 'bad.host.nonexistent');
+      assert.equal(caught.name, 'SsrfDnsError');
+      assert.match(caught.message, /DNS resolution failed/);
+      // Not a block — the request was never rejected by policy.
+      assert.ok(!(caught instanceof SsrfBlockedError));
+    });
+
+    it('surfaces EAI_AGAIN as SsrfDnsError (transient resolver failure)', async () => {
+      const dnsError = Object.assign(new Error('getaddrinfo EAI_AGAIN slow.dns'), {
+        code: 'EAI_AGAIN',
+      });
+      const guard = new SsrfGuard(throwingResolver(dnsError));
       await assertRejects(
-        () => guard.assertUrlAllowed('https://bad.host.nonexistent/api'),
-        Error,
-        /DNS resolution failed/,
+        () => guard.assertUrlAllowed('https://slow.dns.example/api'),
+        SsrfDnsError,
+        /EAI_AGAIN/,
       );
+    });
+
+    it('keeps OTHER DNS errors as a plain Error (not SsrfDnsError)', async () => {
+      const dnsError = new Error('resolver exploded');
+      const guard = new SsrfGuard(throwingResolver(dnsError));
+      let caught: unknown;
+      try {
+        await guard.assertUrlAllowed('https://plain.error.example/api');
+      } catch (error) {
+        caught = error;
+      }
+      assert.ok(!(caught instanceof SsrfDnsError), 'non-libuv DNS errors stay plain');
+      assert.ok(caught instanceof Error);
+      assert.match((caught as Error).message, /DNS resolution failed/);
+      assert.match((caught as Error).message, /resolver exploded/);
     });
   });
 

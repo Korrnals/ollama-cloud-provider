@@ -703,3 +703,232 @@ describe('unified vision + compaction (ArchCom 2026-09-15) — G2 gate', () => {
     );
   });
 });
+
+/**
+ * v0.20.1 — commit-on-success for the vision hash lifecycle
+ * (RCA 2026-09-25, owner report "glm-5.3-flash не работает"): turn 1
+ * dispatched the image RAW, the request died on a transient DNS error,
+ * and the hash had ALREADY been recorded at dispatch time — turn 2
+ * shipped a MARKER instead of the image, so the model never saw it at
+ * all. The lifecycle now writes hashes into a per-turn PENDING
+ * container; every dispatch branch (native + pass-through) commits
+ * them into the instance set ONLY after its stream resolved (onDone).
+ *
+ * Gate (a): failed turn → no commit → next turn RAW again.
+ * Gate (b): successful turn → commit → next turn marker.
+ * Gate (c): pass-through — same two rules on the fallback path.
+ */
+describe('vision hash commit-on-success (v0.20.1 RCA) — G3 gates', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    clearImageDescriptionCache();
+    apiChatCalls = [];
+    chatCalls = [];
+    logger.getRecentErrors().splice(0);
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+    });
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    logger.getRecentErrors().splice(0);
+    clearImageDescriptionCache();
+    setConfig({});
+    for (const dir of storageDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('(a) a FAILED turn does NOT commit image hashes — the next turn re-sends the image RAW', async () => {
+    let primaryFails = true;
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        // Not expected for a vision-capable primary — served anyway so
+        // the stub never falls through accidentally.
+        return new Response(JSON.stringify({ message: { content: 'unused' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      chatCalls.push({ url: urlStr, body: parsed ?? {} });
+      if (primaryFails) {
+        return new Response('upstream exploded', { status: 500 });
+      }
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const token = new vscode.CancellationTokenSource().token;
+    const call = (msgs: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        msgs,
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+
+    // Turn 1: the image goes out RAW, the primary dispatch fails
+    // (HTTP 500 → non-404 → terminal error for the turn).
+    await assert.rejects(
+      () => call([imageMsg(IMG_A)]),
+      /Server error \(HTTP 500\)/,
+      'turn 1 failed with a surfaced server error',
+    );
+    assert.equal(chatCalls.length, 1, 'turn 1 dispatched once');
+    assert.ok(
+      JSON.stringify(chatCalls[0]!.body).includes('image_url'),
+      'turn 1 sent the image RAW',
+    );
+
+    // Turn 2: same image, primary healthy. The failed turn did NOT
+    // commit the hash — the model must see the image RAW again.
+    primaryFails = false;
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('answer from primary'),
+      userMsg('and now?'),
+    ]);
+    assert.equal(chatCalls.length, 2, 'turn 2 dispatched');
+    const turn2 = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(
+      turn2.includes('image_url'),
+      'turn 2 re-sends the SAME image RAW (hash was not committed by the failed turn)',
+    );
+  });
+
+  it('(b) a SUCCESSFUL turn commits the hash — the next turn markerizes the history repeat', async () => {
+    installFetch('ok');
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const token = new vscode.CancellationTokenSource().token;
+    const call = (msgs: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        msgs,
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+
+    // Turn 1 succeeds → the hash is committed on the success path.
+    await call([imageMsg(IMG_A)]);
+    assert.equal(chatCalls.length, 1);
+    assert.ok(
+      JSON.stringify(chatCalls[0]!.body).includes('image_url'),
+      'turn 1 sent the image RAW',
+    );
+
+    // Turn 2: the committed hash turns the history repeat into a
+    // marker (the pre-v0.20.1 behaviour, preserved).
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('answer from primary'),
+      userMsg('what else?'),
+    ]);
+    assert.equal(chatCalls.length, 2);
+    const turn2 = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(!turn2.includes('image_url'), 'turn 2 history repeat is a marker');
+    assert.ok(turn2.includes('[Image'), 'marker text present');
+  });
+
+  it('(c) pass-through: a failed pass-through does NOT commit; a successful one does', async () => {
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'pass-through',
+    });
+    let visionFails = true;
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        return new Response(JSON.stringify({ message: { content: 'unused' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (visionFails) {
+        return new Response('vision upstream exploded', { status: 500 });
+      }
+      chatCalls.push({ url: urlStr, body: parsed });
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"vision ok"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const token = new vscode.CancellationTokenSource().token;
+    const call = (msgs: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        msgs,
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+
+    // Turn 1: pass-through dispatch fails (HTTP 500) — no commit.
+    await assert.rejects(
+      () => call([imageMsg(IMG_A)]),
+      /Server error \(HTTP 500\)/,
+      'turn 1 pass-through failed with a surfaced server error',
+    );
+
+    // Turn 2: same image — the failed pass-through did NOT commit the
+    // hash, so the vision model sees it RAW again.
+    visionFails = false;
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('vision ok'),
+      userMsg('and now?'),
+    ]);
+    assert.equal(chatCalls.length, 1, 'turn 2 pass-through dispatched');
+    assert.ok(
+      JSON.stringify(chatCalls[0]!.body).includes('image_url'),
+      'turn 2 re-sends the SAME image RAW through the pass-through (no commit on the failed turn)',
+    );
+
+    // Turn 3: the SUCCESSFUL turn 2 committed the hash — the history
+    // repeat becomes a marker.
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('vision ok'),
+      userMsg('what else?'),
+    ]);
+    assert.equal(chatCalls.length, 2, 'turn 3 pass-through dispatched');
+    const turn3 = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(!turn3.includes('image_url'), 'turn 3 history repeat is a marker');
+    assert.ok(turn3.includes('[Image'), 'marker text present');
+  });
+});

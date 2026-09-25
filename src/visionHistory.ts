@@ -94,12 +94,27 @@ export const degradedImageMarker = (hash: string): string =>
  * Mode filtering (`'marker'` vs `'raw'`) is the CALLER's
  * responsibility — this function always applies the lifecycle.
  *
+ * HASH-CONTAINER CONTRACT (v0.20.1 — commit-on-success): the function
+ * takes TWO sets — the instance-level committed set (`sentHashes`:
+ * images whose RAW send completed successfully this window) and a
+ * PER-TURN pending set (`pendingHashes`: raw first-sends recorded this
+ * request, committed to `sentHashes` by the caller only after the
+ * stream resolved). A hash in EITHER set → the image already reached
+ * the model (or is in-flight in THIS request) → substituted with the
+ * marker. Unknown hash → recorded into pending + forwarded RAW: the
+ * model sees it on the turn that matters, and the caller commits the
+ * hash only on success — a failed/cancelled turn leaves it
+ * uncommitted, so the next turn re-sends the image RAW (RCA
+ * 2026-09-25: a hash committed at dispatch time survived a DNS-failed
+ * turn, and the image was never shown to the model).
+ *
  * Returns a NEW array; untouched messages are shared by reference
  * (message objects are copied only where a substitution happened).
  */
 export function applyVisionHistoryLifecycle(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
-  seenHashes: Set<string>,
+  sentHashes: ReadonlySet<string>,
+  pendingHashes: Set<string>,
 ): vscode.LanguageModelChatRequestMessage[] {
   let changed = false;
   const result: vscode.LanguageModelChatRequestMessage[] = [];
@@ -136,13 +151,16 @@ export function applyVisionHistoryLifecycle(
         data && data.length > 0
           ? sha256ShortHex(Buffer.from(data))
           : 'no-image';
-      if (seenHashes.has(hash)) {
+      if (sentHashes.has(hash) || pendingHashes.has(hash)) {
         // Second+ send of the same image — substitute the marker.
         changed = true;
         newContent.push(new vscode.LanguageModelTextPart(MARKER_TEMPLATE(hash)));
       } else {
-        // First send this session — record and forward RAW.
-        seenHashes.add(hash);
+        // First send this session AND this turn — record into the
+        // PENDING container and forward RAW. The caller commits the
+        // pending hashes into the seen set only after the stream
+        // succeeds.
+        pendingHashes.add(hash);
         newContent.push(part);
       }
     }
