@@ -3,6 +3,15 @@
 All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
+## [0.20.1] - 2026-09-25
+
+PATCH release — vision commit-on-success + retryable DNS blips (RCA 2026-09-25): a failed turn no longer poisons an image into an «already analyzed» marker, and transient resolver blips retry at the connect phase instead of killing the turn.
+
+### Fixed
+- **Image hashes commit only after the stream succeeds (commit-on-success)** — `applyVisionHistoryLifecycle` now takes a dual-set hash contract (`sentHashes` + per-turn `pendingHashes`): a hash in EITHER set markerizes history re-sends; an unknown hash is recorded into the per-turn PENDING container and forwarded RAW. The provider commits pending hashes (`commitPendingImageHashes`) only after the stream resolved (`onDone` fired) on every dispatch branch — native chat, native responses, and pass-through. A failed or cancelled turn (DNS error, 5xx, user cancel) no longer records the hash, so the next turn re-sends the image RAW instead of the «already analyzed» marker — the exact field-report symptom (a DNS-killed turn shipped a marker for an image the model never saw). A 404-fallback retrying a second endpoint within the same request shares one pending container, and only the branch that actually completes commits.
+- **Transient DNS blips (ENOTFOUND / EAI_AGAIN) retry at the connect phase** — the SSRF guard now throws a typed `SsrfDnsError` carrying the libuv resolver code; `defaultRetryOn` retries those two codes at the connect boundary (zero bytes produced → no double-billing risk; the live log proved an immediate retry succeeds during VPN hiccups). Other DNS codes (permanent resolver misconfiguration) stay terminal, and `SsrfDnsError` is excluded from the socket-close wrapping so the cause is not misnamed «closed by server».
+- **Human message for DNS failures** — `classifyStreamError` maps `SsrfDnsError` to a Blocked error naming the unresolvable host and the recovery path (check connection/VPN; the extension retries automatically) instead of surfacing a terminal raw resolver error.
+
 ## [0.20.0] - 2026-09-24
 
 MINOR release — post-response teardown-error noise silenced (logging behavior changed; RCA day).
@@ -10,7 +19,7 @@ MINOR release — post-response teardown-error noise silenced (logging behavior 
 ### Fixed
 - **Post-response TLS teardown errors no longer logged as WARN (BAD_DECRYPT noise)** — `wireRequestLifecycle` in the native HTTP client now marks the request as response-received on the success path (the marker was only set on the failure path, so late `error` events on an already-answered request passed the settled check and logged WARN). A post-response error is logged at debug level only — tagged `(boringssl teardown artifact)` when the message matches the BoringSSL `OPENSSL_internal` shape — and never rejects (the promise is already resolved). 740 WARN lines/day silenced at peak; functional impact was zero (no request failed, no retry was spent). Pre-response errors keep the WARN + reject path; mid-stream abort still destroys the socket.
 
-## [Unreleased]
+## [0.19.1] - 2026-09-15
 
 PATCH regression fix on 0.19.0 — direct sight for vision-capable primaries restored.
 
