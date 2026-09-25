@@ -38,22 +38,26 @@ describe('visionHistory lifecycle (ADR 0013 extension)', () => {
     });
   });
 
-  it('first send of an image passes through RAW and is recorded', () => {
-    const seen = new Set<string>();
-    const out = applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], seen);
+  it('first send of an image passes through RAW and is recorded into PENDING (commit-on-success)', () => {
+    const sent = new Set<string>();
+    const pending = new Set<string>();
+    const out = applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], sent, pending);
     assert.equal(out.length, 1);
     const parts = out[0]!.content;
     assert.equal(parts.length, 1);
     assert.ok(parts[0] instanceof vscode.LanguageModelDataPart, 'raw image forwarded');
-    assert.equal(seen.size, 1, 'hash recorded');
+    assert.equal(pending.size, 1, 'hash recorded into PENDING');
+    assert.equal(sent.size, 0, 'NOT committed into seen yet (commit-on-success)');
   });
 
   it('second send of the SAME image is replaced with a marker (~100 chars, not ~2M)', () => {
-    const seen = new Set<string>();
-    // Turn 1: raw + record.
-    applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], seen);
+    const sent = new Set<string>();
+    // Turn 1: raw + record into pending; the caller commits on success.
+    const pending1 = new Set<string>();
+    applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], sent, pending1);
+    for (const h of pending1) sent.add(h);
     // Turn 2: the history re-sends the same image — marker instead.
-    const out = applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], seen);
+    const out = applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], sent, new Set());
     const parts = out[0]!.content;
     assert.equal(parts.length, 1);
     assert.ok(parts[0] instanceof vscode.LanguageModelTextPart, 'marker is text');
@@ -63,12 +67,15 @@ describe('visionHistory lifecycle (ADR 0013 extension)', () => {
   });
 
   it('a NEW image pasted this turn is still sent raw (multi-image history)', () => {
-    const seen = new Set<string>();
-    applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], seen);
+    const sent = new Set<string>();
+    const pending = new Set<string>();
+    applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], sent, pending);
+    for (const h of pending) sent.add(h);
     // History repeats A, user adds B — B must go raw, A must marker.
     const out = applyVisionHistoryLifecycle(
       [userMsg([imagePart(PNG_A), imagePart(PNG_B)])],
-      seen,
+      sent,
+      new Set(),
     );
     const parts = out[0]!.content;
     assert.equal(parts.length, 2);
@@ -77,11 +84,11 @@ describe('visionHistory lifecycle (ADR 0013 extension)', () => {
   });
 
   it('does not touch messages without images and keeps turn structure', () => {
-    const seen = new Set<string>();
+    const sent = new Set<string>();
     const msg = userMsg([new vscode.LanguageModelTextPart('plain question')]);
-    const out = applyVisionHistoryLifecycle([msg], seen);
+    const out = applyVisionHistoryLifecycle([msg], sent, new Set());
     assert.strictEqual(out[0], msg, 'untouched message shared by reference');
-    assert.equal(seen.size, 0);
+    assert.equal(sent.size, 0);
   });
 
   it('assistant-role image parts are left alone (native path only sends user images anyway)', () => {
@@ -91,7 +98,7 @@ describe('visionHistory lifecycle (ADR 0013 extension)', () => {
       content: [imagePart(PNG_A)],
       name: undefined,
     } as vscode.LanguageModelChatRequestMessage;
-    const out = applyVisionHistoryLifecycle([msg], seen);
+    const out = applyVisionHistoryLifecycle([msg], seen, new Set());
     assert.strictEqual(out[0], msg);
     assert.equal(seen.size, 0, 'no hashes recorded from assistant parts');
   });

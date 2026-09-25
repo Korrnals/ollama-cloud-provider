@@ -50,6 +50,51 @@ export class SsrfBlockedError extends Error {
   }
 }
 
+/**
+ * libuv DNS error `code` carried by {@link SsrfDnsError}. Production
+ * `assertUrlAllowed` throws the typed error ONLY for the two classic
+ * resolver failure codes below (any other DNS error stays a plain
+ * `Error`); the union stays open so the retry/classification layers
+ * can keep distinguishing codes without a breaking change.
+ */
+export type SsrfDnsErrorCode = 'ENOTFOUND' | 'EAI_AGAIN' | (string & {});
+
+/**
+ * Typed DNS-resolution failure from the SSRF guard's resolver
+ * (v0.20.1 — RCA: a transient DNS blip, e.g. `ENOTFOUND` on
+ * ollama.com during a VPN hiccup, surfaced to the user as a terminal
+ * raw error AND poisoned the vision lifecycle — the image hash was
+ * recorded on the failed turn so the next turn never re-sent the
+ * image).
+ *
+ * Only the resolver-failure codes that are meaningfully transient or
+ * resolver-scoped (`ENOTFOUND`, `EAI_AGAIN`) are thrown as this type;
+ * every other DNS error keeps the historical plain-Error shape. The
+ * retry layer (`defaultRetryOn`) treats `ENOTFOUND` / `EAI_AGAIN` as
+ * retryable at the connect phase (zero bytes produced → no
+ * double-billing risk), and `classifyStreamError` maps this error to
+ * a human-readable Blocked message.
+ */
+export class SsrfDnsError extends Error {
+  /** libuv DNS code (`ENOTFOUND`, `EAI_AGAIN`, ...). */
+  readonly code: SsrfDnsErrorCode;
+  /** Sanitized hostname that failed to resolve (log-safe). */
+  readonly hostname: string;
+
+  constructor(code: SsrfDnsErrorCode, hostname: string, cause?: unknown) {
+    const safeHostname = sanitizeForMessage(hostname);
+    const causeMsg =
+      cause instanceof Error ? cause.message : String(cause ?? '');
+    super(
+      `SSRF guard: DNS resolution failed for '${safeHostname}' (${code})` +
+        (causeMsg ? `: ${sanitizeForMessage(causeMsg)}` : ''),
+    );
+    this.name = 'SsrfDnsError';
+    this.code = code;
+    this.hostname = safeHostname;
+  }
+}
+
 type ParsedIp =
   | { family: 4; octets: [number, number, number, number]; raw: string }
   | { family: 6; groups: number[]; raw: string };
@@ -193,6 +238,14 @@ export class SsrfGuard {
     try {
       resolved = await this.resolveDns(hostname);
     } catch (error) {
+      // v0.20.1 — the two classic resolver-failure codes get a TYPED
+      // error so the retry layer can treat them as transient connect-
+      // phase failures and `classifyStreamError` can show a human
+      // message. Every other DNS error keeps the plain-Error shape.
+      const code = (error as { code?: unknown } | null)?.code;
+      if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') {
+        throw new SsrfDnsError(code, hostname, error);
+      }
       const msg = error instanceof Error ? error.message : String(error);
       throw new Error(`SSRF guard: DNS resolution failed for '${sanitizeForMessage(hostname)}': ${msg}`);
     }

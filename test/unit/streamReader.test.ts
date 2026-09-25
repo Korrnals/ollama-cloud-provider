@@ -38,6 +38,7 @@ import {
   ZeroByteSocketCloseError,
   ConnectionInterruptedError,
 } from '../../src/retry.js';
+import { SsrfDnsError } from '../../src/ssrfGuard.js';
 
 const BASE_URL = 'https://ollama.com/v1';
 const STREAM_URL = `${BASE_URL}/test`;
@@ -809,6 +810,114 @@ describe('streamReader.readStream — module contract', () => {
     );
 
     assert.equal(resetCalled, true, 'processLine must receive ctx with resetInactivity');
+
+    global.fetch = originalFetch;
+  });
+});
+
+/**
+ * v0.20.1 — SSRF-guard DNS blip retry (RCA 2026-09-25: a transient
+ * `ENOTFOUND` on ollama.com killed the turn with a terminal error).
+ * `assertUrlAllowed` runs INSIDE the connect-phase `withRetry`, so a
+ * typed `SsrfDnsError` carrying a retryable code must be retried by
+ * `defaultRetryOn` and the request must succeed on the next attempt —
+ * the same dependency-injected resolver seam the probe tests use (no
+ * real DNS is touched).
+ */
+describe('streamReader.readStream — ssrfGuard DNS blip retry (v0.20.1)', () => {
+  it('retries a SsrfDnsError(ENOTFOUND) from assertUrlAllowed and succeeds on the next attempt', async () => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMin: 30,
+      maxRetries: 2,
+    });
+
+    let guardCalls = 0;
+    let fetchCalls = 0;
+    const body = streamFromChunks([
+      encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n'),
+      encode('data: [DONE]\n'),
+    ]);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      return mockResponse(body);
+    }) as typeof fetch;
+
+    // The guard fails with a DNS blip on the FIRST call and resolves on
+    // every later one — the classic transient resolver hiccup.
+    const ssrfGuard = {
+      assertUrlAllowed: async (_url: string) => {
+        guardCalls += 1;
+        if (guardCalls === 1) {
+          throw new SsrfDnsError('ENOTFOUND', 'ollama.com');
+        }
+      },
+    };
+
+    const recorder = makeCallbacks();
+    await readStream(
+      makeBaseOptions({ ssrfGuard, connectRetryBaseDelayMs: 1 }),
+      recorder,
+    );
+
+    assert.equal(guardCalls, 2, 'assertUrlAllowed ran twice (initial + retry)');
+    assert.equal(fetchCalls, 1, 'fetch ran once — the DNS blip failed before connect');
+    assert.equal(recorder.doneCount, 1, 'the retried attempt completed the stream');
+    assert.equal(recorder.errors.length, 0, 'no error surfaced after the retry');
+
+    global.fetch = originalFetch;
+  });
+
+  it('does NOT retry a SsrfDnsError with a non-transient code (terminal)', async () => {
+    setConfig({
+      baseUrl: BASE_URL,
+      allowedBaseUrls: [BASE_URL],
+      requestTimeoutMs: 120000,
+      requestConnectTimeoutMs: 30000,
+      requestInactivityTimeoutMs: 90000,
+      requestMaxDurationMin: 30,
+      maxRetries: 3,
+    });
+
+    let guardCalls = 0;
+    let fetchCalls = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async () => {
+      fetchCalls += 1;
+      return mockResponse(streamFromChunks([encode('data: x\n')]));
+    }) as typeof fetch;
+
+    const ssrfGuard = {
+      assertUrlAllowed: async (_url: string) => {
+        guardCalls += 1;
+        throw new SsrfDnsError('NXDOMAIN', 'ollama.com');
+      },
+    };
+
+    const recorder = makeCallbacks();
+    // Direct readStream calls surface terminal errors via
+    // callbacks.onError and RESOLVE — assert on the recorder, not on a
+    // rejection.
+    await readStream(
+      makeBaseOptions({ ssrfGuard, connectRetryBaseDelayMs: 1 }),
+      recorder,
+    );
+
+    assert.equal(recorder.errors.length, 1, 'terminal error surfaced via onError');
+    assert.ok(
+      recorder.errors[0] instanceof SsrfDnsError &&
+        (recorder.errors[0] as SsrfDnsError).code === 'NXDOMAIN',
+      'the SsrfDnsError(NXDOMAIN) surfaced unchanged',
+    );
+    assert.equal(guardCalls, 1, 'no retry burned on a non-transient DNS code');
+    assert.equal(fetchCalls, 0, 'never reached fetch');
+    assert.equal(recorder.doneCount, 0, 'no completion on a terminal error');
 
     global.fetch = originalFetch;
   });

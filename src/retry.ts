@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { logger } from './logger.js';
+import { SsrfDnsError } from './ssrfGuard.js';
 
 /**
  * Issue 13 — retry wrapper with exponential backoff.
@@ -195,7 +196,13 @@ export function isSocketCloseError(error: unknown): boolean {
     error instanceof MaxDurationError ||
     error instanceof MidStreamError ||
     error instanceof UpstreamIdleTimeoutError ||
-    error instanceof PostBudgetExhaustedError
+    error instanceof PostBudgetExhaustedError ||
+    // v0.20.1 — the SSRF guard's typed DNS failure carries a libuv
+    // code (ENOTFOUND / EAI_AGAIN) that would match SOCKET_CLOSE_CODES
+    // below and get re-wrapped as a socket close ("закрыто сервером"),
+    // which misnames the cause. It is classified by its own
+    // SsrfDnsError branch in `classifyStreamError` / `defaultRetryOn`.
+    error instanceof SsrfDnsError
   ) {
     return false;
   }
@@ -358,6 +365,10 @@ export function isRetriableHttpStatus(status: number): boolean {
  *
  * Retries on:
  * - {@link ZeroByteSocketCloseError} — 0-byte socket close, retryable
+ * - {@link SsrfDnsError} with code `ENOTFOUND` / `EAI_AGAIN` — transient
+ *   DNS blip at the connect phase (`assertUrlAllowed` runs inside
+ *   `withRetry` before every POST); 0 bytes produced → no double-billing
+ *   risk. Any other `SsrfDnsError` code stays terminal.
  * - {@link HttpError} with status 429 or >= 500
  * - `TypeError` (fetch failed — network error, DNS, connection refused)
  * - `AbortError` (timeout) — note: only meaningful when the abort signal
@@ -373,10 +384,20 @@ export function isRetriableHttpStatus(status: number): boolean {
  * - {@link MidStreamError} — server-sent mid-stream error, terminal
  * - {@link ConnectionInterruptedError} — mid-stream socket close, terminal
  * - {@link MaxDurationError} — total-duration cap, terminal
+ * - {@link SsrfDnsError} with any code other than `ENOTFOUND`/`EAI_AGAIN`
  */
 export function defaultRetryOn(error: unknown): boolean {
   if (error instanceof ZeroByteSocketCloseError) {
     return true;
+  }
+  if (error instanceof SsrfDnsError) {
+    // v0.20.1 (RCA: DNS ENOTFOUND killed the turn and poisoned the
+    // vision lifecycle) — ENOTFOUND / EAI_AGAIN are the signature of a
+    // transient resolver blip (VPN reconnect, flaky DNS, network
+    // switch). At the connect boundary zero bytes were produced, so
+    // retrying does not double-bill. Other DNS codes (permanent
+    // resolver misconfigurations) stay terminal.
+    return error.code === 'ENOTFOUND' || error.code === 'EAI_AGAIN';
   }
   if (error instanceof ConnectionInterruptedError) {
     return false;

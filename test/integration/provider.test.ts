@@ -7,6 +7,7 @@ import {
   MidStreamError,
   ZeroByteSocketCloseError,
 } from '../../src/retry.js';
+import { SsrfDnsError } from '../../src/ssrfGuard.js';
 import {
   clearCapabilityCache,
   isModelKnownRetired,
@@ -3002,6 +3003,20 @@ describe('classifyStreamError — ADR 0008 provider-level mapping', () => {
     assert.ok(result instanceof vscode.LanguageModelError);
     assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
     assert.match(result.message, /соединение прервано/);
+  });
+
+  // v0.20.1 (RCA: a transient DNS ENOTFOUND on ollama.com surfaced as a
+  // terminal raw stack trace) — the typed SSRF-guard DNS failure maps to
+  // a human-readable Blocked message naming the hostname and the
+  // recovery path.
+  it('maps SsrfDnsError to Blocked with a human-readable DNS message', () => {
+    const result = classifyStreamError(new SsrfDnsError('ENOTFOUND', 'ollama.com'));
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /DNS не смог разрешить имя сервера ollama\.com/);
+    assert.match(result.message, /transient network issue/);
+    assert.match(result.message, /проверь подключение\/VPN/);
+    assert.match(result.message, /\[ref [0-9a-f]{8}\]/, 'carries the correlatable ref id');
   });
 });
 

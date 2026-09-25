@@ -64,6 +64,7 @@ import {
 } from './retry.js';
 import {
   SsrfBlockedError,
+  SsrfDnsError,
   createProductionSsrfGuard,
   type SsrfGuard,
 } from './ssrfGuard.js';
@@ -238,6 +239,16 @@ export function classifyStreamError(error: unknown): Error {
   // policy, not by the server.
   if (error instanceof SsrfBlockedError) {
     return vscode.LanguageModelError.Blocked(`${error.message} [ref ${ref}]`);
+  }
+  if (error instanceof SsrfDnsError) {
+    // v0.20.1 (RCA: transient DNS ENOTFOUND on ollama.com surfaced as a
+    // terminal raw error) — a human message naming the resolver failure
+    // and the recovery path. The retry layer now retries these codes at
+    // the connect phase; if the user still sees this message, the
+    // retries were exhausted or the resolver is down for longer.
+    return vscode.LanguageModelError.Blocked(
+      `Ollama Cloud: DNS не смог разрешить имя сервера ${error.hostname} (transient network issue) — проверь подключение/VPN; расширение повторит запрос автоматически при следующей попытке. [ref ${ref}]`,
+    );
   }
   if (error instanceof ZeroByteSocketCloseError) {
     // ADR 0008 Phase 3 — server closed before any chunk. Retryable at
@@ -504,8 +515,38 @@ export class OllamaCloudChatProvider
    * reload re-sends each image once (acceptable, mirrors the
    * two-phase cache posture rationale). Opt-out:
    * ollamaCloud.visionHistory.mode = 'raw'.
+   *
+   * v0.20.1 (commit-on-success) — written ONLY via
+   * {@link commitPendingImageHashes}, which the dispatch branches call
+   * AFTER `runStream` resolved (= `onDone` fired). A failed/cancelled
+   * turn must NOT record hashes: the model never saw the image, so
+   * the next turn re-sends it RAW (RCA 2026-09-25: a DNS-killed turn
+   * recorded the hash, and the retry turn shipped a marker instead of
+   * the image — the model never saw it at all).
    */
   private readonly sentImageHashes = new Set<string>();
+
+  /**
+   * v0.20.1 — commits a turn's pending vision-lifecycle hashes into
+   * the instance-level {@link sentImageHashes} set. Called ONLY on the
+   * success path: after `await this.runStream(...)` resolved (which
+   * resolves on `onDone`) or after `executePassThrough` resolved. A
+   * turn that throws (error / cancel) never reaches the commit, so
+   * the next turn re-sends the image RAW.
+   *
+   * Composition note: the existing per-endpoint `onSuccess` callbacks
+   * (`markResponsesAvailable`, `markChatAvailable`, ...) are untouched
+   * — this is a separate post-await commit, not a callback replacement.
+   */
+  private commitPendingImageHashes(pending: Set<string>): void {
+    if (pending.size === 0) {
+      return;
+    }
+    for (const hash of pending) {
+      this.sentImageHashes.add(hash);
+    }
+    pending.clear();
+  }
   /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
@@ -903,6 +944,16 @@ export class OllamaCloudChatProvider
     // lifecycle then stays out of the way; see the native dispatch
     // block).
     let twoPhaseRewroteHistory = false;
+    // v0.20.1 (commit-on-success) — per-turn PENDING hash container.
+    // `applyVisionHistoryLifecycle` records first-send hashes HERE, not
+    // into `this.sentImageHashes`. The dispatch branches commit the
+    // pending hashes into the instance set only after their stream
+    // resolved successfully; a failed/cancelled turn leaves them
+    // uncommitted so the next turn re-sends the image RAW (the model
+    // never saw it). One container per request — a 404 fallback that
+    // retries a second endpoint within the SAME request shares it, and
+    // only the branch that actually completes commits.
+    const pendingImageHashes = new Set<string>();
       // ArchCom 2026-09-14 P0 fix — cloud models resolve `connection`
       // to undefined (legacy path), which silently dropped the user's
       // `ollamaCloud.visionModels` override for the cloud connection:
@@ -936,11 +987,13 @@ export class OllamaCloudChatProvider
             // re-send lifecycle here too: first RAW send reaches the
             // vision model; repeats become markers (same ~2M/turn
             // inflation fix as the primary dispatch — review P1-2).
+            // v0.20.1 — hashes go into the PENDING container and are
+            // committed only after the pass-through stream resolved.
             const passThroughMessages =
               resolveVisionHistoryMode() === 'marker'
-                ? applyVisionHistoryLifecycle(messages, this.sentImageHashes)
+                ? applyVisionHistoryLifecycle(messages, this.sentImageHashes, pendingImageHashes)
                 : messages;
-            return await executePassThrough({
+            const passThroughResult = await executePassThrough({
               primaryModel: model,
               primaryConnection: connection ?? cloudConnection,
               messages: passThroughMessages,
@@ -951,6 +1004,8 @@ export class OllamaCloudChatProvider
               catalog: this.modelCatalog.list(),
               connections,
             });
+            this.commitPendingImageHashes(pendingImageHashes);
+            return passThroughResult;
           }
           // two-phase — phase 1: vision describes the image, rewrite
           // history, then fall through to the primary dispatch below.
@@ -1021,7 +1076,7 @@ export class OllamaCloudChatProvider
       // repeat-marker protection (that is the v0.18 lifecycle that
       // shipped with `'raw'` already in effect).
       if (requestHasImages && !twoPhaseRewroteHistory) {
-        messages = applyVisionHistoryLifecycle(messages, this.sentImageHashes);
+        messages = applyVisionHistoryLifecycle(messages, this.sentImageHashes, pendingImageHashes);
       }
 
       const clientBaseUrl = connection
@@ -1385,6 +1440,9 @@ export class OllamaCloudChatProvider
             requestChars,
             () => markResponsesAvailable(connectionId),
           );
+          // v0.20.1 — the stream resolved (= onDone fired): commit the
+          // vision hashes this turn's lifecycle recorded as pending.
+          this.commitPendingImageHashes(pendingImageHashes);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1482,6 +1540,9 @@ export class OllamaCloudChatProvider
               reset404s(connectionId, 'native');
             },
           );
+          // v0.20.1 — the stream resolved (= onDone fired): commit the
+          // vision hashes this turn's lifecycle recorded as pending.
+          this.commitPendingImageHashes(pendingImageHashes);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1563,6 +1624,9 @@ export class OllamaCloudChatProvider
             requestChars,
             () => markResponsesAvailable(connectionId),
           );
+          // v0.20.1 — the stream resolved (= onDone fired): commit the
+          // vision hashes this turn's lifecycle recorded as pending.
+          this.commitPendingImageHashes(pendingImageHashes);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1618,6 +1682,9 @@ export class OllamaCloudChatProvider
             requestChars,
             () => markChatAvailable(connectionId),
           );
+          // v0.20.1 — the stream resolved (= onDone fired): commit the
+          // vision hashes this turn's lifecycle recorded as pending.
+          this.commitPendingImageHashes(pendingImageHashes);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1685,6 +1752,9 @@ export class OllamaCloudChatProvider
             requestChars,
             () => markResponsesAvailable(connectionId),
           );
+          // v0.20.1 — the stream resolved (= onDone fired): commit the
+          // vision hashes this turn's lifecycle recorded as pending.
+          this.commitPendingImageHashes(pendingImageHashes);
           return;
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1724,6 +1794,9 @@ export class OllamaCloudChatProvider
         requestChars,
         isLocal ? undefined : () => markChatAvailable(connectionId),
       );
+      // v0.20.1 — the final fallback resolved (= onDone fired): commit
+      // the vision hashes this turn's lifecycle recorded as pending.
+      this.commitPendingImageHashes(pendingImageHashes);
     } catch (error) {
       logger.error('provideLanguageModelChatResponse failed.', error);
       throw classifyStreamError(error);
