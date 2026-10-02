@@ -288,54 +288,89 @@ function requestViaTlsConnectTunnel(
   };
 
   return new Promise<HttpResponse>((resolve, reject) => {
+    // Security audit P3 (task v0220-s) — TWO request lifecycles live on
+    // this tunnel and each needs its own marker:
+    // `markConnectResponseReceived` for the CONNECT request itself,
+    // `markResponseReceived` for the TLS request issued over the
+    // tunnelled socket. Discarding the CONNECT marker left its
+    // lifecycle believing no response ever arrived, so a mid-stream
+    // abort through an HTTP proxy logged a spurious "request to <host>
+    // failed" WARN for the already-established tunnel.
+    //
+    // Routing reality discovered while fixing the audit item: Node
+    // delivers a CONNECT response ONLY via the 'connect' event — the
+    // response-callback form is a 'response' listener that NEVER fires
+    // for CONNECT (node:_http_client routes every CONNECT response to
+    // 'connect', and without a listener it destroys the socket). The
+    // former callback body (TLS upgrade AND the non-200 reject) was
+    // dead code: through an HTTP proxy the request hung until the
+    // caller aborted, and that abort produced exactly the spurious
+    // WARN the audit flagged. Listen on 'connect'; the event fires for
+    // every CONNECT response status and hands us the detached socket.
+    let markConnectResponseReceived: (res: http.IncomingMessage) => void = () => undefined;
     let markResponseReceived: (res: http.IncomingMessage) => void = () => undefined;
-    const connectReq = http.request(
-      {
-        host: proxyHost,
-        port: proxyPort,
-        method: 'CONNECT',
-        path: `${targetHost}:${targetPort}`,
-        headers: connectHeaders,
-      },
-      (connectRes) => {
-        if (connectRes.statusCode !== 200) {
-          connectRes.resume();
-          reject(
-            new Error(
-              `httpClient: proxy CONNECT failed with ${connectRes.statusCode} ${connectRes.statusMessage ?? ''}`.trim(),
-            ),
-          );
-          return;
-        }
-        // Upgrade the raw socket to TLS and issue the real request.
-        const socket = connectRes.socket;
-        if (!socket) {
-          reject(
-            new Error('httpClient: proxy CONNECT succeeded but no socket was returned'),
-          );
-          return;
-        }
-        const tlsReq = https.request(
-          url,
-          {
-            method: options.method ?? 'GET',
-            headers: options.headers,
-            agent: false,
-            createConnection: () => socket,
-          },
-          (res) => {
-            markResponseReceived(res);
-            resolve(buildResponse(res, parsedTarget));
-          },
+    const connectReq = http.request({
+      host: proxyHost,
+      port: proxyPort,
+      method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
+      headers: connectHeaders,
+    });
+    connectReq.on('connect', (connectRes, socket, head) => {
+      if (connectRes.statusCode !== 200) {
+        connectRes.resume();
+        // The socket is detached to us the moment 'connect' fires —
+        // tear it down or it leaks.
+        socket.destroy();
+        reject(
+          new Error(
+            `httpClient: proxy CONNECT failed with ${connectRes.statusCode} ${connectRes.statusMessage ?? ''}`.trim(),
+          ),
         );
-        markResponseReceived = wireRequestLifecycle(tlsReq, options, url, reject);
-        if (options.body !== undefined) {
-          tlsReq.write(options.body);
-        }
-        tlsReq.end();
-      },
-    );
-    wireRequestLifecycle(connectReq, options, url, reject);
+        return;
+      }
+      // Tell the CONNECT lifecycle the tunnel was established — same
+      // invariant as the two sibling transport paths (mark BEFORE
+      // anything settles): teardown errors on the CONNECT request
+      // after this point are classified as artifacts (debug only, no
+      // WARN) instead of request failures.
+      markConnectResponseReceived(connectRes);
+      // Bytes the proxy sent between the 200 head and our handler
+      // belong to the tunnelled protocol — put them back.
+      if (head.length > 0) {
+        socket.unshift(head);
+      }
+      // Upgrade the raw socket to TLS and issue the real request.
+      const tlsOptions: https.RequestOptions = {
+        method: options.method ?? 'GET',
+        headers: options.headers,
+        agent: false,
+        createConnection: () => socket,
+      };
+      // Test seam (same pattern as OLLAMA_HTTP_TEST_DELEGATE in
+      // httpRequest): the tunnel integration test targets a local
+      // self-signed HTTPS server, and NODE_EXTRA_CA_CERTS cannot be
+      // used there (Node reads it during process bootstrap, before any
+      // test code runs). Production never sets this var — certificate
+      // verification stays fully on.
+      if (process.env.OLLAMA_HTTP_TEST_TLS_INSECURE === '1') {
+        tlsOptions.rejectUnauthorized = false;
+      }
+      const tlsReq = https.request(
+        url,
+        tlsOptions,
+        (res) => {
+          markResponseReceived(res);
+          resolve(buildResponse(res, parsedTarget));
+        },
+      );
+      markResponseReceived = wireRequestLifecycle(tlsReq, options, url, reject);
+      if (options.body !== undefined) {
+        tlsReq.write(options.body);
+      }
+      tlsReq.end();
+    });
+    markConnectResponseReceived = wireRequestLifecycle(connectReq, options, url, reject);
     connectReq.end();
   });
 }
