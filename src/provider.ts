@@ -1483,7 +1483,8 @@ export class OllamaCloudChatProvider
    * very next turn → projection dropped → one-turn full-history
    * whiplash + cooldown-gated re-fire (self-healing but real).
    *
-   * Canonical form per message — `user␂<text>␂<sorted hashes>`:
+   * Canonical form per message — `user␂<text>␂<JSON array of sorted
+   * hashes>`:
    *   - text: the concatenated text of the message with every image
    *     marker STRIPPED (markers are state, not content);
    *   - hashes: the sorted set of image identities — the 16-hex sha
@@ -1494,7 +1495,10 @@ export class OllamaCloudChatProvider
    *     raw and marker form). Sorted because the raw form separates
    *     text/image parts while the marker form concatenates them,
    *     losing the interleave order — ordering of image identities
-   *     themselves is preserved by sorting deterministically.
+   *     themselves is preserved by sorting deterministically. Encoded
+   *     as a JSON array (QA P3-1, task v0221-p3) — a plain comma join
+   *     let a comma inside one identity collide with the two-identity
+   *     form.
    * Non-user messages never change render across vision states (the
    * lifecycle rewrites user messages only) — the wire render is
    * already stable for them. The WIRE render is untouched: estimates,
@@ -1541,7 +1545,17 @@ export class OllamaCloudChatProvider
       }
     }
     hashes.sort();
-    return `user\u0002${JSON.stringify(text)}\u0002${hashes.join(',')}`;
+    // QA P3-1 (task v0221-p3) — JSON-array encode the sorted hash set.
+    // The former `join(',')` was not injective: a non-data `url:` identity
+    // whose URL contains a comma could equal the joined form of TWO
+    // identities (`url:a,url:b` — one image with url `a,url:b`, or two
+    // images `a` + `b`), colliding distinct messages onto one fingerprint.
+    // JSON's per-element quoting keeps every comma inside its element.
+    // Sorted → deterministic. The fingerprint format is internal and
+    // in-memory (conversation keys live in the per-session
+    // `compactionStates` LRU, reset on reload) — no persisted basis to
+    // migrate.
+    return `user\u0002${JSON.stringify(text)}\u0002${JSON.stringify(hashes)}`;
   }
 
   /**
