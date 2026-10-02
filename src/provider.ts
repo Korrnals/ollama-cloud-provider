@@ -1496,6 +1496,15 @@ export class OllamaCloudChatProvider
             `Context filter: truncated ${filterReport.truncatedMessages} oldest messages`,
           );
         }
+        // v0.22.0 — a dropped checkpoint means compacted memory left the
+        // context (oldest-first fallback under an impossible budget);
+        // that is a quality-relevant loss, not routine hygiene — surface
+        // it at WARN so field logs show it without digging.
+        if (filterReport.truncatedCheckpoints > 0) {
+          logger.warn(
+            `Context filter: truncated ${filterReport.truncatedCheckpoints} compaction checkpoint(s) — compacted memory degraded this turn`,
+          );
+        }
         if (filterReport.droppedTools > 0) {
           logger.info(
             `Context filter: dropped ${filterReport.droppedTools} duplicate tools`,
