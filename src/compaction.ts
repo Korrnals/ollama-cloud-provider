@@ -29,6 +29,18 @@
  *     text); a 5-minute cooldown rate-guards re-fires against estimate
  *     oscillation; the compaction result carries before/after/capped
  *     stats for Slice 2 logging.
+ *   - v0.21.0 (slice d1, stickiness): VS Code re-sends the FULL
+ *     immutable chat history on every request, so a compaction that
+ *     only rewrote the triggering request evaporates on the next one
+ *     (field evidence 2026-10-02: context whiplash 380K↔1.1M tokens
+ *     between consecutive turns). After a fire, the projection
+ *     (system + pinned + injected summary replacing the evicted
+ *     prefix) is remembered in `CompactionState.projection` keyed by
+ *     a fingerprint of the consumed raw prefix, and RE-APPLIED to
+ *     every subsequent request whose history still starts with that
+ *     prefix (tail growth allowed). The cooldown and the 75%
+ *     threshold gate NEW summarizer fires only — never the
+ *     re-application of an existing projection.
  */
 
 /** Fire threshold — fraction of the model window (spec: 75%). */
@@ -129,6 +141,73 @@ export function retrievalBudgetTokens(windowTokens: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Projection fingerprints (v0.21.0 slice d1 — stickiness)
+// ---------------------------------------------------------------------------
+
+/**
+ * 32-bit FNV-1a fingerprint of a rendered message, hex-encoded. Used to
+ * recognize the consumed raw-history prefix across requests WITHOUT
+ * holding the full (multi-megabyte) prefix text in memory. This is a
+ * correctness guard for a UI state machine, not a security boundary:
+ * element-wise comparison of one fingerprint per prefix message plus the
+ * length guard makes accidental collisions negligible for real chat
+ * traffic, and a false match can only serve a stale-but-valid-shaped
+ * projection for one request.
+ */
+export function fingerprintText(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Whether `messages` still starts with the remembered prefix basis and
+ * has grown beyond it (a projection replaces a prefix; an incoming
+ * history at or below the basis length cannot be a continuation).
+ * Pure; any `render` error propagates to the caller's safety net.
+ */
+function basisMatches<T>(
+  messages: readonly T[],
+  basis: readonly string[],
+  render: (m: T) => string,
+): boolean {
+  if (messages.length <= basis.length) return false;
+  for (let i = 0; i < basis.length; i++) {
+    if (fingerprintText(render(messages[i]!)) !== basis[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * The remembered compaction projection (v0.21.0 slice d1). After a fire,
+ * `compactIfNeeded` remembers what the fire REPLACED and what it served,
+ * so subsequent requests re-apply the compacted shape instead of
+ * passing the raw history through (VS Code re-sends the full immutable
+ * history every turn — see the module header).
+ *
+ * - `basis`: fingerprint (via {@link fingerprintText} over `render`) of
+ *   every message of the consumed raw prefix, in order. Validity check
+ *   on each request: the incoming history must still start with exactly
+ *   this prefix and be longer than it (tail growth is the normal case).
+ * - `head` + `summaryMessage`: what is served in place of that prefix —
+ *   `[system..., pinned..., summary-inject]`. The pinned predicate must
+ *   be stable across calls for stickiness to carry pinned messages; a
+ *   member that loses pinned status is not re-carried (production
+ *   currently pins nothing, so this constraint is dormant).
+ */
+export interface CompactionProjection<T> {
+  /** Fingerprints of the consumed raw prefix messages, in order. */
+  basis: string[];
+  /** Consumed-and-carried messages: `[system..., pinned...]` carved from the raw basis region. */
+  head: T[];
+  /** The machine-generated summary message injected in place of the evicted block. */
+  summaryMessage: T;
+}
+
+// ---------------------------------------------------------------------------
 // Hysteresis state machine
 // ---------------------------------------------------------------------------
 
@@ -137,8 +216,12 @@ export function retrievalBudgetTokens(windowTokens: number): number {
  * when usage reaches {@link COMPACT_AT_RATIO}; a fire sets `armed: false`
  * until {@link applyCompacted} observes the result at or below
  * {@link COMPACT_TARGET_RATIO}.
+ *
+ * Generic in the message type because the d1 projection carries message
+ * references; defaults to `unknown` so non-generic uses (hysteresis-only
+ * checks) compile unchanged.
  */
-export interface CompactionState {
+export interface CompactionState<T = unknown> {
   armed: boolean;
   /** Last checkpoint summary — the sliding-summary chain; absent/null until the first compaction (slice 1.1). */
   lastSummary?: string | null;
@@ -146,6 +229,12 @@ export interface CompactionState {
   lastPointer?: string | null;
   /** Epoch-ms timestamp of the last fire; gates the cooldown rate guard (slice 1.1). */
   lastFiredAt?: number | null;
+  /**
+   * Remembered projection for stickiness (v0.21.0 slice d1); absent/null
+   * when no compaction is currently projected. Dropped (with the summary
+   * chain) as soon as the incoming history stops matching the basis.
+   */
+  projection?: CompactionProjection<T> | null;
 }
 
 /**
@@ -205,12 +294,14 @@ export function shouldCompact(
  *
  * Slice 1.1: chain fields (`lastSummary`, `lastPointer`, `lastFiredAt`)
  * are carried through untouched — only `armed` is (re)evaluated.
+ * v0.21.0 d1: the projection rides along in the spread; the function is
+ * generic so the carried message type survives the copy.
  */
-export function applyCompacted(
-  state: CompactionState,
+export function applyCompacted<T>(
+  state: CompactionState<T>,
   usedTokensAfter: number,
   windowTokens: number,
-): CompactionState {
+): CompactionState<T> {
   if (state.armed) return { ...state };
   // Bug 1 fix — re-arm at the fire threshold (75%), not just the
   // target (40%). A partial compaction that did not reach 40% but
@@ -386,7 +477,7 @@ export interface CompactIfNeededInput<T> {
   messages: readonly T[];
   windowTokens: number;
   charsPerToken: number;
-  state: CompactionState;
+  state: CompactionState<T>;
   summarize: Summarizer;
   store: EvictedStore;
   /** Message → text used for token estimation, store payload and prompt. */
@@ -415,9 +506,13 @@ export interface CompactionStats {
 export interface CompactionResult<T> {
   /** `true` when a compaction fired and `messages` is the compacted array. */
   compacted: boolean;
-  /** Post-check hysteresis state (input state on passthrough). */
-  state: CompactionState;
-  /** Messages to send onward: input copy on passthrough, `[system, pinned, summary-inject, recency]` on compaction. */
+  /** v0.21.0 d1 — `true` when `messages` is a re-applied remembered projection (no new fire this call). */
+  reapplied: boolean;
+  /** v0.21.0 d1 — `true` when a remembered projection was dropped this call (basis mismatch or re-apply error). */
+  droppedProjection: boolean;
+  /** Post-check hysteresis state (input state on plain passthrough; carries projection transitions otherwise). */
+  state: CompactionState<T>;
+  /** Messages to send onward: input copy on passthrough, projection shape on compaction/re-apply. */
   messages: T[];
   /** Checkpoint text on compaction, else `null`. */
   summary: string | null;
@@ -425,27 +520,61 @@ export interface CompactionResult<T> {
   pointer: string | null;
   /** Stats on compaction, else `null` (slice 1.1). */
   stats: CompactionStats | null;
+  /** v0.21.0 d1 — re-apply observability; `null` unless this call re-applied a projection. */
+  reapply: { projectedTokens: number; tailMessages: number } | null;
+}
+
+/**
+ * Drops a remembered projection and the summary chain it anchors (v0.21.0
+ * d1 invalidation). `lastFiredAt` is kept so the cooldown still rate-guards
+ * the fresh machine; `armed` is restored — a projection exists only after a
+ * fire, and re-arming on invalidation avoids the stuck-disarmed failure
+ * mode (the history that invalidated the basis never re-evaluates a fire
+ * result, so nothing else would re-arm the machine).
+ */
+function resetProjection<T>(state: CompactionState<T>): CompactionState<T> {
+  return {
+    armed: true,
+    lastSummary: null,
+    lastPointer: null,
+    lastFiredAt: state.lastFiredAt ?? null,
+    projection: null,
+  };
 }
 
 /**
  * Runs one compaction check over the message history.
  *
- * Flow: estimate usage (sum of per-message `estimateTokens(render(m))`)
- * → `shouldCompact`? no → passthrough (input copied, deps untouched).
- * yes → `splitZones` → empty evictable → passthrough (nothing to
- * compact). Otherwise: `store(evictable rendered)` — the FULL text,
- * the cap never applies to the store — → cap the block to 25% of
- * `summarizerWindowTokens` when provided (slice 1.1) →
- * `buildSummaryPrompt(state.lastSummary, cappedText)` (null only on
- * the first compaction) → `summarize` → assemble `[system...,
- * pinned..., summary-inject, recency...]` → evaluate the new
- * hysteresis state against the post-compaction usage and stamp the
- * chain (`lastSummary`/`lastPointer`/`lastFiredAt`) onto it.
+ * Flow (v0.21.0 d1): estimate raw usage → when a projection is
+ * remembered, check the basis against the incoming history:
+ *   - basis matches (prefix intact, history grown) → RE-APPLY: serve
+ *     `[head..., summary-inject, tail...]` where the tail is the raw
+ *     history beyond the basis. Re-application is independent of the
+ *     cooldown and the 75% threshold — those gate NEW fires only.
+ *   - basis gone (new session, VS Code-side pruning, deleted turns) →
+ *     drop the projection AND the summary chain (a stale chain would
+ *     fold an unrelated conversation into the next summary), keep the
+ *     cooldown stamp, restore `armed`.
+ * Then run the hysteresis over the EFFECTIVE (re-applied when sticky)
+ * history: `shouldCompact`? no → serve the effective history (re-applied
+ * projection, or input copy on plain passthrough). yes → `splitZones` →
+ * empty evictable → serve effective. Otherwise: `store(evictable
+ * rendered)` — the FULL text, the cap never applies to the store — →
+ * cap the block to 25% of `summarizerWindowTokens` when provided
+ * (slice 1.1) → `buildSummaryPrompt(state.lastSummary, cappedText)`
+ * (null only on the first compaction) → `summarize` → assemble
+ * `[system..., pinned..., summary-inject, recency...]` → evaluate the
+ * new hysteresis state against the post-compaction usage, stamp the
+ * chain, and remember the NEW projection (fingerprints of the consumed
+ * raw prefix + the head served in its place).
  *
  * Fallback contract (spec decision 1): if `store` or `summarize`
  * throws, the history is passed through untouched with
  * `compacted: false` — compaction never fails the chat; the caller
- * falls back to the existing blunt truncation path.
+ * falls back to the existing blunt truncation path. d1 extension: a
+ * failed re-fire still serves the re-applied projection (better than
+ * raw), and any error inside the re-apply path itself degrades to the
+ * raw passthrough.
  */
 export async function compactIfNeeded<T extends { role: string }>(
   input: CompactIfNeededInput<T>,
@@ -456,24 +585,74 @@ export async function compactIfNeeded<T extends { role: string }>(
   const estimate = (m: T): number => estimateTokens(render(m).length, charsPerToken);
   const usedTokens = messages.reduce((sum, m) => sum + estimate(m), 0);
 
+  // --- d1 stickiness: re-apply a remembered projection while the raw
+  // history still carries the evicted prefix basis. `effective` is what
+  // the model should see this request and what a new fire operates on.
+  let effective: readonly T[] = messages;
+  let effectiveUsed = usedTokens;
+  let reapplied = false;
+  let droppedProjection = false;
+  let tailMessages = 0;
+  let working: CompactionState<T> = state;
+  const projection = state.projection ?? null;
+  if (projection !== null) {
+    let basisOk = false;
+    try {
+      basisOk = basisMatches(messages, projection.basis, render);
+    } catch {
+      basisOk = false;
+    }
+    if (basisOk) {
+      try {
+        effective = [...projection.head, projection.summaryMessage, ...messages.slice(projection.basis.length)];
+        tailMessages = messages.length - projection.basis.length;
+        effectiveUsed = effective.reduce((sum, m) => sum + estimate(m), 0);
+        reapplied = true;
+      } catch {
+        // SAFETY (fallback contract): any error in the re-apply path
+        // degrades to the uncompacted raw passthrough — never fails
+        // the chat, never keeps a half-applied projection.
+        effective = messages;
+        effectiveUsed = usedTokens;
+        working = resetProjection(state);
+        droppedProjection = true;
+      }
+    } else {
+      working = resetProjection(state);
+      droppedProjection = true;
+    }
+  }
+
   const passthrough = (): CompactionResult<T> => ({
     compacted: false,
-    state,
-    messages: [...messages],
+    reapplied,
+    droppedProjection,
+    state: working,
+    messages: [...effective],
     summary: null,
     pointer: null,
     stats: null,
+    reapply: reapplied ? { projectedTokens: effectiveUsed, tailMessages } : null,
   });
 
-  if (!shouldCompact(state, usedTokens, windowTokens, nowMs)) return passthrough();
+  // Re-evaluate the hysteresis against the SERVED (re-applied) usage:
+  // applyCompacted is otherwise only evaluated on fires, so a machine
+  // discharged by a partial compaction would stay disarmed forever
+  // while the tail grows. Armed machines are never disarmed here.
+  if (reapplied) {
+    working = applyCompacted(working, effectiveUsed, windowTokens);
+  }
 
-  const zones = splitZones(messages, windowTokens, estimate, isPinned);
+  if (!shouldCompact(working, effectiveUsed, windowTokens, nowMs)) return passthrough();
+
+  const zones = splitZones(effective, windowTokens, estimate, isPinned);
   if (zones.evictable.length === 0) return passthrough();
 
   const evictedText = zones.evictable.map(render).join('\n\n');
-  // Slice 1.1 chain: fold the previous checkpoint in — null only on the first compaction.
-  const previousSummary = state.lastSummary ?? null;
-  const previousPointer = state.lastPointer ?? null;
+  // Slice 1.1 chain: fold the previous checkpoint in — null only on the
+  // first compaction (or after a d1 invalidation reset).
+  const previousSummary = working.lastSummary ?? null;
+  const previousPointer = working.lastPointer ?? null;
   let pointer: string;
   let summary: string;
   let capped = false;
@@ -502,30 +681,91 @@ export async function compactIfNeeded<T extends { role: string }>(
     content: `${SUMMARY_MARKER}\n${summary}\n[evicted-block pointer: ${pointer}]${pointerChain}`,
   } as unknown as T;
 
-  const assembled: T[] = [...zones.system, ...zones.pinned, summaryMessage, ...zones.recency];
+  // d1: on a re-fire the effective history opened with the previous
+  // projection; its injected summary message is REPLACED by the chained
+  // summary above — drop exactly that one message (by identity; raw-tail
+  // messages are fresh objects each request, so identity can never
+  // false-positive on them) so the assembled list never carries two
+  // summary messages.
+  const oldSummary = reapplied ? projection!.summaryMessage : null;
+  const systemKept = oldSummary !== null ? zones.system.filter((m) => m !== oldSummary) : zones.system;
+  const assembled: T[] = [...systemKept, ...zones.pinned, summaryMessage, ...zones.recency];
   const usedAfter = assembled.reduce((sum, m) => sum + estimate(m), 0);
+
+  // d1: remember the new projection — fingerprints of the raw prefix the
+  // projection replaces (in RAW coordinates, because VS Code re-sends the
+  // raw history, never our projection) and the head served in its place.
+  // The accounting maps the surviving zones back onto the raw message
+  // stream: survivors (kept pinned + recency) must form a contiguous raw
+  // suffix. When they do not (a pinned/system message interleaves inside
+  // the evicted span — production pins nothing and front-loads system
+  // messages, so this is a degenerate-history path), stickiness is
+  // skipped for this fire (projection: null) rather than serving a wrong
+  // projection later.
+  const sticky = projection !== null && reapplied;
+  const rawTail: T[] = sticky ? [...messages.slice(projection!.basis.length)] : [...messages];
+  const prevBasis: string[] = sticky ? [...projection!.basis] : [];
+  const survivor = new Set<T>([...zones.pinned, ...zones.recency]);
+  let contiguous = true;
+  let consumedPrefix = 0;
+  let seenSurvivor = false;
+  for (const m of rawTail) {
+    if (survivor.has(m)) {
+      seenSurvivor = true;
+    } else if (seenSurvivor) {
+      contiguous = false;
+      break;
+    } else {
+      consumedPrefix++;
+    }
+  }
+  let newBasis: string[] | null = null;
+  if (contiguous) {
+    try {
+      newBasis = [...prevBasis];
+      for (let i = 0; i < consumedPrefix; i++) {
+        newBasis.push(fingerprintText(render(rawTail[i]!)));
+      }
+    } catch {
+      newBasis = null;
+    }
+  }
+  // Head members carried forward: fresh system messages plus pinned
+  // messages that came from the previous head (tail-region pinned
+  // messages survive at their raw position and must NOT be carried —
+  // that would duplicate them).
+  const oldHeadSet = sticky ? new Set(projection!.head) : null;
+  const nextHead: T[] = [
+    ...systemKept,
+    ...(oldHeadSet !== null ? zones.pinned.filter((m) => oldHeadSet.has(m)) : []),
+  ];
+
   // The fire discharged the machine above; evaluate re-arm against the
   // result while stamping the chain onto the state (slice 1.1).
-  const firedState: CompactionState = {
-    ...state,
+  const firedState: CompactionState<T> = {
+    ...working,
     armed: false,
     lastSummary: summary,
     lastPointer: pointer,
     lastFiredAt: nowMs,
+    projection: newBasis !== null ? { basis: newBasis, head: nextHead, summaryMessage } : null,
   };
   const nextState = applyCompacted(firedState, usedAfter, windowTokens);
 
   return {
     compacted: true,
+    reapplied: false,
+    droppedProjection,
     state: nextState,
     messages: assembled,
     summary,
     pointer,
     stats: {
-      beforeTokens: usedTokens,
+      beforeTokens: effectiveUsed,
       afterTokens: usedAfter,
       evictedMessages: zones.evictable.length,
       capped,
     },
+    reapply: null,
   };
 }

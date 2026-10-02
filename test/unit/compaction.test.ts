@@ -8,9 +8,11 @@ import {
   compactIfNeeded,
   estimateTokens,
   evictedCapTokens,
+  fingerprintText,
   retrievalBudgetTokens,
   shouldCompact,
   splitZones,
+  type CompactionResult,
   type CompactionState,
   type EvictedStore,
   type Summarizer,
@@ -45,9 +47,9 @@ const asr = (tag: string, n = 50): Msg => ({ role: 'assistant', content: pad(tag
 const tol = (tag: string, n = 50): Msg => ({ role: 'tool', content: pad(tag, n) });
 
 /** `count` two-message turns [user, assistant], 50 tokens each message. */
-function turns(count: number, perMsg = 50): Msg[] {
+function turns(count: number, perMsg = 50, startAt = 1): Msg[] {
   const out: Msg[] = [];
-  for (let i = 1; i <= count; i++) {
+  for (let i = startAt; i < startAt + count; i++) {
     const tag = `t${String(i).padStart(2, '0')}`;
     out.push(usr(`${tag}u`, perMsg), asr(`${tag}a`, perMsg));
   }
@@ -367,12 +369,15 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(result.summary, 'GOAL: keep the goal. DONE: work.');
       // Slice 1.1 (additive): the fire stamps the summary chain onto the state.
       // Bug 1 fix: 816 < 1125 (75% of 1500) → re-arms (was: stays disarmed at 40%).
-      assert.deepStrictEqual(result.state, {
-        armed: true,
-        lastSummary: 'GOAL: keep the goal. DONE: work.',
-        lastPointer: 'ptr-1',
-        lastFiredAt: 123_456,
-      });
+      assert.strictEqual(result.state.armed, true);
+      assert.strictEqual(result.state.lastSummary, 'GOAL: keep the goal. DONE: work.');
+      assert.strictEqual(result.state.lastPointer, 'ptr-1');
+      assert.strictEqual(result.state.lastFiredAt, 123_456);
+      // v0.21.0 d1 — stickiness is SKIPPED for this fire by design: the
+      // pinned message sits mid-history inside the evicted span, so the
+      // surviving zones are not a contiguous raw suffix and a projection
+      // basis cannot be expressed (see compactIfNeeded contiguity check).
+      assert.strictEqual(result.state.projection, null);
     });
 
     it('re-arms when the compaction result lands at or below the 75% fire threshold (Bug 1 fix)', async () => {
@@ -392,12 +397,18 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(result.compacted, true);
       assert.strictEqual(result.messages.length, 1 + 1 + 20); // sys + inject + recency
       assert.strictEqual(result.messages[2], messages[61]); // user of turn 31
-      assert.deepStrictEqual(result.state, {
-        armed: true,
-        lastSummary: 'GOAL: keep the goal. DONE: work.',
-        lastPointer: 'ptr-1',
-        lastFiredAt: 1_000_000,
-      });
+      assert.strictEqual(result.state.armed, true);
+      assert.strictEqual(result.state.lastSummary, 'GOAL: keep the goal. DONE: work.');
+      assert.strictEqual(result.state.lastPointer, 'ptr-1');
+      assert.strictEqual(result.state.lastFiredAt, 1_000_000);
+      // v0.21.0 d1 — the fire remembers its projection for stickiness:
+      // basis = fingerprints of the consumed raw prefix (system + the 40
+      // evicted candidates = 61 of the 81 messages), head = the system
+      // message carved from that prefix, summaryMessage = the inject.
+      assert.ok(result.state.projection, 'projection remembered after the fire');
+      assert.strictEqual(result.state.projection.basis.length, 61);
+      assert.deepStrictEqual(result.state.projection.head, [messages[0]]);
+      assert.strictEqual(result.state.projection.summaryMessage, result.messages[1]);
     });
 
     it('falls back to passthrough when the summarizer throws', async () => {
@@ -507,22 +518,25 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(first.compacted, true);
       assert.strictEqual(first.pointer, 'ptr-1');
       assert.ok(!summarize.calls[0]!.includes('PREVIOUS CHECKPOINT')); // first: no chain yet
-      assert.deepStrictEqual(first.state, {
-        armed: true,
-        lastSummary: 'SUMMARY-ONE',
-        lastPointer: 'ptr-1',
-        lastFiredAt: 1_000_000,
-      });
+      assert.strictEqual(first.state.armed, true);
+      assert.strictEqual(first.state.lastSummary, 'SUMMARY-ONE');
+      assert.strictEqual(first.state.lastPointer, 'ptr-1');
+      assert.strictEqual(first.state.lastFiredAt, 1_000_000);
       const firstInjected = first.messages[1] as Msg;
       assert.ok(!firstInjected.content.includes('previous pointer'));
 
-      // Caller re-arms after observing the result at <= 75% fire threshold
-      // (applyCompacted contract — Bug 1 fix: was 40%, now 75%).
+      // v0.21.0 d1 — the second fire now happens on the RE-APPLIED
+      // projection plus a GROWN tail (VS Code re-sends the raw history
+      // with new turns appended): 5 extra turns push the re-applied
+      // usage (≈750) back over the 1050 fire threshold, and the
+      // cooldown has expired at t+1_000_000. Same-size re-sends no
+      // longer re-fire — they re-apply (covered in the d1 suite).
+      const grown = (): Msg[] => [sys('s1'), ...turns(20), ...turns(5, 50, 21)];
       const second = await compactIfNeeded({
-        messages: history(),
+        messages: grown(),
         windowTokens: 1400,
         charsPerToken: 1,
-        state: { ...first.state, armed: true },
+        state: first.state,
         summarize,
         store,
         render,
@@ -532,12 +546,14 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(second.pointer, 'ptr-2');
       assert.ok(summarize.calls[1]!.includes('PREVIOUS CHECKPOINT'));
       assert.ok(summarize.calls[1]!.includes('SUMMARY-ONE')); // folded into the prompt
-      assert.deepStrictEqual(second.state, {
-        armed: true,
-        lastSummary: 'SUMMARY-TWO',
-        lastPointer: 'ptr-2',
-        lastFiredAt: 2_000_000,
-      });
+      // The chained fire summarizes the NEWLY evicted tail block only —
+      // turns already folded into SUMMARY-ONE are never re-summarized.
+      assert.ok(store.calls[1]!.includes('t15u'));
+      assert.ok(!store.calls[1]!.includes('t01u'));
+      assert.strictEqual(second.state.armed, true);
+      assert.strictEqual(second.state.lastSummary, 'SUMMARY-TWO');
+      assert.strictEqual(second.state.lastPointer, 'ptr-2');
+      assert.strictEqual(second.state.lastFiredAt, 2_000_000);
       const secondInjected = second.messages[1] as Msg;
       assert.ok(secondInjected.content.includes('[evicted-block pointer: ptr-2]'));
       assert.ok(secondInjected.content.includes('[previous pointer: ptr-1]')); // pointer chain
@@ -603,6 +619,207 @@ describe('compaction (v0.13.0 slice 1)', () => {
       });
       assert.strictEqual(idle.compacted, false);
       assert.strictEqual(idle.stats, null);
+    });
+  });
+
+  describe('projection stickiness (v0.21.0 slice d1)', () => {
+    // Shared fixture: window 1400 (fire at 1050), raw history
+    // [sys, ...turns(20)] = 2050 tokens. Fire 1 evicts t01..t14a
+    // (28 msgs), keeps recency t15..t20a (12 msgs), and — since d1 —
+    // remembers projection {basis: 29 fingerprints, head: [s1],
+    // summaryMessage: inject}.
+    const WINDOW = 1400;
+    const fire1 = async (
+      summarize: Summarizer,
+      store: EvictedStore,
+    ): Promise<{ result: CompactionResult<Msg>; raw: Msg[] }> => {
+      const raw = [sys('s1'), ...turns(20)];
+      const result = await compactIfNeeded({
+        messages: raw,
+        windowTokens: WINDOW,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        nowMs: 1_000_000,
+      });
+      assert.strictEqual(result.compacted, true, 'fixture: fire 1 must fire');
+      return { result, raw };
+    };
+    // Grown history: +5 turns (t21..t25) appended at the tail — the
+    // VS Code full-history re-send shape.
+    const grown = (): Msg[] => [sys('s1'), ...turns(20), ...turns(5, 50, 21)];
+
+    it('re-applies the projection on the next request WITHIN the cooldown, with the grown tail appended', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const { result: first, raw } = await fire1(summarize, store);
+      const head = first.state.projection!;
+
+      // 60s after the fire — deep inside the 5-minute cooldown, and the
+      // re-applied usage (750 + 500 = 1250 > 1050) is OVER threshold:
+      // without stickiness this call would passthrough the raw 3060
+      // tokens (the production whiplash). It must re-apply instead.
+      const second = await compactIfNeeded({
+        messages: grown(),
+        windowTokens: WINDOW,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.compacted, false, 'no new fire within the cooldown');
+      assert.strictEqual(second.reapplied, true, 'the remembered projection is re-applied');
+      assert.strictEqual(second.droppedProjection, false);
+      assert.strictEqual(summarize.calls.length, 1, 'summarizer NOT called again');
+      assert.strictEqual(store.calls.length, 1, 'store NOT called again');
+      // Served shape: [head(s1), inject, recency + grown tail].
+      assert.strictEqual(second.messages.length, 2 + 22);
+      assert.strictEqual(second.messages[0], raw[0], 'head carries the system message by identity');
+      assert.ok((second.messages[1] as Msg).content.startsWith(SUMMARY_MARKER));
+      assert.ok(second.messages.some((m) => (m as Msg).content.includes('t15u')), 'recency kept');
+      assert.ok(second.messages.some((m) => (m as Msg).content.includes('t25a')), 'grown tail appended');
+      assert.ok(!second.messages.some((m) => (m as Msg).content.includes('t01u')), 'evicted prefix stays evicted');
+      // Observability payload. projectedTokens = head(50) + inject(99:
+      // marker 56 + newline + 'SUMMARY-ONE' + pointer line) + recency
+      // 600 + grown tail 500 = 1249.
+      assert.deepStrictEqual(second.reapply, { projectedTokens: 1249, tailMessages: 22 });
+      // State survives untouched for the next request.
+      assert.deepStrictEqual(second.state, first.state);
+      assert.strictEqual(second.state.projection, head);
+    });
+
+    it('stores the projection basis as per-message FNV-1a fingerprints of the rendered consumed prefix', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const { result: first, raw } = await fire1(summarize, store);
+      const projection = first.state.projection!;
+      // Consumed prefix = system + evictable t01..t14a = 29 messages.
+      assert.strictEqual(projection.basis.length, 29);
+      for (let i = 0; i < 29; i++) {
+        assert.strictEqual(
+          projection.basis[i],
+          fingerprintText(render(raw[i]!)),
+          `basis[${i}] must be the FNV-1a fingerprint of rendered raw[${i}]`,
+        );
+      }
+      assert.deepStrictEqual(projection.head, [raw[0]]);
+      assert.strictEqual(projection.summaryMessage, first.messages[1]);
+    });
+
+    it('invalidates the projection (and the summary chain) when the prefix basis is gone', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const { result: first } = await fire1(summarize, store);
+
+      // Different conversation: new system prompt → fingerprint
+      // mismatch at index 0.
+      const other = [sys('OTHER'), ...turns(20)];
+      const second = await compactIfNeeded({
+        messages: other,
+        windowTokens: WINDOW,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        nowMs: 1_060_000, // within cooldown
+      });
+      assert.strictEqual(second.compacted, false, 'cooldown still holds a fresh fire');
+      assert.strictEqual(second.reapplied, false);
+      assert.strictEqual(second.droppedProjection, true);
+      assert.deepStrictEqual(second.messages, other, 'raw passthrough');
+      assert.deepStrictEqual(second.state, {
+        armed: true,
+        lastSummary: null, // stale chain dropped — no cross-conversation folding
+        lastPointer: null,
+        lastFiredAt: 1_000_000, // cooldown stamp kept rate-guarding the fresh machine
+        projection: null,
+      });
+      assert.strictEqual(second.reapply, null);
+    });
+
+    it('invalidates when the incoming history is not longer than the basis (shrank below the prefix)', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const { result: first } = await fire1(summarize, store);
+      const shrunk = [sys('s1'), ...turns(10)];
+      const second = await compactIfNeeded({
+        messages: shrunk,
+        windowTokens: WINDOW,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.reapplied, false);
+      assert.strictEqual(second.droppedProjection, true);
+      assert.strictEqual(second.state.projection, null);
+    });
+
+    it('SAFETY: a render error inside the re-apply path degrades to raw passthrough, never throws', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const { result: first } = await fire1(summarize, store);
+      // The throwing render must fail ONLY inside the new path: the
+      // raw-history estimate (pre-existing code) renders every raw
+      // message first and propagates render errors to the provider's
+      // catch (unchanged pre-d1 behavior) — so the error is keyed to
+      // the injected summary message, which exists ONLY once the
+      // re-apply assembles the projection.
+      const renderThrows = (m: Msg): string => {
+        if (m.content.startsWith(SUMMARY_MARKER)) throw new Error('render boom');
+        return m.content;
+      };
+      const second = await compactIfNeeded({
+        messages: grown(),
+        windowTokens: WINDOW,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render: renderThrows,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.compacted, false);
+      assert.strictEqual(second.reapplied, false);
+      assert.strictEqual(second.droppedProjection, true);
+      assert.deepStrictEqual(second.messages, grown());
+      assert.strictEqual(second.state.projection, null);
+    });
+
+    it('a failed re-fire (summarizer error after cooldown) still serves the re-applied projection', async () => {
+      const store = fakeStore('ptr-1');
+      const calls: string[] = [];
+      let n = 0;
+      const flaky: Summarizer = async (prompt) => {
+        calls.push(prompt);
+        n++;
+        if (n === 1) return 'SUMMARY-ONE';
+        throw new Error('summarizer down');
+      };
+      const { result: first } = await fire1(flaky, store);
+
+      const second = await compactIfNeeded({
+        messages: grown(),
+        windowTokens: WINDOW,
+        charsPerToken: 1,
+        state: first.state,
+        summarize: flaky,
+        store,
+        render,
+        nowMs: 1_400_000, // cooldown expired; re-applied usage 1250 > 1050 → re-fire attempted
+      });
+      assert.strictEqual(calls.length, 2, 'the chained re-fire was attempted');
+      assert.strictEqual(second.compacted, false, 'the re-fire failed');
+      assert.strictEqual(second.reapplied, true, 'the projection still served — better than raw');
+      assert.ok((second.messages[1] as Msg).content.startsWith(SUMMARY_MARKER));
+      assert.strictEqual(second.state.projection, first.state.projection, 'projection retained for the next attempt');
     });
   });
 
