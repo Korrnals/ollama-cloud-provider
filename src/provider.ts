@@ -76,11 +76,8 @@ import {
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
-import {
-  applyVisionHistoryLifecycle,
-  resolveRawResendCap,
-  resolveVisionHistoryMode,
-} from './visionHistory.js';
+import { resolveVisionHistoryMode } from './visionHistory.js';
+import { TurnLedger } from './turnLedger.js';
 import { executeTwoPhaseVision, sha256ShortHex } from './visionTwoPhase.js';
 import type {
   NativeChatMessage,
@@ -552,143 +549,18 @@ export class OllamaCloudChatProvider
    */
   private readonly contextInflationWarned = new Set<string>();
   /**
-   * ADR 0013 lifecycle extension (2026-09-15) — image hashes already
-   * sent RAW in this window/session. VS Code re-sends immutable
-   * history every turn; without this set the native vision path
-   * re-uploaded ~2M chars of base64 per screenshot PER TURN (the RCA
-   * behind the owner's 2.46M-char sessions that killed subagent
-   * delegations with context overflow). First send: raw; repeats: an
-   * in-band marker (~100 chars). In-memory per instance — a window
-   * reload re-sends each image once (acceptable, mirrors the
-   * two-phase cache posture rationale). Opt-out:
-   * ollamaCloud.visionHistory.mode = 'raw'.
-   *
-   * v0.20.1 (commit-on-success) — written ONLY via
-   * {@link commitPendingImageHashes}, which the dispatch branches call
-   * AFTER `runStream` resolved (= `onDone` fired). A failed/cancelled
-   * turn must NOT record hashes: the model never saw the image, so
-   * the next turn re-sends it RAW (RCA 2026-09-25: a DNS-killed turn
-   * recorded the hash, and the retry turn shipped a marker instead of
-   * the image — the model never saw it at all).
+   * v0220 P2 (slice v0212-p2-turncontext-extraction) — the ONE owner
+   * of the vision turn bookkeeping: the instance-level sent/failed/
+   * capped/warned maps + the per-turn pending hash container, and the
+   * commit-on-success / failed-send / raw-resend-cap semantics that
+   * used to live in six scattered fields + two methods here. The
+   * provider opens a turn (`beginTurn`) at the top of every request,
+   * applies the lifecycle (`applyLifecycle`), commits on stream
+   * success (`commitTurn(token)`), and records failures in the catch
+   * (`recordFailedTurn()`). Lifetime and semantics unchanged — see
+   * turnLedger.ts.
    */
-  private readonly sentImageHashes = new Set<string>();
-  /**
-   * v0.21.0 D-3 (owner-ratified 2026-10-02) — per-hash count of FAILED
-   * raw sends (turn ended without its stream genuinely completing).
-   * Caps the resend amplifier: v0.20.1 commit-on-success correctly
-   * leaves a failed turn's hashes uncommitted, but that made every
-   * subsequent turn re-send those images as RAW base64 — one failed
-   * screenshot turn re-uploaded ~2M chars per turn until a success
-   * landed (3.3M-char requests observed), tripping over-window
-   * compaction and mass eviction. When a count reaches
-   * `ollamaCloud.visionHistory.rawResendCap` (default 3), the hash
-   * moves to {@link cappedImageHashes} and degrades to the never-sent
-   * marker for the rest of the session. In-memory per instance (same
-   * lifetime as {@link sentImageHashes}); a successful commit deletes
-   * the entry (committed hashes are exempt forever).
-   */
-  private readonly failedImageSendCounts = new Map<string, number>();
-  /**
-   * v0.21.0 D-3 — hashes that exhausted the raw-resend cap, mapped to
-   * the attempt count that capped them (rendered into the marker
-   * note). Permanent for the session; never re-sent raw, never
-   * committed into {@link sentImageHashes}.
-   */
-  private readonly cappedImageHashes = new Map<string, number>();
-  /** v0.21.0 D-3 — WARN-once-per-session latch for the first capped hash. */
-  private visionResendCapWarned = false;
-
-  /**
-   * v0.20.1 — commits a turn's pending vision-lifecycle hashes into
-   * the instance-level {@link sentImageHashes} set. Called ONLY on the
-   * success path: after `await this.runStream(...)` resolved (which
-   * resolves on `onDone`) or after `executePassThrough` resolved. A
-   * turn that throws (error / cancel) never reaches the commit, so
-   * the next turn re-sends the image RAW.
-   *
-   * v0.21.0 D-3 — `onDone` fires for BOTH genuine completion and the
-   * D-2 quiet-completed cancel (a cancel with nothing user-visible
-   * resolves the stream pipeline instead of rejecting it). The token
-   * distinguishes them: a cancelled token at commit time means the
-   * stream did NOT genuinely complete (the cancel listener aborts the
-   * read, so a stream cannot genuinely finish while cancelled) — the
-   * pending hashes count as FAILED sends for the raw-resend cap
-   * instead of committing (restores the documented v0.20.1 intent
-   * "a failed/cancelled turn must NOT record hashes" for the D-2
-   * path). With `rawResendCap = 0` the check is skipped entirely:
-   * the legacy commit-on-resolve behavior applies unchanged.
-   *
-   * Composition note: the existing per-endpoint `onSuccess` callbacks
-   * (`markResponsesAvailable`, `markChatAvailable`, ...) are untouched
-   * — this is a separate post-await commit, not a callback replacement.
-   */
-  private commitPendingImageHashes(
-    pending: Set<string>,
-    token?: vscode.CancellationToken,
-  ): void {
-    if (pending.size === 0) {
-      return;
-    }
-    if (token?.isCancellationRequested && resolveRawResendCap() > 0) {
-      this.recordFailedImageSends(pending);
-      return;
-    }
-    for (const hash of pending) {
-      this.sentImageHashes.add(hash);
-      // Success exempts the hash forever (never raw again) — drop any
-      // stale failure count so the map does not grow unbounded.
-      this.failedImageSendCounts.delete(hash);
-    }
-    pending.clear();
-  }
-
-  /**
-   * v0.21.0 D-3 — records a FAILED raw send for every pending hash of
-   * a turn that ended without its stream genuinely completing (the
-   * provideLanguageModelChatResponse catch path, or a quiet-completed
-   * cancel routed here from {@link commitPendingImageHashes}). When a
-   * hash's count reaches `ollamaCloud.visionHistory.rawResendCap` it
-   * moves to {@link cappedImageHashes} — the next turn degrades it to
-   * the never-sent marker instead of re-uploading raw base64. With
-   * cap = 0 (unlimited legacy) this is a no-op beyond clearing the
-   * container: no counting, no degradation, byte-identical v0.20.1
-   * behavior.
-   */
-  private recordFailedImageSends(pending: Set<string>): void {
-    if (pending.size === 0) {
-      return;
-    }
-    const cap = resolveRawResendCap();
-    if (cap <= 0) {
-      pending.clear();
-      return;
-    }
-    for (const hash of pending) {
-      const attempts = (this.failedImageSendCounts.get(hash) ?? 0) + 1;
-      if (attempts >= cap) {
-        this.failedImageSendCounts.delete(hash);
-        this.cappedImageHashes.set(hash, attempts);
-        logger.info(
-          `vision resend cap reached: hash=${hash.slice(0, 8)} attempts=${attempts} — degrading to marker`,
-        );
-        if (!this.visionResendCapWarned) {
-          this.visionResendCapWarned = true;
-          // P3-d (cascade cosmetics 2026-10-02): the old advice said
-          // "re-attach the image" — but cappedImageHashes keys on the
-          // sha256 of the bytes, so a byte-identical re-attach silently
-          // stays capped. The advice must name what actually clears the
-          // cap: a MODIFIED copy (new bytes → new hash) or a window
-          // reload (the sets are per-session, see sentImageHashes).
-          logger.warn(
-            `vision resend cap: an image (${hash.slice(0, 8)}) failed ${attempts} raw sends and stays a text marker for the rest of the session — прикрепите изменённую копию изображения или перезагрузите окно, чтобы модель его увидела; побайтово идентичная копия даёт тот же хеш и остаётся маркером до конца сессии`,
-          );
-        }
-      } else {
-        this.failedImageSendCounts.set(hash, attempts);
-      }
-    }
-    pending.clear();
-  }
+  private readonly turnLedger = new TurnLedger();
   /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
@@ -1002,18 +874,15 @@ export class OllamaCloudChatProvider
       throw new Error(`Unknown Ollama Cloud model: ${modelInfo.id}`);
     }
 
-    // v0.20.1 (commit-on-success) — per-turn PENDING hash container.
-    // `applyVisionHistoryLifecycle` records first-send hashes HERE, not
-    // into `this.sentImageHashes`. The dispatch branches commit the
-    // pending hashes into the instance set only after their stream
-    // resolved successfully; a failed/cancelled turn leaves them
-    // uncommitted so the next turn re-sends the image RAW (the model
-    // never saw it). One container per request — a 404 fallback that
-    // retries a second endpoint within the SAME request shares it, and
-    // only the branch that actually completes commits.
-    // Declared ABOVE the try (v0.21.0 D-3) so the catch path can route
-    // the leftover pending hashes into the failed-send counter.
-    const pendingImageHashes = new Set<string>();
+    // v0.20.1 (commit-on-success) — open the turn's PENDING hash
+    // container on the ledger. The lifecycle records first-send hashes
+    // THERE, not into the instance sent-set; only the attempt whose
+    // stream genuinely resolved commits them (a 404 fallback that
+    // retries a second endpoint within the SAME request shares the
+    // container). Opened ABOVE the try (v0.21.0 D-3) so the catch path
+    // can route the leftover pending hashes into the failed-send
+    // counter. See turnLedger.ts for the full contract.
+    this.turnLedger.beginTurn();
 
     try {
       // Resolve the connection for this model. Cloud connection models
@@ -1136,12 +1005,7 @@ export class OllamaCloudChatProvider
             // committed only after the pass-through stream resolved.
             const passThroughMessages =
               resolveVisionHistoryMode() === 'marker'
-                ? applyVisionHistoryLifecycle(
-                    messages,
-                    this.sentImageHashes,
-                    pendingImageHashes,
-                    this.cappedImageHashes,
-                  )
+                ? this.turnLedger.applyLifecycle(messages)
                 : messages;
             const passThroughResult = await executePassThrough({
               primaryModel: model,
@@ -1154,7 +1018,7 @@ export class OllamaCloudChatProvider
               catalog: this.modelCatalog.list(),
               connections,
             });
-            this.commitPendingImageHashes(pendingImageHashes, token);
+            this.turnLedger.commitTurn(token);
             return passThroughResult;
           }
           // two-phase — phase 1: vision describes the image, rewrite
@@ -1226,12 +1090,7 @@ export class OllamaCloudChatProvider
       // repeat-marker protection (that is the v0.18 lifecycle that
       // shipped with `'raw'` already in effect).
       if (requestHasImages && !twoPhaseRewroteHistory) {
-        messages = applyVisionHistoryLifecycle(
-          messages,
-          this.sentImageHashes,
-          pendingImageHashes,
-          this.cappedImageHashes,
-        );
+        messages = this.turnLedger.applyLifecycle(messages);
       }
 
       const clientBaseUrl = connection
@@ -1649,7 +1508,7 @@ export class OllamaCloudChatProvider
           );
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
+          this.turnLedger.commitTurn(token);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1750,7 +1609,7 @@ export class OllamaCloudChatProvider
           );
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
+          this.turnLedger.commitTurn(token);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1836,7 +1695,7 @@ export class OllamaCloudChatProvider
           );
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
+          this.turnLedger.commitTurn(token);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1894,7 +1753,7 @@ export class OllamaCloudChatProvider
           );
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
+          this.turnLedger.commitTurn(token);
           return; // success — no fallback needed
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -1964,7 +1823,7 @@ export class OllamaCloudChatProvider
           );
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
+          this.turnLedger.commitTurn(token);
           return;
         } catch (error) {
           if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
@@ -2006,14 +1865,14 @@ export class OllamaCloudChatProvider
       );
       // v0.20.1 — the final fallback resolved (= onDone fired): commit
       // the vision hashes this turn's lifecycle recorded as pending.
-      this.commitPendingImageHashes(pendingImageHashes, token);
+      this.turnLedger.commitTurn(token);
     } catch (error) {
       // v0.21.0 D-3 — the turn ended WITHOUT its stream completing
       // (terminal error path): every hash this turn's lifecycle sent
       // RAW counts as a failed send toward the raw-resend cap. Empty
       // for turns that failed before any raw send (vision gate, etc.)
       // and already cleared when a commit point ran.
-      this.recordFailedImageSends(pendingImageHashes);
+      this.turnLedger.recordFailedTurn();
       logger.error('provideLanguageModelChatResponse failed.', error);
       throw classifyStreamError(error);
     }
