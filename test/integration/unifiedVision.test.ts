@@ -1361,6 +1361,161 @@ describe('vision raw-resend cap (v0.21.0 D-3)', () => {
   });
 });
 
+/**
+ * T-3 (QA audit, cascade cosmetics 2026-10-02) — quiet-cancel in a
+ * tool-call/subagent-shaped request. The composition seam under test:
+ * buffered tool_call deltas inside the OPEN commit window × mid-stream
+ * cancel × the D-2 quiet-completion path × the vision commit-site
+ * failed-send accounting.
+ *
+ * KNOWN DEFECT (NOT asserted here — the parallel stream slice flips it
+ * this cycle): on the cancel quiet-completion branch
+ * (src/streamReader.ts:966) the wrapped onDone FLUSHES the still-open
+ * commit window first (src/commitWindow.ts:226-232 — "buffered deltas
+ * must still reach the user" was written for GENUINE completion), so
+ * buffered tool_call deltas are delivered to `progress` AFTER the
+ * cancel. When the discard-on-cancel fix lands, that flush disappears;
+ * the invariants below hold in BOTH worlds, which is why this test
+ * deliberately asserts no flush shape.
+ */
+describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    clearImageDescriptionCache();
+    apiChatCalls = [];
+    chatCalls = [];
+    logger.getRecentErrors().splice(0);
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+    });
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    logger.getRecentErrors().splice(0);
+    clearImageDescriptionCache();
+    setConfig({});
+    for (const dir of storageDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('buffered tool_call deltas + cancel mid-stream → clean quiet onDone, no error, hashes counted as failed sends', async () => {
+    // Subagent-shaped turn: the history carries an image (the vision
+    // pending-hash accounting is part of the composition) and the SSE
+    // stream emits a tool_call delta pair — a fragment chunk plus the
+    // `finish_reason: "tool_calls"` chunk that flushes the accumulated
+    // call into onToolCall — which the OPEN commit window buffers; the
+    // stream then hangs and only the caller's cancel ends the turn.
+    //
+    // NOTE on options.tools: the request carries no `tools` array —
+    // the vscode test stub does not define
+    // `LanguageModelChatToolMode`, and provider.resolveToolChoice
+    // reads `vscode.LanguageModelChatToolMode.Required` whenever tools
+    // are present, so a tools-bearing request crashes under the stub
+    // (test-infra gap, reported separately; the shared stub is outside
+    // this slice's file ownership). The tool-call buffering seam under
+    // test here is fully exercised by the response-side tool_call
+    // deltas, which is what a subagent delegation receives.
+    global.fetch = (async (url: unknown, init?: { body?: unknown; signal?: AbortSignal }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        return new Response(JSON.stringify({ message: { content: 'unused' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      chatCalls.push({ url: urlStr, body: parsed ?? {} });
+      const signal = init?.signal;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            // Tool-call fragment, then the finish_reason chunk that
+            // flushes it into onToolCall (compat parser accumulates by
+            // index and flushes on finish_reason === 'tool_calls').
+            // No [DONE]: the stream hangs — the commit window (5 s
+            // default) is still OPEN when the cancel fires.
+            controller.enqueue(
+              encode(
+                'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_t3","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":\\"Paris\\"}"}}]}}]}\n\n',
+              ),
+            );
+            controller.enqueue(
+              encode(
+                'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+              ),
+            );
+            signal?.addEventListener('abort', () => {
+              const err = new Error('The operation was aborted');
+              err.name = 'AbortError';
+              controller.error(err);
+            });
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+
+    // Turns 1–3: cancel mid-stream each time. Stable invariants under
+    // assertion (hold with the flush AND with the future discard):
+    //   (1) the turn resolves QUIETLY — clean onDone, no error
+    //       surfaced to VS Code (D-2 invariant, tool-call shape);
+    //   (2) the raw image was sent and its hash counts as a FAILED
+    //       send (default cap 3) — observable on turn 4 below.
+    for (let turn = 1; turn <= 3; turn++) {
+      const cts = new vscode.CancellationTokenSource();
+      const pending = provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        [imageMsg(IMG_A)],
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        cts.token,
+      );
+      await waitFor(() => chatCalls.length === turn);
+      cts.cancel();
+      await pending; // MUST resolve — an error here would surface to VS Code
+      const body = JSON.stringify(chatCalls[turn - 1]!.body);
+      assert.ok(body.includes('image_url'), `turn ${turn} had sent the image RAW`);
+    }
+
+    // Turn 4: the three quiet-completed cancels exhausted the cap — the
+    // pending hashes were recorded as failed sends on every cancelled
+    // turn, so the image degrades to the never-sent marker.
+    const cts4 = new vscode.CancellationTokenSource();
+    const call4 = provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      [imageMsg(IMG_A), assistantMsg('partial'), userMsg('again?')],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      cts4.token,
+    );
+    await waitFor(() => chatCalls.length === 4);
+    cts4.cancel();
+    await call4;
+    const turn4 = JSON.stringify(chatCalls[3]!.body);
+    assert.ok(!turn4.includes('image_url'), 'no 4th raw upload — failed-send accounting ran on every quiet cancel');
+    assert.ok(
+      turn4.includes('never successfully sent') && turn4.includes('3 attempts failed'),
+      'the cancelled tool-call turns counted as failed sends',
+    );
+  });
+});
+
 /** Polls `cond` until it holds; rejects after `ms` (test pacing for async fetch stubs). */
 function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
   const start = Date.now();
