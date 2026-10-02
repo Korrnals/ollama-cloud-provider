@@ -166,3 +166,80 @@ describe('compaction basis canonical form (v0220-t P3-3 / P4-1)', () => {
     );
   });
 });
+
+describe('compaction basis canonical form — hash-set encoding (QA P3-1, v0221-p3)', () => {
+  let render: BasisRenderer;
+  before(() => {
+    render = basisRenderer();
+  });
+
+  // QA P3-1 — the former `hashes.join(',')` was not injective: a
+  // non-data `url:` identity whose URL contains a comma could equal
+  // the joined form of TWO identities. Concretely, one image with url
+  // `a,url:b` and two images `a` + `b` both rendered the sorted-join
+  // `url:a,url:b` — distinct messages colliding onto ONE fingerprint.
+  // The JSON-array encoding keeps every comma inside its quoted
+  // element, so the encoding is injective.
+  it('a comma inside one URL identity cannot collide with the two-identity join form', () => {
+    const oneImageWithCommaUrl: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: 'a,url:b' } },
+      ],
+    };
+    const twoImages: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: 'a' } },
+        { type: 'image_url', image_url: { url: 'b' } },
+      ],
+    };
+    const a = render(oneImageWithCommaUrl);
+    const b = render(twoImages);
+    assert.notStrictEqual(
+      a,
+      b,
+      'the single comma-carrying identity must be DISTINCT from the two-identity form',
+    );
+    // Not vacuous — pin the exact encodings so the shapes cannot
+    // silently regress to a join again: the comma stays INSIDE the
+    // single quoted element.
+    assert.ok(
+      a.endsWith('["url:a,url:b"]'),
+      `single comma-carrying identity is one quoted JSON element, got ${a}`,
+    );
+    assert.ok(
+      b.endsWith('["url:a","url:b"]'),
+      `two identities are two quoted JSON elements, got ${b}`,
+    );
+  });
+
+  // Neighbor invariant while the encoding changes: sorted-set
+  // determinism survives — part order in the content array must not
+  // affect the fingerprint.
+  it('sorting determinism is preserved under the JSON-array encoding', () => {
+    const forward: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: 'https://x.example/b.png' } },
+        { type: 'image_url', image_url: { url: 'https://x.example/a.png' } },
+      ],
+    };
+    const reversed: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: 'https://x.example/a.png' } },
+        { type: 'image_url', image_url: { url: 'https://x.example/b.png' } },
+      ],
+    };
+    assert.strictEqual(
+      render(forward),
+      render(reversed),
+      'image part order must not affect the fingerprint',
+    );
+  });
+});

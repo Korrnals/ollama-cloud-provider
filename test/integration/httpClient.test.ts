@@ -564,3 +564,250 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3 + rework)',
     assert.equal(await res.text(), 'plain-proxy-ok');
   });
 });
+
+/**
+ * Sec F2 (task v0221-p3) — the proxy port must default by the PROXY
+ * URL's own protocol (`http://` → 80, `https://` → 443), never by the
+ * target's scheme. The CONNECT path used to hardcode 443, so a
+ * port-less `http://` proxy sent its CONNECT — with
+ * `Proxy-Authorization` — to whatever happens to listen on :443
+ * instead of the proxy's own :80 listener.
+ *
+ * Topology: three minimal CONNECT sinks — 127.0.0.1:80,
+ * 127.0.0.1:443, and an ephemeral port. Each records the CONNECT
+ * targets it received and answers 403 (the client then rejects fast
+ * with `CONNECT failed with 403`; no TLS leg, no upstream connection,
+ * no DNS — the sink never dials out). WHICH sink saw the request is
+ * exactly the port-default under test.
+ *
+ * Binding :80/:443 unprivileged works on this host
+ * (net.ipv4.ip_unprivileged_port_start=80); if either port is
+ * occupied the `listen` fails and this suite says so explicitly
+ * instead of passing vacuously.
+ */
+describe('httpClient — proxy port defaults by PROXY URL protocol (Sec F2, v0221-p3)', () => {
+  const sightings80: string[] = [];
+  const sightings443: string[] = [];
+  const sightingsEphemeral: string[] = [];
+  let sink80: http.Server;
+  let sink443: http.Server;
+  let sinkEphemeral: http.Server;
+  let ephemeralPort: number;
+  let savedDelegate: string | undefined;
+
+  /** Minimal CONNECT sink: record the connect target, answer 403. */
+  const makeSink = (sightings: string[]): http.Server => {
+    const server = http.createServer();
+    server.on('connect', (req, clientSocket) => {
+      sightings.push(req.url ?? '');
+      clientSocket.end('HTTP/1.1 403 Forbidden\r\n\r\n');
+    });
+    return server;
+  };
+
+  const listen = (server: http.Server, port: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(port, '127.0.0.1', () => {
+        server.removeListener('error', reject);
+        resolve();
+      });
+    });
+
+  before(async () => {
+    // Native transport, same pattern as the suites above.
+    savedDelegate = process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    delete process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    sink80 = makeSink(sightings80);
+    sink443 = makeSink(sightings443);
+    sinkEphemeral = makeSink(sightingsEphemeral);
+    await listen(sink80, 80);
+    await listen(sink443, 443);
+    await listen(sinkEphemeral, 0);
+    ephemeralPort = (sinkEphemeral.address() as AddressInfo).port;
+  });
+
+  after(() => {
+    // Restore process-global state SYNCHRONOUSLY first (same rule as
+    // the tunnel suite — never leak env into later suites).
+    if (savedDelegate !== undefined) {
+      process.env.OLLAMA_HTTP_TEST_DELEGATE = savedDelegate;
+    } else {
+      delete process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    }
+    sink80.closeAllConnections?.();
+    void sink80.close();
+    sink443.closeAllConnections?.();
+    void sink443.close();
+    sinkEphemeral.closeAllConnections?.();
+    void sinkEphemeral.close();
+  });
+
+  afterEach(() => {
+    restoreHttpProxyConfig();
+    sightings80.length = 0;
+    sightings443.length = 0;
+    sightingsEphemeral.length = 0;
+  });
+
+  it('port-less http:// proxy: the CONNECT lands on the proxy :80 listener, never :443', async function () {
+    this.timeout(4000);
+    setHttpProxyConfig('http://127.0.0.1');
+
+    await assert.rejects(
+      httpRequest('https://connect-target.example:443/x'),
+      (err: unknown) => {
+        assert.match(
+          (err as Error).message,
+          /CONNECT failed with 403/,
+          'the sink 403 must surface as the CONNECT failure',
+        );
+        return true;
+      },
+    );
+    // The connect target assertion: the :80 sink saw exactly this
+    // CONNECT, and the :443 sink saw nothing (the old hardcoded-443
+    // default fails the second half).
+    assert.deepEqual(
+      sightings80,
+      ['connect-target.example:443'],
+      'the CONNECT target must arrive at the :80 listener',
+    );
+    assert.equal(sightings443.length, 0, ':443 must NOT receive the CONNECT');
+    assert.equal(sightingsEphemeral.length, 0);
+  });
+
+  it('port-less https:// proxy: the CONNECT lands on :443', async function () {
+    this.timeout(4000);
+    setHttpProxyConfig('https://127.0.0.1');
+
+    await assert.rejects(
+      httpRequest('https://connect-target.example:443/x'),
+      /CONNECT failed with 403/,
+    );
+    assert.deepEqual(
+      sightings443,
+      ['connect-target.example:443'],
+      'the CONNECT target must arrive at the :443 listener',
+    );
+    assert.equal(sightings80.length, 0, ':80 must not be touched');
+    assert.equal(sightingsEphemeral.length, 0);
+  });
+
+  it('explicit proxy port is honored over either default', async function () {
+    this.timeout(4000);
+    setHttpProxyConfig(`http://127.0.0.1:${ephemeralPort}`);
+
+    await assert.rejects(
+      httpRequest('https://connect-target.example:443/x'),
+      /CONNECT failed with 403/,
+    );
+    assert.deepEqual(
+      sightingsEphemeral,
+      ['connect-target.example:443'],
+      'the CONNECT must arrive at the explicitly configured port',
+    );
+    assert.equal(
+      sightings80.length + sightings443.length,
+      0,
+      'neither default port may be touched when a port is explicit',
+    );
+  });
+});
+
+/**
+ * Sec F4 (task v0221-p3) — the insecure test transport
+ * (`rejectUnauthorized: false`) used to activate SILENTLY when dev
+ * leftovers (`OLLAMA_HTTP_TEST_TLS_INSECURE=1` + any
+ * `OLLAMA_HTTP_TEST_DELEGATE`) sat in a user's shell env. Activation
+ * must now WARN, naming both env vars so the operator knows what to
+ * unset.
+ *
+ * Topology: a minimal CONNECT proxy that answers 200 and immediately
+ * destroys the socket — the TLS leg fails fast. The WARN fires before
+ * `tls.connect`, so the assertion does not depend on the TLS outcome.
+ */
+describe('httpClient — insecure test transport activation warns (Sec F4, v0221-p3)', () => {
+  let proxy: http.Server;
+  let proxyPort: number;
+  let savedDelegate: string | undefined;
+  let savedTlsInsecure: string | undefined;
+
+  /** The request under test: through the sink proxy, TLS target. */
+  const requestThroughSinkProxy = (): Promise<unknown> => {
+    setHttpProxyConfig(`http://127.0.0.1:${proxyPort}`);
+    return httpRequest('https://insecure-warn.example:443/x');
+  };
+
+  before(async () => {
+    savedDelegate = process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    savedTlsInsecure = process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+    proxy = http.createServer();
+    proxy.on('connect', (_req, clientSocket) => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      clientSocket.destroy();
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    proxyPort = (proxy.address() as AddressInfo).port;
+  });
+
+  after(() => {
+    // Synchronous env restore first — same rule as the tunnel suite.
+    if (savedDelegate !== undefined) {
+      process.env.OLLAMA_HTTP_TEST_DELEGATE = savedDelegate;
+    } else {
+      delete process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    }
+    if (savedTlsInsecure !== undefined) {
+      process.env.OLLAMA_HTTP_TEST_TLS_INSECURE = savedTlsInsecure;
+    } else {
+      delete process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+    }
+    proxy.closeAllConnections?.();
+    void proxy.close();
+  });
+
+  afterEach(() => {
+    restoreHttpProxyConfig();
+  });
+
+  it('activation with both test env vars logs a WARN naming both', async function () {
+    this.timeout(4000);
+    process.env.OLLAMA_HTTP_TEST_DELEGATE = '0';
+    process.env.OLLAMA_HTTP_TEST_TLS_INSECURE = '1';
+
+    const before = logger.getRecentErrors().length;
+    await assert.rejects(
+      requestThroughSinkProxy(),
+      (err: unknown) => err instanceof Error,
+    );
+    const recent = logger.getRecentErrors().slice(before).join('\n');
+    assert.ok(
+      recent.includes('OLLAMA_HTTP_TEST_TLS_INSECURE') &&
+        recent.includes('OLLAMA_HTTP_TEST_DELEGATE'),
+      `the activation WARN must name BOTH env vars so the user knows what to unset; recent:\n${recent}`,
+    );
+    assert.ok(
+      recent.includes('[WARN]'),
+      'the line must be a WARN (visible in the default output channel), ' +
+        `recent:\n${recent}`,
+    );
+  });
+
+  it('without the insecure opt-in, no insecure-transport WARN fires', async function () {
+    this.timeout(4000);
+    process.env.OLLAMA_HTTP_TEST_DELEGATE = '0';
+    delete process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+
+    const before = logger.getRecentErrors().length;
+    await assert.rejects(
+      requestThroughSinkProxy(),
+      (err: unknown) => err instanceof Error,
+    );
+    const recent = logger.getRecentErrors().slice(before).join('\n');
+    assert.ok(
+      !recent.includes('insecure TEST transport'),
+      `no insecure-transport WARN without the opt-in (the request itself may WARN about the torn-down tunnel — that is fine); recent:\n${recent}`,
+    );
+  });
+});
