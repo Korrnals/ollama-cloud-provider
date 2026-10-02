@@ -2185,35 +2185,55 @@ export class OllamaCloudChatProvider
   /**
    * v0.22.0 (v0220-cc, D-1 review P2) — stable per-CONVERSATION key for
    * the compaction state map: `${modelId}::<fingerprint of the FIRST
-   * raw message>`. The fingerprint runs over the vision-state-
+   * USER message>`. The fingerprint runs over the vision-state-
    * INDEPENDENT canonical form ({@link renderCompactionBasis}) — an
    * image committing to a marker inside the anchor message must not
    * re-key the conversation (that would reproduce the exact state-loss
    * bug this key exists to fix).
    *
-   * v0220-t (CC review P3-4) — the anchor is the FIRST message ONLY,
-   * not `min(4, len)` leading messages. A K-of-len head fingerprint is
+   * v0220-t (CC review P3-4) — a single-message anchor, not `min(4,
+   * len)` leading messages. A K-of-len head fingerprint is
    * length-unstable: the state slot is created on the conversation's
    * FIRST request (often 1-3 messages) and re-keys on every early turn
    * — a fire at len=3 wrote a 3-message key, the next turn (len>=4)
    * computed a 4-message key and silently orphaned the projection and
-   * summary chain under a dead key. The first message is present and
-   * identical from the conversation's first request (VS Code re-sends
-   * the immutable history; growth only appends), so the anchor never
-   * moves. Chosen over capturing the head-length at first state
+   * summary chain under a dead key. A single stable anchor is present
+   * and identical from the conversation's first request (VS Code
+   * re-sends the immutable history; growth only appends), so the key
+   * never moves. Chosen over capturing the head-length at first state
    * creation because it needs no extra bookkeeping: the key stays a
-   * pure function of (modelId, history). Trade-off: two same-model
-   * conversations whose first message canonicalizes identically share a
-   * slot; the per-request basis validation inside `compactIfNeeded`
-   * then drops the foreign projection and the colliding conversation
-   * re-fires fresh — the bounded pre-P2 degradation, never corruption.
-   * Degenerate empty history keeps the constant `''` fallback
-   * (fingerprint of the empty string; compaction no-ops on it anyway).
+   * pure function of (modelId, history).
+   *
+   * v0220-t2 (review follow-up T2) — the anchor is the first
+   * role:'user' message (fallback: messages[0] for degenerate histories
+   * with no user message), NOT messages[0]: production histories may
+   * lead with a per-client SYSTEM prompt, and two same-model windows
+   * with a byte-identical leading system prompt (same client, same
+   * default prompt — plausible) collapsed into ONE slot, recreating
+   * exactly the interleaved-window clobbering CC P2 fixed: each
+   * alternation dropped the other window's projection and re-fired
+   * (bounded: fresh-fire cadence with orphaned store blocks, never
+   * wrong data served — but a real regression class). The first user
+   * message is the first conversation-SPECIFIC content.
+   *
+   * Honest trade-off ledger (both classes named):
+   *   1. A same-model collision requires byte-identical FIRST USER
+   *      messages (e.g. two windows pasting the same prompt) — far
+   *      rarer than identical leading system prompts, and the
+   *      per-request basis validation inside `compactIfNeeded` bounds
+   *      the damage: the foreign projection is dropped and the
+   *      colliding conversation re-fires fresh. Degradation, never
+   *      corruption.
+   *   2. A history with NO user message at all (system-only or empty)
+   *      falls back to messages[0] (or the constant `''` for an empty
+   *      history — fingerprint of the empty string; compaction no-ops
+   *      on it anyway), so degenerate histories share one slot only
+   *      among themselves.
    */
   private conversationKey(modelId: string, openaiMessages: readonly OpenAICompatibleMessage[]): string {
-    const first = openaiMessages[0];
-    const anchor = first === undefined ? '' : this.memoizedBasisRender(first);
-    return `${modelId}::${fingerprintText(anchor)}`;
+    const anchor =
+      openaiMessages.find((m) => m.role === 'user') ?? openaiMessages[0];
+    return `${modelId}::${fingerprintText(anchor === undefined ? '' : this.memoizedBasisRender(anchor))}`;
   }
 
   /**
