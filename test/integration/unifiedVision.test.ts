@@ -1368,15 +1368,14 @@ describe('vision raw-resend cap (v0.21.0 D-3)', () => {
  * cancel × the D-2 quiet-completion path × the vision commit-site
  * failed-send accounting.
  *
- * KNOWN DEFECT (NOT asserted here — the parallel stream slice flips it
- * this cycle): on the cancel quiet-completion branch
- * (src/streamReader.ts:966) the wrapped onDone FLUSHES the still-open
- * commit window first (src/commitWindow.ts:226-232 — "buffered deltas
- * must still reach the user" was written for GENUINE completion), so
- * buffered tool_call deltas are delivered to `progress` AFTER the
- * cancel. When the discard-on-cancel fix lands, that flush disappears;
- * the invariants below hold in BOTH worlds, which is why this test
- * deliberately asserts no flush shape.
+ * POST-CANCEL FLUSH (fixed in this cycle by the stream slice's
+ * discard-on-cancel): the cancel quiet-completion branches
+ * (src/streamReader.ts) used to FLUSH the still-open commit window on
+ * onDone (src/commitWindow.ts), delivering buffered tool_call deltas
+ * to `progress` AFTER the cancel. Since discard-on-cancel landed, a
+ * cancel-caused completion drops the buffer without delivery — the
+ * tightened assertion below pins that: no tool-call part may reach
+ * the host after the user cancelled.
  */
 describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)', () => {
   let originalFetch: typeof fetch;
@@ -1473,6 +1472,7 @@ describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)',
     //       send (default cap 3) — observable on turn 4 below.
     for (let turn = 1; turn <= 3; turn++) {
       const cts = new vscode.CancellationTokenSource();
+      const progress = makeProgress();
       const pending = provider.provideLanguageModelChatResponse(
         chatInfoFor('kimi-k3'),
         [imageMsg(IMG_A)],
@@ -1480,7 +1480,7 @@ describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)',
           modelOptions: {},
           justification: 'test',
         } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
-        makeProgress(),
+        progress,
         cts.token,
       );
       await waitFor(() => chatCalls.length === turn);
@@ -1488,6 +1488,17 @@ describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)',
       await pending; // MUST resolve — an error here would surface to VS Code
       const body = JSON.stringify(chatCalls[turn - 1]!.body);
       assert.ok(body.includes('image_url'), `turn ${turn} had sent the image RAW`);
+      // Tightened post-discard assertion: the buffered tool_call deltas
+      // were in the OPEN window when the cancel fired — they must be
+      // DISCARDED, never delivered to the host after the cancel.
+      const leakedToolCalls = progress.parts.filter(
+        (p) => (p as { toolCallId?: unknown }).toolCallId !== undefined,
+      );
+      assert.strictEqual(
+        leakedToolCalls.length,
+        0,
+        `turn ${turn}: cancel-caused completion must not deliver buffered tool_call parts`,
+      );
     }
 
     // Turn 4: the three quiet-completed cancels exhausted the cap — the
