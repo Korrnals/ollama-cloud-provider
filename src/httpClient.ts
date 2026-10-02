@@ -402,6 +402,15 @@ function requestViaTlsConnectTunnel(
       const insecureTestTransport =
         process.env.OLLAMA_HTTP_TEST_TLS_INSECURE === '1' &&
         process.env.OLLAMA_HTTP_TEST_DELEGATE !== undefined;
+      if (insecureTestTransport) {
+        // Sec F4 (task v0221-p3): dev leftovers in a user's shell env
+        // used to disable certificate verification SILENTLY. One WARN
+        // per CONNECT names both env vars so the operator knows exactly
+        // what to unset.
+        logger.warn(
+          'httpClient: insecure TEST transport active — TLS certificate verification disabled for this tunnel. Test-only env vars detected: unset OLLAMA_HTTP_TEST_TLS_INSECURE and OLLAMA_HTTP_TEST_DELEGATE to restore verification.',
+        );
+      }
       const tlsSocket = tls.connect({
         socket,
         // SNI/hostname verification against the URL host; SNI is

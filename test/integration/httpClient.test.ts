@@ -689,3 +689,100 @@ describe('httpClient — proxy port defaults by PROXY URL protocol (Sec F2, v022
     );
   });
 });
+
+/**
+ * Sec F4 (task v0221-p3) — the insecure test transport
+ * (`rejectUnauthorized: false`) used to activate SILENTLY when dev
+ * leftovers (`OLLAMA_HTTP_TEST_TLS_INSECURE=1` + any
+ * `OLLAMA_HTTP_TEST_DELEGATE`) sat in a user's shell env. Activation
+ * must now WARN, naming both env vars so the operator knows what to
+ * unset.
+ *
+ * Topology: a minimal CONNECT proxy that answers 200 and immediately
+ * destroys the socket — the TLS leg fails fast. The WARN fires before
+ * `tls.connect`, so the assertion does not depend on the TLS outcome.
+ */
+describe('httpClient — insecure test transport activation warns (Sec F4, v0221-p3)', () => {
+  let proxy: http.Server;
+  let proxyPort: number;
+  let savedDelegate: string | undefined;
+  let savedTlsInsecure: string | undefined;
+
+  /** The request under test: through the sink proxy, TLS target. */
+  const requestThroughSinkProxy = (): Promise<unknown> => {
+    setHttpProxyConfig(`http://127.0.0.1:${proxyPort}`);
+    return httpRequest('https://insecure-warn.example:443/x');
+  };
+
+  before(async () => {
+    savedDelegate = process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    savedTlsInsecure = process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+    proxy = http.createServer();
+    proxy.on('connect', (_req, clientSocket) => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      clientSocket.destroy();
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    proxyPort = (proxy.address() as AddressInfo).port;
+  });
+
+  after(() => {
+    // Synchronous env restore first — same rule as the tunnel suite.
+    if (savedDelegate !== undefined) {
+      process.env.OLLAMA_HTTP_TEST_DELEGATE = savedDelegate;
+    } else {
+      delete process.env.OLLAMA_HTTP_TEST_DELEGATE;
+    }
+    if (savedTlsInsecure !== undefined) {
+      process.env.OLLAMA_HTTP_TEST_TLS_INSECURE = savedTlsInsecure;
+    } else {
+      delete process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+    }
+    proxy.closeAllConnections?.();
+    void proxy.close();
+  });
+
+  afterEach(() => {
+    restoreHttpProxyConfig();
+  });
+
+  it('activation with both test env vars logs a WARN naming both', async function () {
+    this.timeout(4000);
+    process.env.OLLAMA_HTTP_TEST_DELEGATE = '0';
+    process.env.OLLAMA_HTTP_TEST_TLS_INSECURE = '1';
+
+    const before = logger.getRecentErrors().length;
+    await assert.rejects(
+      requestThroughSinkProxy(),
+      (err: unknown) => err instanceof Error,
+    );
+    const recent = logger.getRecentErrors().slice(before).join('\n');
+    assert.ok(
+      recent.includes('OLLAMA_HTTP_TEST_TLS_INSECURE') &&
+        recent.includes('OLLAMA_HTTP_TEST_DELEGATE'),
+      `the activation WARN must name BOTH env vars so the user knows what to unset; recent:\n${recent}`,
+    );
+    assert.ok(
+      recent.includes('[WARN]'),
+      'the line must be a WARN (visible in the default output channel), ' +
+        `recent:\n${recent}`,
+    );
+  });
+
+  it('without the insecure opt-in, no insecure-transport WARN fires', async function () {
+    this.timeout(4000);
+    process.env.OLLAMA_HTTP_TEST_DELEGATE = '0';
+    delete process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+
+    const before = logger.getRecentErrors().length;
+    await assert.rejects(
+      requestThroughSinkProxy(),
+      (err: unknown) => err instanceof Error,
+    );
+    const recent = logger.getRecentErrors().slice(before).join('\n');
+    assert.ok(
+      !recent.includes('insecure TEST transport'),
+      `no insecure-transport WARN without the opt-in (the request itself may WARN about the torn-down tunnel — that is fine); recent:\n${recent}`,
+    );
+  });
+});
