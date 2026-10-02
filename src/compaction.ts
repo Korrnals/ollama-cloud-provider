@@ -84,6 +84,42 @@ export const SUMMARY_DATA_FRAME_OPEN =
 /** Close line of the summary DATA FRAME ({@link SUMMARY_DATA_FRAME_OPEN}). */
 export const SUMMARY_DATA_FRAME_CLOSE = '[end machine-generated summary]';
 
+/**
+ * Zero-width space — the de-fang insert (v0220-t, CC review P3-1).
+ * Renders invisibly everywhere while breaking exact substring matches.
+ */
+const ZERO_WIDTH_SPACE = '\u200b';
+
+/** `s` with a zero-width space inserted at its midpoint (de-fang form). */
+function zwspAtMidpoint(s: string): string {
+  const mid = s.length >> 1;
+  return s.slice(0, mid) + ZERO_WIDTH_SPACE + s.slice(mid);
+}
+
+/** De-fanged forms of the frame delimiters (computed once). */
+const DEFANGED_FRAME_OPEN = zwspAtMidpoint(SUMMARY_DATA_FRAME_OPEN);
+const DEFANGED_FRAME_CLOSE = zwspAtMidpoint(SUMMARY_DATA_FRAME_CLOSE);
+
+/**
+ * Echo-breakout de-fang (v0220-t, CC review P3-1). The cheap summarizer
+ * can ECHO an attacker-planted frame delimiter verbatim into the
+ * summary body (CWE-74 echo attack). A verbatim CLOSE inside the body
+ * would terminate the DATA frame early — everything after it reads as
+ * unframed (operator-grade) content; a verbatim OPEN would open a
+ * second frame. Replacing every exact occurrence with a
+ * zero-width-space-broken copy makes a mechanical echo impossible: the
+ * injected message carries exactly one intact OPEN and one intact
+ * CLOSE (the ones the injector itself wrote), and an echoed delimiter
+ * survives only as visibly-broken text no exact-match consumer can
+ * hit. Applied at INJECTION time only — the raw summary chain
+ * (`lastSummary`) keeps the summarizer's text untouched.
+ */
+export function defangFrameDelimiters(text: string): string {
+  return text
+    .replaceAll(SUMMARY_DATA_FRAME_OPEN, () => DEFANGED_FRAME_OPEN)
+    .replaceAll(SUMMARY_DATA_FRAME_CLOSE, () => DEFANGED_FRAME_CLOSE);
+}
+
 // ---------------------------------------------------------------------------
 // Token estimation
 // ---------------------------------------------------------------------------
@@ -725,12 +761,13 @@ export async function compactIfNeeded<T extends { role: string }>(
   // `previous pointer` when a chain exists. Injection hardening (P2
   // 2026-10-02): the summary body is wrapped in an explicit DATA FRAME so
   // downstream turns cannot mistake reproduced attacker directives for
-  // operator instructions.
+  // operator instructions. v0220-t (P3-1): the body is de-fanged first —
+  // a verbatim delimiter echoed by the summarizer cannot break the frame.
   const pointerChain = previousPointer === null ? '' : `\n[previous pointer: ${previousPointer}]`;
   const summaryMessage = {
     role: 'system',
     content:
-      `${SUMMARY_MARKER}\n${SUMMARY_DATA_FRAME_OPEN}\n${summary}\n${SUMMARY_DATA_FRAME_CLOSE}\n` +
+      `${SUMMARY_MARKER}\n${SUMMARY_DATA_FRAME_OPEN}\n${defangFrameDelimiters(summary)}\n${SUMMARY_DATA_FRAME_CLOSE}\n` +
       `[evicted-block pointer: ${pointer}]${pointerChain}`,
   } as unknown as T;
 
