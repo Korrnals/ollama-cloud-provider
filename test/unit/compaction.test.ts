@@ -1165,3 +1165,77 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(summarize.calls.length, 2, 'no re-fire beyond the two fixture fires');
     });
   });
+
+  // v0220-cc P3-c — pin: after a CHAINED re-fire the served history
+  // carries the checkpoint marker EXACTLY ONCE. The chained fire folds
+  // the previous checkpoint into the new one and must REPLACE the old
+  // injected summary message (by identity), never stack a second one —
+  // two checkpoints in one payload would double-bill context and
+  // confuse downstream consumers (e.g. the /v1/responses instructions
+  // folding, which targets the SUMMARY_MARKER message).
+  describe('chained re-fire marker hygiene (v0220-cc P3-c)', () => {
+    it('SUMMARY_MARKER occurs exactly ONCE in messages after a chained re-fire', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('Goal: chained. Done: more.');
+      const first = await compactIfNeeded({
+        messages: [sys('s1'), ...turns(20)],
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        nowMs: 1_000_000,
+      });
+      assert.strictEqual(first.compacted, true, 'fixture: fire 1 fires');
+
+      // Re-applied turn inside the cooldown (projection in play), then
+      // the chained re-fire past the cooldown on the grown history.
+      const grown = [sys('s1'), ...turns(20), ...turns(5, 50, 21)];
+      const second = await compactIfNeeded({
+        messages: grown,
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.reapplied, true, 'fixture: projection re-applied in the cooldown');
+      const fired2 = await compactIfNeeded({
+        messages: grown,
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: second.state,
+        summarize,
+        store,
+        render,
+        nowMs: 1_500_000,
+      });
+      assert.strictEqual(fired2.compacted, true, 'fixture: chained re-fire fires');
+      assert.strictEqual(summarize.calls.length, 2, 'fixture: exactly two summarizer calls');
+      assert.ok(
+        summarize.calls[1]!.includes('Goal: keep') === false && summarize.calls[1]!.length > 0,
+        'fixture: fire 2 prompt built',
+      );
+
+      // THE PIN: exactly one message leads with the marker, and the
+      // marker substring occurs exactly once across the whole served
+      // history (no stacked checkpoint, no marker echoed inside
+      // message bodies).
+      const markerMessages = fired2.messages.filter(
+        (m) => typeof (m as Msg).content === 'string' && (m as Msg).content.startsWith(SUMMARY_MARKER),
+      );
+      assert.strictEqual(markerMessages.length, 1, 'exactly one summary message');
+      const occurrences = fired2.messages.reduce(
+        (n, m) => n + (((m as Msg).content as string).split(SUMMARY_MARKER).length - 1),
+        0,
+      );
+      assert.strictEqual(occurrences, 1, 'SUMMARY_MARKER appears exactly once across all served messages');
+      // And the chained checkpoint carries the folded chain (pointer
+      // chain from fire 1) without a second marker.
+      const injected = markerMessages[0] as Msg;
+      assert.ok((injected.content as string).includes('[previous pointer: ptr-1]'));
+    });
+  });

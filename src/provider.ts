@@ -515,6 +515,24 @@ export class OllamaCloudChatProvider
   /** v0220-cc P2 — LRU cap on remembered per-conversation states (bounded memory). */
   private static readonly COMPACTION_STATES_MAX = 8;
   /**
+   * v0220-cc P3-b — per-message WIRE render memo (JSON.stringify).
+   * One compaction check renders the same message objects 2-3×
+   * (raw usage estimate, re-apply estimate over head+summary+tail,
+   * evicted-block text, assembled-result estimate) — on multi-MB
+   * vision histories that is 2-3 full-history stringify passes per
+   * request. WeakMap keyed on the message OBJECT: entries die with
+   * the message (VS Code re-sends fresh objects each turn, so the map
+   * never grows stale); within one request the shared references hit
+   * the memo. Accessed via {@link memoizedWireRender}.
+   */
+  private readonly wireRenderMemo = new WeakMap<object, string>();
+  /**
+   * v0220-cc P3-b — per-message BASIS render memo (canonical form),
+   * same rationale as {@link wireRenderMemo}. Accessed via
+   * {@link memoizedBasisRender}.
+   */
+  private readonly basisRenderMemo = new WeakMap<object, string>();
+  /**
    * v0.12.1 — tracks model ids for which the context-inflation warning
    * has already fired this session. Prevents spamming the user on every
    * turn once the threshold is crossed and compaction is disabled.
@@ -2111,7 +2129,7 @@ export class OllamaCloudChatProvider
     );
     let joined = '';
     for (let i = 0; i < k; i++) {
-      joined += this.renderCompactionBasis(openaiMessages[i]!) + '\u0001';
+      joined += this.memoizedBasisRender(openaiMessages[i]!) + '\u0001';
     }
     return `${modelId}::${fingerprintText(joined)}`;
   }
@@ -2145,6 +2163,26 @@ export class OllamaCloudChatProvider
       if (oldest === undefined) break;
       this.compactionStates.delete(oldest);
     }
+  }
+
+  /** v0220-cc P3-b — memoized wire render (see {@link wireRenderMemo}). */
+  private memoizedWireRender(m: OpenAICompatibleMessage): string {
+    let s = this.wireRenderMemo.get(m);
+    if (s === undefined) {
+      s = JSON.stringify(m);
+      this.wireRenderMemo.set(m, s);
+    }
+    return s;
+  }
+
+  /** v0220-cc P3-b — memoized basis render (see {@link basisRenderMemo}). */
+  private memoizedBasisRender(m: OpenAICompatibleMessage): string {
+    let s = this.basisRenderMemo.get(m);
+    if (s === undefined) {
+      s = this.renderCompactionBasis(m);
+      this.basisRenderMemo.set(m, s);
+    }
+    return s;
   }
 
   /**
@@ -2242,7 +2280,11 @@ export class OllamaCloudChatProvider
       const summarizerWindowTokens = this.modelCatalog
         .list()
         .find((m) => m.apiModel === summarizerModel)?.maxInputTokens;
-      const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(JSON.stringify(m).length / charsPerToken), 0);
+      // v0220-cc P3-b — computed through the memoized wire render so
+      // the check line shares the per-message stringify with the
+      // compactIfNeeded estimates instead of adding one more
+      // full-history pass.
+      const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(this.memoizedWireRender(m).length / charsPerToken), 0);
       const hadProjection = state.projection != null;
       const result = await compactIfNeeded<OpenAICompatibleMessage>({
         messages: openaiMessages,
@@ -2251,12 +2293,13 @@ export class OllamaCloudChatProvider
         state,
         summarize: summarizer,
         store,
-        render: (m) => JSON.stringify(m),
+        render: (m) => this.memoizedWireRender(m),
         // v0220-cc P2 — basis fingerprints are computed over the
         // vision-state-INDEPENDENT canonical form so a raw→marker
         // transition inside the evicted prefix cannot drop the
         // projection (whiplash). The wire render above is unchanged.
-        basisRender: (m) => this.renderCompactionBasis(m),
+        // v0220-cc P3-b — both renders memoized per message object.
+        basisRender: (m) => this.memoizedBasisRender(m),
         ...(summarizerWindowTokens !== undefined
           ? { summarizerWindowTokens }
           : {}),
@@ -2275,8 +2318,13 @@ export class OllamaCloudChatProvider
       // re-applied" (true/false) from "no projection in play" (n/a).
       // v0220-cc P2 — `conv` carries the conversation-key fingerprint
       // so interleaved windows are tellable apart in field logs.
+      // v0220-cc P3-a — the token number is renamed `rawUsedTokens=`:
+      // it is the estimate over the RAW incoming history, while the
+      // fire/re-apply gate inside compactIfNeeded operates on the
+      // PROJECTED (re-applied) usage — the old `usedTokens=` label
+      // invited reading it as the gate's number (D-1 review P3).
       logger.info(
-        `Compaction check: usedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'} conv=${convKey.split('::')[1] ?? '?'}`,
+        `Compaction check: rawUsedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'} conv=${convKey.split('::')[1] ?? '?'}`,
       );
       if (result.reapply) {
         // d1 stickiness observability — distinct from the fire line so
@@ -2311,15 +2359,17 @@ export class OllamaCloudChatProvider
       // renderer in the chat transcript, so it never becomes assistant
       // text. The durable human-readable record stays the
       // `Compaction: before=… after=…` INFO line above.
+      // v0220-cc P3-d — built via the static `LanguageModelDataPart.json`
+      // factory (present in @types/vscode 1.118 and the test stub):
+      // same bytes as the hand-rolled TextEncoder payload, minus the
+      // hand-rolling.
       progress.report(
-        new vscode.LanguageModelDataPart(
-          new TextEncoder().encode(
-            JSON.stringify({
-              notice: 'context-compacted',
-              beforeTokens: stats?.beforeTokens ?? null,
-              afterTokens: stats?.afterTokens ?? null,
-            }),
-          ),
+        vscode.LanguageModelDataPart.json(
+          {
+            notice: 'context-compacted',
+            beforeTokens: stats?.beforeTokens ?? null,
+            afterTokens: stats?.afterTokens ?? null,
+          },
           'application/json',
         ),
       );

@@ -355,7 +355,7 @@ describe('compaction stickiness — provider wiring (v0.21.0 slice d1)', () => {
     );
     assert.ok(
       capturedLogLines.some((line) =>
-        /Compaction check: usedTokens=\d+ windowTokens=131072 threshold=\d+ charsPerToken=\d+(\.\d+)? armed=\w+ reapply=\w+/.test(
+        /Compaction check: rawUsedTokens=\d+ windowTokens=131072 threshold=\d+ charsPerToken=\d+(\.\d+)? armed=\w+ reapply=\w+/.test(
           line,
         ),
       ),
