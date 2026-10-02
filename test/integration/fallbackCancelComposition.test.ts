@@ -313,7 +313,12 @@ describe('P2-2 — discard-on-cancel under a 404 fallback chain (cascade QA audi
     const cts3 = new vscode.CancellationTokenSource();
     const progress3 = makeProgress();
     const turn3 = call([imageMsg(IMG_A)], cts3.token, progress3);
-    await waitFor(() => chatBodies.length === 1);
+    // 8s window: the awaited chain spans two DNS-resolving fetches
+    // (native 404 + the chat fallback); under first-run suite load the
+    // 2s default flaked (run-35 RCA). The 5s commit window is unaffected
+    // — it arms on the first delta AFTER the chat fetch lands, and the
+    // cancel follows within one 10ms poll tick.
+    await waitFor(() => chatBodies.length === 1, 8000);
     cts3.cancel();
     await turn3; // MUST resolve quietly — a rejection would surface to VS Code
 
@@ -354,7 +359,7 @@ describe('P2-2 — discard-on-cancel under a 404 fallback chain (cascade QA audi
       [imageMsg(IMG_A), assistantMsg('partial'), userMsg('again?')],
       cts4.token,
     );
-    await waitFor(() => chatBodies.length === 2);
+    await waitFor(() => chatBodies.length === 2, 8000);
     cts4.cancel();
     await call4;
     const turn4 = JSON.stringify(chatBodies[1]);
@@ -469,7 +474,9 @@ describe('P3 rider — hidden-retry backoff-cancel: quiet onDone, no double-flus
     const cts = new vscode.CancellationTokenSource();
     const progress = makeProgress();
     const turn1 = call([imageMsg(IMG_A)], cts.token, progress);
-    await waitFor(() => stream1Errored);
+    // 8s window: the fetch (and its DNS resolve) precedes the 20ms
+    // stream break this waits for — same first-run load margin as P2-2.
+    await waitFor(() => stream1Errored, 8000);
     const cancelledAt = Date.now();
     cts.cancel();
     await turn1; // MUST resolve quietly — a rejection would surface to VS Code
