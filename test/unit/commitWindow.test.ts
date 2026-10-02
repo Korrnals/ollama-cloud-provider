@@ -809,3 +809,371 @@ describe('commit-window boundary races (review P3-3)', () => {
     assert.equal(win.controller.hiddenRetryCount(), 0, 'no hidden retry after cancel');
   });
 });
+
+describe('cancel × untagged socket-close classification race (task v0210-d2, contract 2026-10-02)', () => {
+  // RCA (proven in field logs 2026-10-02): a cancellation tears down the
+  // request; the teardown used to surface on the body stream as an
+  // UNTAGGED raw socket-close (ECONNRESET / "aborted" / "socket hang
+  // up"), escaping the AbortError routing in `readStreamOnce` and being
+  // reclassified to ConnectionInterruptedError (chunks > 0) at a moment
+  // when the token was ALREADY cancelled. The old `cancelled → throw`
+  // branch then rethrew the CIE into provideLanguageModelChatResponse
+  // and killed the agent turn mid-work as a provider failure — even
+  // though nothing from the attempt had reached the user.
+  //
+  // The contract under test (owner-ratified 2026-10-02):
+  //   - cancelled + window OPEN  → quiet completion (onDone), NEVER a
+  //     rethrow and NEVER a retry — a cancel with nothing shown must
+  //     look to VS Code like a clean cancel;
+  //   - window CLOSED            → TERMINAL CIE regardless of cancel
+  //     (content already shown; an honest error is the only
+  //     non-duplicating outcome);
+  //   - no cancel + window OPEN  → the hidden retry fires (the retry
+  //     must not become dead code to the mere PRESENCE of a token);
+  //   - budget exhausted         → terminal.
+  //
+  // The untagged-error route here simulates the transport-level race in
+  // the delegated-fetch test world (no httpClient in the loop): cancel
+  // fires FIRST (the reader tags abortReason), then the stream errors
+  // with the untagged socket-close family — exactly the interleaving
+  // production produced. The fully-tagged route (httpClient now
+  // destroys the response with the AbortError BEFORE the socket, task
+  // v0210-d2) lands in the AbortError branch of readStreamOnce and is
+  // additionally pinned by test/integration/httpClient.test.ts against
+  // the real node:http transport.
+  const WINDOW_MS = 60;
+  const TARGET_URL = 'https://ollama.com/v1/test-d2-cancel-race';
+  const ORIGINAL_RANDOM = Math.random;
+
+  beforeEach(() => {
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      requestMaxDurationMin: 60,
+      maxRetries: 0, // one POST per readStreamOnce round
+    });
+    // Pin the hidden-retry jitter factor to exactly 1.0 → backoffs are
+    // exactly 1000ms * 2^(n-1).
+    Math.random = () => 0.5;
+  });
+  afterEach(() => {
+    globalThis.fetch = ORIGINAL_FETCH;
+    Math.random = ORIGINAL_RANDOM;
+  });
+
+  /** SSE `data: {"delta":...}` processor with [DONE] terminal (file-local shape). */
+  function sseLine(callbacks: StreamCallbacks): StreamLineProcessor {
+    return (line, ctx) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        return false;
+      }
+      ctx.markParsed();
+      const payload = trimmed.slice('data:'.length).trim();
+      if (payload === '[DONE]') {
+        callbacks.onDone();
+        return true;
+      }
+      try {
+        const parsed = JSON.parse(payload) as { delta?: string };
+        if (parsed.delta) {
+          callbacks.onText(parsed.delta);
+        }
+      } catch {
+        // ignore non-JSON
+      }
+      return false;
+    };
+  }
+
+  it('cancel + untagged socket close mid-stream, window OPEN → quiet onDone, no rethrow, no retry', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // One delta (buffered, window armed), then 20ms in — inside the
+      // 60ms window — the production interleaving: cancel fires, the
+      // teardown surfaces as an UNTAGGED socket-close.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
+          setTimeout(() => {
+            source.cancel();
+            controller.error(socketCloseError());
+          }, 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    // The HARD INVARIANT: readStream RESOLVES (never rejects into
+    // provideLanguageModelChatResponse) — the quiet-cancel branch.
+    await readStream(
+      {
+        logTag: 'd2-cancel-open',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: sseLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'quiet completion via onDone (same as the plain cancel path)');
+    assert.equal(recorded.error, undefined, 'no error may surface — a cancelled open-window break is not a provider failure');
+    assert.equal(fetchCalls, 1, 'NO retry POST after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 0, 'no hidden retry was scheduled');
+    // Diagnostics honesty (contract #5): the eval line keeps its shape
+    // and the quiet completion is logged distinctly at warn level so
+    // field logs show why no retry happened.
+    const recent = logger.getRecentErrors().join('\n');
+    assert.ok(recent.includes('windowOpen=true'), 'eval line carries the window state');
+    assert.ok(
+      recent.includes('Mid-stream interrupt while cancelled, window open — quiet completion'),
+      'the quiet completion must be disclosed via a distinct WARN line',
+    );
+  });
+
+  it('cancel + untagged socket close mid-stream, window CLOSED → terminal ConnectionInterruptedError surfaces', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // Delta at ~0ms; the 60ms window closes and FLUSHES it (the user
+      // has seen it); cancel + untagged close land at 120ms — after
+      // the window. Terminal per contract #3 even though cancelled.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"delta":"visible"}\n\n'));
+          setTimeout(() => {
+            source.cancel();
+            controller.error(socketCloseError());
+          }, 120);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await assert.rejects(
+      readStream(
+        {
+          logTag: 'd2-cancel-closed',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          cancellationToken: source.token,
+          processLine: sseLine(wrapped),
+        },
+        wrapped,
+      ),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ConnectionInterruptedError,
+          `terminal CIE expected (window closed beats cancel), got ${(error as Error)?.constructor?.name}`,
+        );
+        return true;
+      },
+    );
+
+    assert.equal(fetchCalls, 1, 'no retry on a closed window');
+    assert.deepStrictEqual(
+      recorded.events,
+      ['text:visible'],
+      'already-shown content flushed exactly once — no duplication, no loss',
+    );
+    assert.equal(recorded.done, false, 'a terminal break is not a quiet success');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+  });
+
+  it('cancel before stream start → quiet onDone, no error, no retry (unchanged)', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    source.cancel(); // cancelled BEFORE readStream is entered
+
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown, init?: { signal?: AbortSignal }) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // Mirror the real transport: an already-aborted signal rejects
+      // the request with an AbortError before any body is produced.
+      if (init?.signal?.aborted) {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'd2-cancel-pre',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: sseLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'pre-stream cancel completes quietly');
+    assert.equal(recorded.error, undefined, 'no error on a pre-stream cancel');
+    assert.equal(fetchCalls, 1, 'the connect attempt was issued once and never retried');
+    assert.deepStrictEqual(recorded.events, [], 'nothing was shown');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+  });
+
+  it('genuine ECONNRESET with a cancellation token attached but NOT fired, window open → hidden retry fires', async function () {
+    this.timeout(10000); // exact 1000ms hidden-retry backoff + stream time
+    // Proves the retry is not dead code now that a token is in play:
+    // the PRESENCE of a CancellationToken must not gate the hidden
+    // retry — only an actual cancellation may.
+    const source = new vscode.CancellationTokenSource(); // never cancelled
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        // Genuine network reset 20ms in — inside the 60ms window, no
+        // cancellation involved.
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
+            setTimeout(() => controller.error(socketCloseError()), 20);
+          },
+        });
+        return new Response(body, { status: 200 });
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"delta":"full answer"}\n\n'));
+          controller.enqueue(encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'd2-genuine-reset',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: sseLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(fetchCalls, 2, 'exactly one hidden retry fired');
+    assert.equal(recorded.done, true, 'the retry attempt completed the stream');
+    assert.deepStrictEqual(
+      recorded.events,
+      ['text:full answer'],
+      'only the retry text shown — discarded prefix never leaks',
+    );
+    assert.equal(recorded.error, undefined);
+    assert.equal(win.controller.hiddenRetryCount(), 1, 'the retry is disclosed in diagnostics');
+  });
+
+  it('budget exhaustion with window open (not cancelled) → terminal ConnectionInterruptedError', async function () {
+    this.timeout(20000);
+    // Each readStreamOnce round burns TWO budget units: the connect
+    // attempt fails with a retriable socket-close (withRetry retries
+    // once — maxRetries=1), the second connect succeeds, the stream
+    // then breaks INSIDE the window. Rounds 1-2 (budget 6→4, 4→2) get
+    // hidden retries (exact 1s + 2s backoffs, pinned); round 3 exhausts
+    // the budget (2→0) and its in-window CIE must be TERMINAL.
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      requestMaxDurationMin: 60,
+      maxRetries: 1, // two POSTs per round (connect retry + stream)
+    });
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // Odd calls: connect-phase retriable socket-close (no headers).
+      // Even calls: 200 + one delta, untagged socket-close 20ms in
+      // (inside the 60ms window).
+      if (fetchCalls % 2 === 1) {
+        throw socketCloseError();
+      }
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
+          setTimeout(() => controller.error(socketCloseError()), 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await assert.rejects(
+      readStream(
+        {
+          logTag: 'd2-budget-terminal',
+          url: TARGET_URL,
+          headers: {},
+          body: '{}',
+          connectRetryBaseDelayMs: 0, // connect backoff seam: 250ms gaps
+          processLine: sseLine(wrapped),
+        },
+        wrapped,
+      ),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ConnectionInterruptedError,
+          `terminal CIE expected at budget exhaustion, got ${(error as Error)?.constructor?.name}`,
+        );
+        return true;
+      },
+    );
+
+    assert.equal(fetchCalls, 6, 'exactly MAX_POST_BUDGET_PER_MESSAGE POSTs — the budget is the cap');
+    assert.equal(win.controller.hiddenRetryCount(), 2, 'two hidden retries were scheduled before exhaustion');
+    assert.deepStrictEqual(
+      recorded.events,
+      [],
+      'nothing ever reached the user — every break was inside the window',
+    );
+    assert.equal(recorded.done, false, 'budget exhaustion is terminal, not a quiet success');
+  });
+});

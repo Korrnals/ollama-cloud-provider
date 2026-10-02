@@ -300,6 +300,12 @@ export interface StreamReaderOptions {
  *     controller, jittered backoff, hidden-retry counter surfaced in
  *     diagnostics only (logger.warn + the runStream report field). No
  *     `onNotice` — the user must not see a duplicate prefix or flicker.
+ *     HARD INVARIANT (owner-ratified 2026-10-02): with the window open
+ *     the error is NEVER rethrown out of the pipeline — if the caller
+ *     cancelled, the break completes QUIETLY via `onDone` (a cancel with
+ *     nothing shown must look like a clean cancel to VS Code, never a
+ *     provider failure); only budget exhaustion (not cancelled) stays
+ *     terminal.
  *   - `ConnectionInterruptedError` after the window closed → TERMINAL.
  *     Honest error, manual user retry. There is no chunk-count
  *     threshold anymore — visibility, not volume, decides.
@@ -364,7 +370,42 @@ export async function readStream(
         logger.warn(
           `Mid-stream retry eval: chunks=${attemptState.chunksReceived} windowOpen=${windowOpen} hiddenRetry=${commitWindow?.hiddenRetryCount() ?? 0} budgetRemaining=${budget.remaining} cancelled=${cancelled} errorClass=${error.constructor.name}`,
         );
-        if (!windowOpen || cancelled || budget.remaining <= 0) {
+        // v0.21.0 (owner-ratified 2026-10-02, task v0210-d2) — HARD
+        // INVARIANT: with the window OPEN this error must NEVER be
+        // rethrown out of the stream pipeline into
+        // provideLanguageModelChatResponse. Pre-fix, a cancellation
+        // racing the teardown surfaced as an UNTAGGED socket-close
+        // (reclassified to CIE, chunks > 0) at a moment when the token
+        // was already cancelled; the old `cancelled → throw` guard then
+        // rethrew the CIE and killed the Copilot agent turn mid-work as
+        // a provider failure.
+        // Ordering of the branches is contract:
+        //   1. window CLOSED → TERMINAL regardless of cancellation:
+        //      content already streamed to the user; an honest error
+        //      is the only non-duplicating outcome (silent retry would
+        //      duplicate visible text; a quiet onDone would silently
+        //      truncate shown content).
+        //   2. cancelled + window open → QUIET COMPLETION (onDone) —
+        //      a cancellation with nothing shown must look to VS Code
+        //      like a clean cancel, never like a provider failure.
+        //   3. budget exhausted (not cancelled) → TERMINAL rethrow.
+        //   4. otherwise → the hidden retry below.
+        // Residual race note: even with the httpClient tagging the
+        // abort BEFORE the socket destroy, a PEER reset can land first
+        // and be reclassified as CIE microseconds before the cancel
+        // listener runs; branch 2 is the compensating path that keeps
+        // that interleaving harmless (cancelled + open window → onDone).
+        if (!windowOpen) {
+          throw error;
+        }
+        if (cancelled) {
+          logger.warn(
+            'Mid-stream interrupt while cancelled, window open — quiet completion (nothing user-visible from the attempt; no retry, no rethrow)',
+          );
+          callbacks.onDone();
+          return;
+        }
+        if (budget.remaining <= 0) {
           throw error;
         }
         // Reset the buffer BEFORE the retry so the discarded attempt's

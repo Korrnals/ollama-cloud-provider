@@ -96,6 +96,13 @@ describe('httpClient — proxy-aware native HTTP client', () => {
         res.end();
         return;
       }
+      if (req.url === '/stream-hang') {
+        // One chunk, then the stream stays open forever — the client
+        // must abort mid-stream (task v0210-d2 regression pin).
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.write('chunk1\n');
+        return;
+      }
       if (req.url === '/slow') {
         // Never respond — for the abort test.
         return;
@@ -160,6 +167,40 @@ describe('httpClient — proxy-aware native HTTP client', () => {
     await assert.rejects(
       promise,
       (err: unknown) => err instanceof Error && err.name === 'AbortError',
+    );
+  });
+
+  it('mid-stream abort surfaces the TAGGED AbortError on the body reader (v0210-d2)', async () => {
+    // Regression pin for the classification race (task v0210-d2,
+    // RCA 2026-10-02): a cancellation destroys the socket; the teardown
+    // must surface on the BODY stream as the tagged AbortError, never
+    // as Node's internal untagged socket-close (code ECONNRESET,
+    // message "aborted") that escapes the AbortError routing in
+    // streamReader and gets reclassified to ConnectionInterruptedError
+    // while the caller merely cancelled. Verified empirically on Node
+    // v22: without destroying the response with the tagged error the
+    // reader rejects with { code: 'ECONNRESET', message: 'aborted' }.
+    const controller = new AbortController();
+    const res = await httpRequest(`${baseUrl}/stream-hang`, {
+      signal: controller.signal,
+    });
+    const reader = res.body.getReader();
+    const first = await reader.read();
+    assert.ok(!first.done && first.value, 'the first chunk must arrive before the abort');
+
+    controller.abort();
+
+    await assert.rejects(
+      reader.read(),
+      (err: unknown) => {
+        assert.ok(
+          err instanceof Error && err.name === 'AbortError',
+          `body reader must reject with the TAGGED AbortError, got ${
+            (err as Error)?.constructor?.name
+          } name=${(err as Error)?.name} code=${String((err as { code?: unknown })?.code)} message=${(err as Error)?.message}`,
+        );
+        return true;
+      },
     );
   });
 
