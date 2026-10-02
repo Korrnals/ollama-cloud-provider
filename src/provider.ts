@@ -511,8 +511,6 @@ export class OllamaCloudChatProvider
    * {@link COMPACTION_STATES_MAX}).
    */
   private readonly compactionStates = new Map<string, CompactionState<OpenAICompatibleMessage>>();
-  /** v0220-cc P2 — conversation fingerprint: how many leading raw messages identify a conversation (K). */
-  private static readonly CONVERSATION_KEY_PREFIX = 4;
   /** v0220-cc P2 — LRU cap on remembered per-conversation states (bounded memory). */
   private static readonly COMPACTION_STATES_MAX = 8;
   /**
@@ -2154,29 +2152,36 @@ export class OllamaCloudChatProvider
 
   /**
    * v0.22.0 (v0220-cc, D-1 review P2) — stable per-CONVERSATION key for
-   * the compaction state map: `${modelId}::<fingerprint of the first K
-   * raw messages>`. The fingerprint runs over the vision-state-
+   * the compaction state map: `${modelId}::<fingerprint of the FIRST
+   * raw message>`. The fingerprint runs over the vision-state-
    * INDEPENDENT canonical form ({@link renderCompactionBasis}) — an
-   * image committing to a marker inside the first K messages must not
+   * image committing to a marker inside the anchor message must not
    * re-key the conversation (that would reproduce the exact state-loss
-   * bug this key exists to fix). Conversation identity lives in the
-   * immutable head VS Code re-sends every turn; tail growth never
-   * changes the key. Degenerate histories (fewer than K messages, even
-   * empty) fingerprint over whatever exists — two brand-new
-   * conversations share a slot only until their first request
-   * differentiates the head (and an empty history no-ops compaction
-   * anyway).
+   * bug this key exists to fix).
+   *
+   * v0220-t (CC review P3-4) — the anchor is the FIRST message ONLY,
+   * not `min(4, len)` leading messages. A K-of-len head fingerprint is
+   * length-unstable: the state slot is created on the conversation's
+   * FIRST request (often 1-3 messages) and re-keys on every early turn
+   * — a fire at len=3 wrote a 3-message key, the next turn (len>=4)
+   * computed a 4-message key and silently orphaned the projection and
+   * summary chain under a dead key. The first message is present and
+   * identical from the conversation's first request (VS Code re-sends
+   * the immutable history; growth only appends), so the anchor never
+   * moves. Chosen over capturing the head-length at first state
+   * creation because it needs no extra bookkeeping: the key stays a
+   * pure function of (modelId, history). Trade-off: two same-model
+   * conversations whose first message canonicalizes identically share a
+   * slot; the per-request basis validation inside `compactIfNeeded`
+   * then drops the foreign projection and the colliding conversation
+   * re-fires fresh — the bounded pre-P2 degradation, never corruption.
+   * Degenerate empty history keeps the constant `''` fallback
+   * (fingerprint of the empty string; compaction no-ops on it anyway).
    */
   private conversationKey(modelId: string, openaiMessages: readonly OpenAICompatibleMessage[]): string {
-    const k = Math.min(
-      OllamaCloudChatProvider.CONVERSATION_KEY_PREFIX,
-      openaiMessages.length,
-    );
-    let joined = '';
-    for (let i = 0; i < k; i++) {
-      joined += this.memoizedBasisRender(openaiMessages[i]!) + '\u0001';
-    }
-    return `${modelId}::${fingerprintText(joined)}`;
+    const first = openaiMessages[0];
+    const anchor = first === undefined ? '' : this.memoizedBasisRender(first);
+    return `${modelId}::${fingerprintText(anchor)}`;
   }
 
   /**
