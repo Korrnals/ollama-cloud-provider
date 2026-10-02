@@ -2120,7 +2120,12 @@ export class OllamaCloudChatProvider
       const sep = ';base64,';
       const at = url.indexOf(sep);
       if (!url.startsWith(prefix) || at < 0) {
-        return url; // non-data URL: opaque but stable (never rewritten)
+        // v0220-t (CC review P4-1) — non-data URLs are namespaced with
+        // a `url:` prefix: opaque but stable (never rewritten), and a
+        // client-set image_url.url of `'no-image'` or a 16-hex string
+        // can no longer collide with a REAL identity (the zero-byte
+        // sentinel or a sha hex) in the sorted hash set.
+        return `url:${url}`;
       }
       const b64 = url.slice(at + sep.length);
       if (b64.length === 0) return 'no-image';

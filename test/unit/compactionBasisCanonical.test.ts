@@ -116,4 +116,53 @@ describe('compaction basis canonical form (v0220-t P3-3 / P4-1)', () => {
     };
     assert.strictEqual(render(raw), render(markerized));
   });
+
+  // v0220-t (CC review P4-1) — a non-data image_url.url returned
+  // verbatim as an identity collided with real identities: a client
+  // setting url='no-image' (or any 16-hex string) produced the SAME
+  // canonical form as a zero-byte image (or the image with that sha).
+  // Non-data URLs are namespaced `url:<raw>` so the collision is
+  // structurally impossible.
+  it('non-data URL identities are url:-prefixed: collision attempts yield DISTINCT identities', () => {
+    const zeroByteRaw: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,' } },
+      ],
+    };
+    const hostileNoImage: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: 'no-image' } },
+      ],
+    };
+    const a = render(zeroByteRaw);
+    const b = render(hostileNoImage);
+    assert.notStrictEqual(a, b, "'no-image' as a URL must not collide with the zero-byte sentinel identity");
+    assert.ok(b.includes('url:no-image'), 'non-data identity carries the url: namespace prefix');
+
+    // Same for a forged 16-hex identity: distinct from a marker/real sha
+    // form carrying the same hex inside the marker text.
+    const forgedHex: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'image_url', image_url: { url: '0123456789abcdef' } },
+      ],
+    };
+    const realMarker: OpenAICompatibleMessage = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 't' },
+        { type: 'text', text: duplicateMarker('0123456789abcdef') },
+      ],
+    };
+    assert.notStrictEqual(
+      render(forgedHex),
+      render(realMarker),
+      'a 16-hex URL must not collide with a marker identity of the same hex',
+    );
+  });
 });
