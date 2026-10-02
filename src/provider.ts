@@ -5,11 +5,7 @@ import { createCommitWindow } from './commitWindow.js';
 import {
   countOpenAIRequestChars,
   convertMessagesToOpenAI,
-  convertMessagesToNative,
-  convertOpenAIMessagesToNative,
-  convertOpenAIToolsToNative,
   convertToolsToOpenAI,
-  convertToolsToNative,
   getMessageText,
   hasImageParts,
 } from './convert.js';
@@ -28,30 +24,10 @@ import {
   type ModelDefinition,
 } from './modelCatalog.js';
 import { OllamaClient } from './ollamaClient.js';
-import { ResponsesClient } from './responsesClient.js';
-import {
-  convertToResponsesInput,
-  convertToolsToResponses,
-  convertOpenAIMessagesToResponsesInput,
-  convertOpenAIToolsToResponses,
-} from './convertResponses.js';
 import {
   clearCapabilityCache,
   getCapabilityCacheSnapshot,
-  isChatKnownUnavailable,
-  isNativeChatKnownUnavailable,
-  isResponsesKnownUnavailable,
-  mark404,
-  markChatAvailable,
-  markChatUnavailable,
   markModel404,
-  markNativeChatAvailable,
-  markNativeChatUnavailable,
-  markResponsesAvailable,
-  markResponsesUnavailable,
-  reset404s,
-  shouldAutoSwitch,
-  shouldRetryAfterSilence,
 } from './capabilityCache.js';
 import {
   HttpError,
@@ -71,22 +47,21 @@ import {
 } from './ssrfGuard.js';
 import {
   loadConnections,
-  nativeBaseUrl,
   openAiBaseUrl,
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
 import { executePassThrough, shouldFallback } from './visionFallback.js';
+import { resolveVisionHistoryMode } from './visionHistory.js';
+import { TurnLedger } from './turnLedger.js';
 import {
-  applyVisionHistoryLifecycle,
-  resolveRawResendCap,
-  resolveVisionHistoryMode,
-} from './visionHistory.js';
+  buildEndpointAttemptChain,
+  guardExplicitEndpointCachedUnavailable,
+  runStreamAttempt,
+  type EndpointDispatchInputs,
+} from './endpointDispatch.js';
 import { executeTwoPhaseVision, sha256ShortHex } from './visionTwoPhase.js';
 import type {
-  NativeChatMessage,
-  NativeChatTool,
   OpenAICompatibleMessage,
-  OpenAICompatibleTool,
   UsageInfo,
 } from './protocolTypes.js';
 import { filterContext, type ContextFilterLevel } from './contextFilter.js';
@@ -149,33 +124,6 @@ function resolveEndpointLabel(connection: ConnectionConfig | undefined): string 
   return `auto (resolves to ${resolvesTo})`;
 }
 
-/**
- * Issue #40 — builds the explicit-mode 404 error thrown when the user
- * explicitly chose `primaryEndpoint` and that endpoint returned 404.
- * The message names the failing endpoint, the connection, and the two
- * remediation paths (switch to `auto` for automatic fallback, or
- * switch to the other explicit endpoint). Surfaced as a
- * `LanguageModelError` so VS Code presents it consistently to the
- * chat participant that invoked the model.
- */
-function endpointExplicitUnavailableError(
-  primaryEndpoint: 'responses' | 'chat' | 'native',
-  connectionId: string,
-): vscode.LanguageModelError {
-  if (primaryEndpoint === 'responses') {
-    return vscode.LanguageModelError.NotFound(
-      `Endpoint /v1/responses returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "chat".`,
-    );
-  }
-  if (primaryEndpoint === 'native') {
-    return vscode.LanguageModelError.NotFound(
-      `Endpoint /api/chat (native) returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "chat" or "responses".`,
-    );
-  }
-  return vscode.LanguageModelError.NotFound(
-    `Endpoint /chat/completions returned 404 for connection "${connectionId}". You have explicitly chosen this endpoint. Set "ollamaCloud.preferredEndpoint" to "auto" for automatic fallback, or switch to "responses".`,
-  );
-}
 
 /**
  * v0.12.0 Item 2 — generates a stable 8-hex-char ref id from an
@@ -395,85 +343,6 @@ export function classifyStreamError(error: unknown): Error {
   );
 }
 
-/**
- * ADR 0007 — resolves the `/v1/responses` `tools[]` array from the
- * filter state. When the context filter ran (`filterReport !==
- * undefined`, i.e. `safe`/`aggressive`), the filter produced a
- * filtered `OpenAICompatibleTool[]` (`filteredTools`) — convert it
- * directly to the `/v1/responses` tool schema via
- * `convertOpenAIToolsToResponses` (no VS Code ↔ OpenAI round-trip,
- * symmetric with `convertOpenAIMessagesToResponsesInput` for
- * messages). When the filter did NOT run (`off` fast path,
- * `filterReport === undefined`), convert the ORIGINAL VS Code
- * `options.tools` via `convertToolsToResponses` — the 375-test
- * regression path is untouched.
- *
- * `filteredTools` is the post-filter OpenAI-format tool list (the
- * filter dedupes by `function.name` and may drop entries). At `off`,
- * `filteredTools` holds the unfiltered `convertToolsToOpenAI` output —
- * but we still take the `options.tools` branch because the
- * `filterReport === undefined` signal means "use the original
- * conversion path", keeping the off-path byte-identical to pre-#39.
- */
-function resolveResponsesTools(
-  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
-  filteredTools: readonly OpenAICompatibleTool[] | undefined,
-  originalTools: readonly vscode.LanguageModelChatTool[] | undefined,
-): ReturnType<typeof convertOpenAIToolsToResponses> {
-  if (filterReport !== undefined) {
-    return convertOpenAIToolsToResponses(filteredTools);
-  }
-  return convertToolsToResponses(originalTools);
-}
-
-/**
- * ADR 0007 + v0220-a — resolves the native `/api/chat` `messages[]`
- * array from the upstream-transform state. When the context filter ran
- * (`safe`/`aggressive`) OR compaction shaped the history (fire or
- * sticky re-apply — `shapedMessages` true), convert the shaped
- * `OpenAICompatibleMessage[]` (`filteredMessages`) directly to the
- * native schema via `convertOpenAIMessagesToNative` (no VS Code ↔
- * OpenAI round-trip, symmetric with
- * `convertOpenAIMessagesToResponsesInput` for `/v1/responses`). When
- * NEITHER transform ran (`off` fast path below the compaction
- * threshold), convert the ORIGINAL VS Code `messages` via
- * `convertMessagesToNative` — the regression path is untouched.
- *
- * History: the original ADR 0007 fix made the native path (the
- * DEFAULT endpoint for cloud, `auto` → native) stop bypassing the
- * filter. v0220-a extended the same routing to compaction output:
- * gating on `filterReport` alone meant that at the shipped defaults
- * (filter `off`, compaction ON) native converted the RAW messages and
- * the compaction state machine ran for nothing.
- */
-function resolveNativeMessages(
-  shapedMessages: boolean,
-  filteredMessages: readonly OpenAICompatibleMessage[],
-  originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
-): NativeChatMessage[] {
-  if (shapedMessages) {
-    return convertOpenAIMessagesToNative(filteredMessages);
-  }
-  return convertMessagesToNative(originalMessages);
-}
-
-/**
- * ADR 0007 — resolves the native `/api/chat` `tools[]` array from the
- * filter state; the native mirror of `resolveResponsesTools`. When
- * the filter ran, convert the filtered `OpenAICompatibleTool[]`
- * directly via `convertOpenAIToolsToNative`; when the filter is `off`,
- * use the original `convertToolsToNative` conversion path.
- */
-function resolveNativeTools(
-  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
-  filteredTools: readonly OpenAICompatibleTool[] | undefined,
-  originalTools: readonly vscode.LanguageModelChatTool[] | undefined,
-): NativeChatTool[] | undefined {
-  if (filterReport !== undefined) {
-    return convertOpenAIToolsToNative(filteredTools);
-  }
-  return convertToolsToNative(originalTools);
-}
 
 type ModelPickerInformation = vscode.LanguageModelChatInformation & {
   isUserSelectable?: boolean;
@@ -552,143 +421,18 @@ export class OllamaCloudChatProvider
    */
   private readonly contextInflationWarned = new Set<string>();
   /**
-   * ADR 0013 lifecycle extension (2026-09-15) — image hashes already
-   * sent RAW in this window/session. VS Code re-sends immutable
-   * history every turn; without this set the native vision path
-   * re-uploaded ~2M chars of base64 per screenshot PER TURN (the RCA
-   * behind the owner's 2.46M-char sessions that killed subagent
-   * delegations with context overflow). First send: raw; repeats: an
-   * in-band marker (~100 chars). In-memory per instance — a window
-   * reload re-sends each image once (acceptable, mirrors the
-   * two-phase cache posture rationale). Opt-out:
-   * ollamaCloud.visionHistory.mode = 'raw'.
-   *
-   * v0.20.1 (commit-on-success) — written ONLY via
-   * {@link commitPendingImageHashes}, which the dispatch branches call
-   * AFTER `runStream` resolved (= `onDone` fired). A failed/cancelled
-   * turn must NOT record hashes: the model never saw the image, so
-   * the next turn re-sends it RAW (RCA 2026-09-25: a DNS-killed turn
-   * recorded the hash, and the retry turn shipped a marker instead of
-   * the image — the model never saw it at all).
+   * v0220 P2 (slice v0212-p2-turncontext-extraction) — the ONE owner
+   * of the vision turn bookkeeping: the instance-level sent/failed/
+   * capped/warned maps + the per-turn pending hash container, and the
+   * commit-on-success / failed-send / raw-resend-cap semantics that
+   * used to live in six scattered fields + two methods here. The
+   * provider opens a turn (`beginTurn`) at the top of every request,
+   * applies the lifecycle (`applyLifecycle`), commits on stream
+   * success (`commitTurn(token)`), and records failures in the catch
+   * (`recordFailedTurn()`). Lifetime and semantics unchanged — see
+   * turnLedger.ts.
    */
-  private readonly sentImageHashes = new Set<string>();
-  /**
-   * v0.21.0 D-3 (owner-ratified 2026-10-02) — per-hash count of FAILED
-   * raw sends (turn ended without its stream genuinely completing).
-   * Caps the resend amplifier: v0.20.1 commit-on-success correctly
-   * leaves a failed turn's hashes uncommitted, but that made every
-   * subsequent turn re-send those images as RAW base64 — one failed
-   * screenshot turn re-uploaded ~2M chars per turn until a success
-   * landed (3.3M-char requests observed), tripping over-window
-   * compaction and mass eviction. When a count reaches
-   * `ollamaCloud.visionHistory.rawResendCap` (default 3), the hash
-   * moves to {@link cappedImageHashes} and degrades to the never-sent
-   * marker for the rest of the session. In-memory per instance (same
-   * lifetime as {@link sentImageHashes}); a successful commit deletes
-   * the entry (committed hashes are exempt forever).
-   */
-  private readonly failedImageSendCounts = new Map<string, number>();
-  /**
-   * v0.21.0 D-3 — hashes that exhausted the raw-resend cap, mapped to
-   * the attempt count that capped them (rendered into the marker
-   * note). Permanent for the session; never re-sent raw, never
-   * committed into {@link sentImageHashes}.
-   */
-  private readonly cappedImageHashes = new Map<string, number>();
-  /** v0.21.0 D-3 — WARN-once-per-session latch for the first capped hash. */
-  private visionResendCapWarned = false;
-
-  /**
-   * v0.20.1 — commits a turn's pending vision-lifecycle hashes into
-   * the instance-level {@link sentImageHashes} set. Called ONLY on the
-   * success path: after `await this.runStream(...)` resolved (which
-   * resolves on `onDone`) or after `executePassThrough` resolved. A
-   * turn that throws (error / cancel) never reaches the commit, so
-   * the next turn re-sends the image RAW.
-   *
-   * v0.21.0 D-3 — `onDone` fires for BOTH genuine completion and the
-   * D-2 quiet-completed cancel (a cancel with nothing user-visible
-   * resolves the stream pipeline instead of rejecting it). The token
-   * distinguishes them: a cancelled token at commit time means the
-   * stream did NOT genuinely complete (the cancel listener aborts the
-   * read, so a stream cannot genuinely finish while cancelled) — the
-   * pending hashes count as FAILED sends for the raw-resend cap
-   * instead of committing (restores the documented v0.20.1 intent
-   * "a failed/cancelled turn must NOT record hashes" for the D-2
-   * path). With `rawResendCap = 0` the check is skipped entirely:
-   * the legacy commit-on-resolve behavior applies unchanged.
-   *
-   * Composition note: the existing per-endpoint `onSuccess` callbacks
-   * (`markResponsesAvailable`, `markChatAvailable`, ...) are untouched
-   * — this is a separate post-await commit, not a callback replacement.
-   */
-  private commitPendingImageHashes(
-    pending: Set<string>,
-    token?: vscode.CancellationToken,
-  ): void {
-    if (pending.size === 0) {
-      return;
-    }
-    if (token?.isCancellationRequested && resolveRawResendCap() > 0) {
-      this.recordFailedImageSends(pending);
-      return;
-    }
-    for (const hash of pending) {
-      this.sentImageHashes.add(hash);
-      // Success exempts the hash forever (never raw again) — drop any
-      // stale failure count so the map does not grow unbounded.
-      this.failedImageSendCounts.delete(hash);
-    }
-    pending.clear();
-  }
-
-  /**
-   * v0.21.0 D-3 — records a FAILED raw send for every pending hash of
-   * a turn that ended without its stream genuinely completing (the
-   * provideLanguageModelChatResponse catch path, or a quiet-completed
-   * cancel routed here from {@link commitPendingImageHashes}). When a
-   * hash's count reaches `ollamaCloud.visionHistory.rawResendCap` it
-   * moves to {@link cappedImageHashes} — the next turn degrades it to
-   * the never-sent marker instead of re-uploading raw base64. With
-   * cap = 0 (unlimited legacy) this is a no-op beyond clearing the
-   * container: no counting, no degradation, byte-identical v0.20.1
-   * behavior.
-   */
-  private recordFailedImageSends(pending: Set<string>): void {
-    if (pending.size === 0) {
-      return;
-    }
-    const cap = resolveRawResendCap();
-    if (cap <= 0) {
-      pending.clear();
-      return;
-    }
-    for (const hash of pending) {
-      const attempts = (this.failedImageSendCounts.get(hash) ?? 0) + 1;
-      if (attempts >= cap) {
-        this.failedImageSendCounts.delete(hash);
-        this.cappedImageHashes.set(hash, attempts);
-        logger.info(
-          `vision resend cap reached: hash=${hash.slice(0, 8)} attempts=${attempts} — degrading to marker`,
-        );
-        if (!this.visionResendCapWarned) {
-          this.visionResendCapWarned = true;
-          // P3-d (cascade cosmetics 2026-10-02): the old advice said
-          // "re-attach the image" — but cappedImageHashes keys on the
-          // sha256 of the bytes, so a byte-identical re-attach silently
-          // stays capped. The advice must name what actually clears the
-          // cap: a MODIFIED copy (new bytes → new hash) or a window
-          // reload (the sets are per-session, see sentImageHashes).
-          logger.warn(
-            `vision resend cap: an image (${hash.slice(0, 8)}) failed ${attempts} raw sends and stays a text marker for the rest of the session — прикрепите изменённую копию изображения или перезагрузите окно, чтобы модель его увидела; побайтово идентичная копия даёт тот же хеш и остаётся маркером до конца сессии`,
-          );
-        }
-      } else {
-        this.failedImageSendCounts.set(hash, attempts);
-      }
-    }
-    pending.clear();
-  }
+  private readonly turnLedger = new TurnLedger();
   /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
@@ -1002,18 +746,18 @@ export class OllamaCloudChatProvider
       throw new Error(`Unknown Ollama Cloud model: ${modelInfo.id}`);
     }
 
-    // v0.20.1 (commit-on-success) — per-turn PENDING hash container.
-    // `applyVisionHistoryLifecycle` records first-send hashes HERE, not
-    // into `this.sentImageHashes`. The dispatch branches commit the
-    // pending hashes into the instance set only after their stream
-    // resolved successfully; a failed/cancelled turn leaves them
-    // uncommitted so the next turn re-sends the image RAW (the model
-    // never saw it). One container per request — a 404 fallback that
-    // retries a second endpoint within the SAME request shares it, and
-    // only the branch that actually completes commits.
-    // Declared ABOVE the try (v0.21.0 D-3) so the catch path can route
-    // the leftover pending hashes into the failed-send counter.
-    const pendingImageHashes = new Set<string>();
+    // v0.20.1 (commit-on-success) — mint the turn's PENDING hash
+    // handle on the ledger. The lifecycle records first-send hashes
+    // THERE, not into the instance sent-set; only the attempt whose
+    // stream genuinely resolved commits them (a 404 fallback that
+    // retries a second endpoint within the SAME request shares the
+    // handle). The handle is CALL-LOCAL (rework P2-1): concurrent
+    // provideLanguageModelChatResponse calls each hold their own —
+    // a parallel request can never wipe or commit this turn's pending
+    // hashes. Opened ABOVE the try (v0.21.0 D-3) so the catch path can
+    // route the leftover pending hashes into the failed-send counter.
+    // See turnLedger.ts for the full contract.
+    const turn = this.turnLedger.beginTurn();
 
     try {
       // Resolve the connection for this model. Cloud connection models
@@ -1136,12 +880,7 @@ export class OllamaCloudChatProvider
             // committed only after the pass-through stream resolved.
             const passThroughMessages =
               resolveVisionHistoryMode() === 'marker'
-                ? applyVisionHistoryLifecycle(
-                    messages,
-                    this.sentImageHashes,
-                    pendingImageHashes,
-                    this.cappedImageHashes,
-                  )
+                ? this.turnLedger.applyLifecycle(messages, turn)
                 : messages;
             const passThroughResult = await executePassThrough({
               primaryModel: model,
@@ -1154,7 +893,7 @@ export class OllamaCloudChatProvider
               catalog: this.modelCatalog.list(),
               connections,
             });
-            this.commitPendingImageHashes(pendingImageHashes, token);
+            this.turnLedger.commitTurn(turn, token);
             return passThroughResult;
           }
           // two-phase — phase 1: vision describes the image, rewrite
@@ -1226,12 +965,7 @@ export class OllamaCloudChatProvider
       // repeat-marker protection (that is the v0.18 lifecycle that
       // shipped with `'raw'` already in effect).
       if (requestHasImages && !twoPhaseRewroteHistory) {
-        messages = applyVisionHistoryLifecycle(
-          messages,
-          this.sentImageHashes,
-          pendingImageHashes,
-          this.cappedImageHashes,
-        );
+        messages = this.turnLedger.applyLifecycle(messages, turn);
       }
 
       const clientBaseUrl = connection
@@ -1532,47 +1266,14 @@ export class OllamaCloudChatProvider
       );
 
       // Issue #40 — capability-cache short-circuit guard for explicit
-      // mode. When the user explicitly chose `primaryEndpoint` AND the
-      // capability cache already memoized that endpoint as unavailable
-      // (a prior 404 in this session), the explicit-mode contract
-      // requires the actionable error — NOT a silent detour to the other
-      // endpoint. Without this guard, the cache would skip the primary
-      // `if` block and execution would fall through to the other
-      // endpoint, silently routing around the user's explicit choice.
-      // The cache itself is NOT bypassed (per task spec point 6); the
-      // guard reads it and translates "known unavailable + explicit"
-      // into the same error a live 404 would produce.
-      if (
-        isPreferredEndpointExplicit &&
-        primaryEndpoint === 'responses' &&
-        isResponsesKnownUnavailable(connectionId)
-      ) {
-        logger.info(
-          `Explicit /v1/responses cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-        );
-        throw endpointExplicitUnavailableError('responses', connectionId);
-      }
-      if (
-        isPreferredEndpointExplicit &&
-        primaryEndpoint === 'chat' &&
-        isChatKnownUnavailable(connectionId)
-      ) {
-        logger.info(
-          `Explicit /chat/completions cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-        );
-        throw endpointExplicitUnavailableError('chat', connectionId);
-      }
-      // Phase 1 — native short-circuit guard (mirrors the chat one).
-      if (
-        isPreferredEndpointExplicit &&
-        primaryEndpoint === 'native' &&
-        isNativeChatKnownUnavailable(connectionId)
-      ) {
-        logger.info(
-          `Explicit /api/chat (native) cached-unavailable for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-        );
-        throw endpointExplicitUnavailableError('native', connectionId);
-      }
+      // mode (moved to endpointDispatch.ts): "explicit choice +
+      // endpoint memoized unavailable" must throw the actionable
+      // error, NOT silently detour through the chain below.
+      guardExplicitEndpointCachedUnavailable(
+        primaryEndpoint,
+        connectionId,
+        isPreferredEndpointExplicit,
+      );
 
       // v0220-a (P1) — dispatch gate for the message SOURCE. The
       // shaped `filteredMessages` array reaches the wire when EITHER
@@ -1598,422 +1299,83 @@ export class OllamaCloudChatProvider
       const shapedMessages =
         filterReport !== undefined || openaiMessages !== rawOpenAIMessages;
 
-      // native `/api/chat` path — reached when primaryEndpoint==='native',
-      // i.e. explicit 'native' OR 'auto' (the default) resolving to native
-      // for cloud. Auto mode uses the 3×404 auto-recovery below; explicit
-      // mode throws on 404 (no silent fallback).
-      // Responses API path — restored from v0.7.3 (accidentally removed in v0.8.0
-      // endpoint routing rewrite). Uses compat schema (thinking: {type}, not think: true).
-      if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
-        try {
-          const responsesClient = new ResponsesClient(
-            clientBaseUrl,
-            apiKey ?? '',
-            connection,
-            ssrfGuard,
-          );
-          // ADR 0007 + v0220-a — `/v1/responses` consumes the SHAPED
-          // payload. When the filter ran (`filterReport !== undefined`)
-          // OR compaction shaped the history (`shapedMessages`), shape
-          // the `OpenAICompatibleMessage[]` directly into
-          // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
-          // (no VS Code ↔ OpenAI round-trip — keeps the upstream
-          // transforms endpoint-agnostic and avoids lossy
-          // re-conversion). When NEITHER ran (`off` fast path below the
-          // compaction threshold), use the original
-          // `convertToResponsesInput` on the VS Code `messages` (the
-          // pre-#39 regression path stays untouched).
-          const { input, instructions } =
-            shapedMessages
-              ? convertOpenAIMessagesToResponsesInput(filteredMessages)
-              : convertToResponsesInput(messages);
-          const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
-          await this.runStream(
-            (callbacks) =>
-              responsesClient.streamResponses(
-                {
-                  model: model.apiModel ?? model.id,
-                  input,
-                  ...(instructions !== undefined ? { instructions } : {}),
-                  ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
-                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                  extraBody: requestConfiguration.openaiBody,
-                },
-                callbacks,
-                token,
-              ),
-            progress,
-            model,
-            requestChars,
-            () => markResponsesAvailable(connectionId),
-          );
-          // v0.20.1 — the stream resolved (= onDone fired): commit the
-          // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
-          return; // success — no fallback needed
-        } catch (error) {
-          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
-            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
-            markResponsesUnavailable(connectionId);
-            // Fix 2 — track per-model 404s so a retired model is hidden
-            // from the picker after 3 distinct-request 404s.
-            markModel404Once();
-            // Issue #40 — explicit choice: do NOT silently fall back.
-            // Surface an actionable error so the user knows their
-            // explicit endpoint is unsupported by this connection.
-            if (isPreferredEndpointExplicit) {
-              logger.info(
-                `Explicit /v1/responses 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-              );
-              throw endpointExplicitUnavailableError('responses', connectionId);
-            }
-            logger.info(
-              `Auto-mode fallback: /v1/responses returned ${error.status} for connection "${connectionId}" — retrying on /chat/completions`,
-            );
-            // fall through to /chat/completions below
-          } else {
-            throw error; // non-404 — surface, no fallback (no double billing)
-          }
-        }
-      }
-
-      // v0.9.0 Fix 3 — auto-recovery: if native was marked unavailable
-      // (prior 404) but 5+ min have passed since the last 404, clear the
-      // memo so the native path gets retried. This lets connections
-      // recover from transient native-endpoint outages without a manual
-      // config change or VS Code restart. Only applies in auto mode
-      // (explicit mode throws on 404 and does not silently switch).
-      if (
-        primaryEndpoint === 'native' &&
-        isNativeChatKnownUnavailable(connectionId) &&
-        !isPreferredEndpointExplicit &&
-        shouldRetryAfterSilence(connectionId)
-      ) {
-        logger.info(
-          `Auto-recovery: connection "${connectionId}" — native was unavailable, 5+ min elapsed since last 404 — retrying native`,
-        );
-        markNativeChatAvailable(connectionId);
-      }
-
-      if (primaryEndpoint === 'native' && !isNativeChatKnownUnavailable(connectionId)) {
-        try {
-          // When `endpointConnection` is defined (the normal case — at
-          // least one of `connection` / `cloudConnection` exists for any
-          // valid model id), pass the native base URL explicitly via
-          // `nativeBaseUrl` so the request lands on `/api/chat`. When
-          // `endpointConnection` is undefined (a stale connection id
-          // pointing at a deleted connection), fall back to the legacy
-          // `clientBaseUrl` and let `OllamaClient.nativeChatUrl` strip
-          // `/v1` and append `/api/chat` itself.
-          const nativeClient = new OllamaClient(
-            endpointConnection ? nativeBaseUrl(endpointConnection) : clientBaseUrl,
-            apiKey ?? '',
-            endpointConnection,
-            'native',
-            ssrfGuard,
-          );
-          // ADR 0007 + v0220-a — native `/api/chat` consumes the SHAPED
-          // payload, mirroring the `/v1/responses` path above: when the
-          // filter ran OR compaction shaped the history, convert the
-          // shaped OpenAI messages/tools directly (no VS Code ↔ OpenAI
-          // round-trip); when neither ran, the original conversion path
-          // runs unchanged. Before ADR 0007, the native path silently
-          // bypassed the filter; before v0220-a it silently bypassed
-          // compaction at filter `off`.
-          // ADR 0013 lifecycle — already applied once above the
-          // dispatch (all three branches share it); no per-branch copy.
-          const nativeMessages = resolveNativeMessages(shapedMessages, filteredMessages, messages);
-          const nativeTools = resolveNativeTools(filterReport, filteredTools, options.tools);
-          const nativeConfig = resolveModelRequestConfiguration(model, modelOptions, 'native');
-          await this.runStream(
-            (callbacks) =>
-              nativeClient.streamChat(
-                {
-                  model: model.apiModel ?? model.id,
-                  messages: nativeMessages,
-                  ...(nativeTools !== undefined ? { tools: nativeTools } : {}),
-                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                  extraBody: nativeConfig.openaiBody,
-                },
-                callbacks,
-                token,
-              ),
-            progress,
-            model,
-            requestChars,
-            () => {
-              markNativeChatAvailable(connectionId);
-              // v0.9.0 Fix 3 — reset the 404 counter on native success
-              // so the auto-recovery window does not accumulate stale 404s.
-              reset404s(connectionId, 'native');
-            },
-          );
-          // v0.20.1 — the stream resolved (= onDone fired): commit the
-          // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
-          return; // success — no fallback needed
-        } catch (error) {
-          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
-            // v0.9.0 Fix 3 (corrected) — track 404s for auto-recovery.
-            // Do NOT mark unavailable on first 404 — that would switch
-            // immediately, bypassing the 3×404 threshold. Instead:
-            // increment counter, only mark unavailable when threshold hit.
-            // Fix 2 — also track per-model 404s (retired-model hiding).
-            markModel404Once();
-            if (isPreferredEndpointExplicit) {
-              logger.info(
-                `Explicit /api/chat (native) 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-              );
-              throw endpointExplicitUnavailableError('native', connectionId);
-            }
-            mark404(connectionId, 'native');
-            if (shouldAutoSwitch(connectionId, 'native')) {
-              logger.info(
-                `Auto-recovery: connection "${connectionId}" hit 3×404 on native — switching to chat`,
-              );
-              markNativeChatUnavailable(connectionId);
-            } else {
-              logger.info(
-                `Auto-mode: /api/chat returned ${error.status} for connection "${connectionId}" — will retry native on next request (see capability cache log for 404 count)`,
-              );
-              // Do NOT fall through to chat yet — retry native on next request.
-              // Only after 3×404 do we switch (markNativeChatUnavailable above).
-              // For THIS request, surface the 404 so the caller sees it.
-              throw error;
-            }
-            logger.info(
-              `Auto-mode fallback: /api/chat returned ${error.status} for connection "${connectionId}" — retrying on /chat/completions`,
-            );
-            // fall through to the /chat/completions path below
-          } else {
-            throw error; // non-404 — surface, no fallback (no double billing)
-          }
-        }
-      }
-
-      if (primaryEndpoint === 'responses' && !isResponsesKnownUnavailable(connectionId)) {
-        try {
-          const responsesClient = new ResponsesClient(
-            clientBaseUrl,
-            apiKey ?? '',
-            connection,
-            ssrfGuard,
-          );
-          // ADR 0007 + v0220-a — `/v1/responses` consumes the SHAPED
-          // payload. When the filter ran (`filterReport !== undefined`)
-          // OR compaction shaped the history (`shapedMessages`), shape
-          // the `OpenAICompatibleMessage[]` directly into
-          // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
-          // (no VS Code ↔ OpenAI round-trip — keeps the upstream
-          // transforms endpoint-agnostic and avoids lossy
-          // re-conversion). When NEITHER ran (`off` fast path below the
-          // compaction threshold), use the original
-          // `convertToResponsesInput` on the VS Code `messages` (the
-          // pre-#39 regression path stays untouched).
-          const { input, instructions } =
-            shapedMessages
-              ? convertOpenAIMessagesToResponsesInput(filteredMessages)
-              : convertToResponsesInput(messages);
-          const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
-          await this.runStream(
-            (callbacks) =>
-              responsesClient.streamResponses(
-                {
-                  model: model.apiModel ?? model.id,
-                  input,
-                  ...(instructions !== undefined ? { instructions } : {}),
-                  ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
-                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                  extraBody: requestConfiguration.openaiBody,
-                },
-                callbacks,
-                token,
-              ),
-            progress,
-            model,
-            requestChars,
-            () => markResponsesAvailable(connectionId),
-          );
-          // v0.20.1 — the stream resolved (= onDone fired): commit the
-          // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
-          return; // success — no fallback needed
-        } catch (error) {
-          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
-            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
-            markResponsesUnavailable(connectionId);
-            // Fix 2 — track per-model 404s so a retired model is hidden
-            // from the picker after 3 distinct-request 404s.
-            markModel404Once();
-            // Issue #40 — explicit choice: do NOT silently fall back.
-            // Surface an actionable error so the user knows their
-            // explicit endpoint is unsupported by this connection.
-            if (isPreferredEndpointExplicit) {
-              logger.info(
-                `Explicit /v1/responses 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-              );
-              throw endpointExplicitUnavailableError('responses', connectionId);
-            }
-            logger.info(
-              `Auto-mode fallback: /v1/responses returned ${error.status} for connection "${connectionId}" — retrying on /chat/completions`,
-            );
-            // fall through to /chat/completions below
-          } else {
-            throw error; // non-404 — surface, no fallback (no double billing)
-          }
-        }
-      }
-
-      // /chat/completions path — primary when global/per-connection
-      // setting is 'chat', fallback when 'responses' returned 404, or
-      // always for local Ollama.
-      if (!isLocal && primaryEndpoint === 'chat' && !isChatKnownUnavailable(connectionId)) {
-        try {
-          await this.runStream(
-            (callbacks) =>
-              client.streamChat(
-                {
-                  model: model.apiModel,
-                  // ADR 0007 — `/chat/completions` consumes the
-                  // FILTERED payload (`filteredMessages` +
-                  // `filteredTools`). At `off` these are the unfiltered
-                  // originals, so the 375-test regression path is
-                  // untouched.
-                  messages: filteredMessages,
-                  tools: filteredTools,
-                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                  extraBody: requestConfiguration.openaiBody,
-                },
-                callbacks,
-                token,
-              ),
-            progress,
-            model,
-            requestChars,
-            () => markChatAvailable(connectionId),
-          );
-          // v0.20.1 — the stream resolved (= onDone fired): commit the
-          // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
-          return; // success — no fallback needed
-        } catch (error) {
-          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
-            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
-            markChatUnavailable(connectionId);
-            // Fix 2 — track per-model 404s so a retired model is hidden
-            // from the picker after 3 distinct-request 404s.
-            markModel404Once();
-            // Issue #40 — explicit choice: do NOT silently fall back.
-            if (isPreferredEndpointExplicit) {
-              logger.info(
-                `Explicit /chat/completions 404 for connection "${connectionId}" — throwing (no fallback, user chose this endpoint explicitly)`,
-              );
-              throw endpointExplicitUnavailableError('chat', connectionId);
-            }
-            logger.info(
-              `Auto-mode fallback: /chat/completions returned ${error.status} for connection "${connectionId}" — retrying on /v1/responses`,
-            );
-            // fall through to /v1/responses below
-          } else {
-            throw error; // non-404 — surface, no fallback
-          }
-        }
-      }
-
-      // If we reach here, either:
-      //   - primary was 'responses' and 404'd → /chat/completions fallback
-      //   - primary was 'chat' and 404'd → /v1/responses fallback
-      //   - local connection → /chat/completions (the only path)
-      // For local connections, this is the only path and there is no
-      // fallback. For cloud/remote, this is the fallback from the
-      // primary endpoint's 404.
-      if (!isLocal && primaryEndpoint === 'chat' && isChatKnownUnavailable(connectionId)) {
-        // /chat/completions 404'd earlier → try /v1/responses as fallback
-        try {
-          const responsesClient = new ResponsesClient(
-            clientBaseUrl,
-            apiKey ?? '',
-            connection,
-            ssrfGuard,
-          );
-          // ADR 0007 + v0220-a — same shaped-payload routing as the
-          // primary /v1/responses path above.
-          const { input, instructions } =
-            shapedMessages
-              ? convertOpenAIMessagesToResponsesInput(filteredMessages)
-              : convertToResponsesInput(messages);
-          const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
-          await this.runStream(
-            (callbacks) =>
-              responsesClient.streamResponses(
-                {
-                  model: model.apiModel ?? model.id,
-                  input,
-                  ...(instructions !== undefined ? { instructions } : {}),
-                  ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
-                  tool_choice: resolveToolChoice(options.toolMode, options.tools),
-                  extraBody: requestConfiguration.openaiBody,
-                },
-                callbacks,
-                token,
-              ),
-            progress,
-            model,
-            requestChars,
-            () => markResponsesAvailable(connectionId),
-          );
-          // v0.20.1 — the stream resolved (= onDone fired): commit the
-          // vision hashes this turn's lifecycle recorded as pending.
-          this.commitPendingImageHashes(pendingImageHashes, token);
-          return;
-        } catch (error) {
-          if (error instanceof HttpError && (error.status === 404 || error.status === 410)) {
-            // Asymmetry: responses/chat mark unavailable on the 1st 404 (stable endpoints — 1×404 means truly unsupported). Only native (/api/chat) uses the 3×404 auto-recovery counter (experimental, may flap during rollout). See capabilityCache.ts.
-            markResponsesUnavailable(connectionId);
-            // Fix 2 — track per-model 404s so a retired model is hidden
-            // from the picker after 3 distinct-request 404s.
-            markModel404Once();
-            logger.info(
-              `/v1/responses also returned ${error.status} for connection "${connectionId}" — both endpoints unavailable`,
-            );
-          }
-          throw error;
-        }
-      }
-
-      // /chat/completions — the final fallback (from responses 404) or
-      // the only path for local Ollama.
-      await this.runStream(
-        (callbacks) =>
-          client.streamChat(
-            {
-              model: model.apiModel,
-              // ADR 0007 — `/chat/completions` consumes the FILTERED
-              // payload (`filteredMessages` + `filteredTools`). At `off`
-              // these are the unfiltered originals.
-              messages: filteredMessages,
-              tools: filteredTools,
-              tool_choice: resolveToolChoice(options.toolMode, options.tools),
-              extraBody: requestConfiguration.openaiBody,
-            },
-            callbacks,
-            token,
-          ),
-        progress,
+      // v0220 P2 (slice v0212-p2-turncontext-extraction) — the seven
+      // dispatch branches collapsed into ONE ordered attempt chain +
+      // ONE result handler (endpointDispatch.ts). The chain preserves
+      // the exact source order: responses-primary → native
+      // auto-recovery check → native-primary → responses-repeat →
+      // chat-primary → responses-last-resort → chat-final (the
+      // unconditional fallback / local-only path). Guards read the
+      // LIVE capability cache at each position; payload converters
+      // run lazily inside each attempt (they log — eager conversion
+      // would emit ghost lines for branches that never fire). The
+      // vision-hash commit is ONE place (success outcome) and the
+      // failed-send recording ONE place (the catch below) — the D-3
+      // "thread token through 7 commit sites" tax is gone.
+      const dispatchInputs: EndpointDispatchInputs = {
+        compatClient: client,
+        connection,
+        endpointConnection,
+        clientBaseUrl,
+        apiKey: apiKey ?? '',
+        ssrfGuard,
+        primaryEndpoint,
+        isPreferredEndpointExplicit,
+        isLocal,
+        connectionId,
         model,
+        modelOptions,
+        requestConfiguration,
+        token,
+        progress,
         requestChars,
-        isLocal ? undefined : () => markChatAvailable(connectionId),
-      );
-      // v0.20.1 — the final fallback resolved (= onDone fired): commit
-      // the vision hashes this turn's lifecycle recorded as pending.
-      this.commitPendingImageHashes(pendingImageHashes, token);
+        runStream: this.runStream.bind(this),
+        markModel404Once,
+        messages,
+        filteredMessages,
+        shapedMessages,
+        filteredTools,
+        filterReport,
+        tools: options.tools,
+        toolMode: options.toolMode,
+      };
+      for (const step of buildEndpointAttemptChain(dispatchInputs)) {
+        if (step.kind === 'native-recovery') {
+          if (step.shouldRecover()) {
+            step.recover();
+          }
+          continue;
+        }
+        if (!step.attempt.enabled()) {
+          continue;
+        }
+        const outcome = await runStreamAttempt(step.attempt, dispatchInputs);
+        if (outcome.kind === 'success') {
+          // v0.20.1 — the stream resolved (= onDone fired): commit the
+          // vision hashes this turn's lifecycle recorded as pending.
+          this.turnLedger.commitTurn(turn, token);
+          return; // success — no fallback needed
+        }
+        if (outcome.kind === 'terminal') {
+          // The attempt's 404 policy decided there is no fallback
+          // (explicit mode, native threshold not reached, last
+          // resort, or a non-404 error — surface, no double billing).
+          // The outer catch records the failed vision sends and
+          // re-classifies.
+          throw outcome.error;
+        }
+        // 'fallback-404' — the policy already applied its capability
+        // marks + log lines; continue the chain at the next enabled
+        // attempt. POST is non-idempotent: only a clean pre-stream
+        // 404 may detour — never a mid-stream retry (ADR 0001/0005).
+      }
     } catch (error) {
       // v0.21.0 D-3 — the turn ended WITHOUT its stream completing
       // (terminal error path): every hash this turn's lifecycle sent
       // RAW counts as a failed send toward the raw-resend cap. Empty
       // for turns that failed before any raw send (vision gate, etc.)
       // and already cleared when a commit point ran.
-      this.recordFailedImageSends(pendingImageHashes);
+      this.turnLedger.recordFailedTurn(turn);
       logger.error('provideLanguageModelChatResponse failed.', error);
       throw classifyStreamError(error);
     }
@@ -2882,18 +2244,7 @@ function toChatInformation(
   } as ModelPickerInformation;
 }
 
-function resolveToolChoice(
-  toolMode: vscode.LanguageModelChatToolMode,
-  tools: readonly vscode.LanguageModelChatTool[] | undefined,
-): 'auto' | 'required' | 'none' | undefined {
-  if (!tools?.length) {
-    return undefined;
-  }
 
-  return toolMode === vscode.LanguageModelChatToolMode.Required
-    ? 'required'
-    : 'auto';
-}
 
 // Issue #41 — Strand 3.2: exported so the unit test in
 // `test/unit/formatUsageLog.test.ts` can assert the estimatedTokens /
