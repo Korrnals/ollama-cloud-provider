@@ -444,9 +444,12 @@ export function convertToolsToNative(
  *     `instructions` hoist — native accepts multiple system messages);
  *     empty content is dropped.
  *   - `user` → `{ role:'user', content }`; part-array content keeps
- *     `text` parts, image parts are skipped (defence-in-depth — vision
- *     content never reaches this path: the vision gate routes image
- *     requests before the filter). Empty text is dropped (mirrors
+ *     `text` parts and maps `image_url` parts into the user message's
+ *     `images[]` array (bare base64 — v0220-a P1: the shaped path is
+ *     lossless and payload-equivalent to `convertMessagesToNative`;
+ *     before v0220-a image parts were silently dropped here). A user
+ *     message with images and empty text is kept (`content: ""` +
+ *     `images: [...]`); empty text without images is dropped (mirrors
  *     `convertMessagesToNative`).
  *   - `assistant` → `{ role:'assistant', content, tool_calls? ,
  *     reasoning_content? }`; `tool_calls[].function.arguments` is
@@ -481,7 +484,7 @@ export function convertOpenAIMessagesToNative(
       continue;
     }
 
-    const text = openAIContentToNativeText(message.content);
+    const { text, images } = openAIContentToNativeParts(message.content);
 
     if (role === 'assistant') {
       if (text || (message.tool_calls !== undefined && message.tool_calls.length > 0)) {
@@ -508,12 +511,26 @@ export function convertOpenAIMessagesToNative(
     // instructions field, so system messages stay in place (first one
     // included, and a second system message after filtering stays too
     // — native accepts multiple system messages, unlike /v1/responses).
-    // Empty text after filtering is dropped — mirrors the VS Code-path
-    // guard in `convertMessagesToNative` (v0.12.0 review P2 fix; the
-    // filter already guarantees non-empty user/system messages, this
-    // is defence-in-depth for raw payloads).
-    if (text) {
-      result.push({ role, content: text });
+    // v0220-a P1 — `image_url` parts map to the user message's
+    // `images[]` array (bare base64), mirroring
+    // `convertMessagesToNative`: the shaped path is payload-equivalent
+    // to the legacy one instead of silently dropping vision content
+    // (the ADR 0007-era skip was based on the false premise that
+    // vision never reaches this path — see
+    // `openAIContentToNativeParts`). Images ride on USER messages
+    // only; a user message with images and empty text is KEPT
+    // (`content: ""` + `images: [...]` — native accepts that shape),
+    // mirroring the legacy converter's guard. Empty text without
+    // images is dropped — mirrors the VS Code-path guard in
+    // `convertMessagesToNative` (v0.12.0 review P2 fix; defence-in-
+    // depth for raw payloads).
+    const userImages = role === 'user' ? images : [];
+    if (text || userImages.length > 0) {
+      const entry: NativeChatMessage = { role, content: text };
+      if (userImages.length > 0) {
+        entry.images = userImages;
+      }
+      result.push(entry);
     } else {
       logger.debug(
         'convertOpenAIToNative: dropped empty user/system message after context filter',
@@ -525,12 +542,11 @@ export function convertOpenAIMessagesToNative(
 }
 
 /**
- * ADR 0007 — extracts the native text from a filtered message's
+ * ADR 0007 — extracts the native text from a shaped message's
  * `OpenAIChatContent`: string → itself; null/undefined → ""; part
- * array → concatenated `text` parts. `image_url` parts are SKIPPED
- * with a debug log — vision content never reaches this path by design
- * (the vision gate routes image requests before the filter), so the
- * log is defence-in-depth only.
+ * array → concatenated `text` parts. Used for the `tool` role, whose
+ * content is always text (tool results are serialized to text by
+ * `convertMessagesToOpenAI` before the shaped path is reached).
  */
 function openAIContentToNativeText(
   content: OpenAICompatibleMessage['content'],
@@ -545,13 +561,68 @@ function openAIContentToNativeText(
   for (const part of content) {
     if (part.type === 'text') {
       text += part.text;
-    } else {
-      logger.debug(
-        'convertOpenAIToNative: dropped image part after context filter',
-      );
     }
   }
   return text;
+}
+
+/**
+ * v0220-a P1 — splits a shaped message's `OpenAIChatContent` into the
+ * native payload pieces: concatenated `text` parts plus every
+ * `image_url` part mapped to bare base64 (via
+ * `openAIImageUrlToNativeBase64`) for the user message's `images[]`
+ * array. The legacy converter (`convertMessagesToNative`) produces the
+ * same pieces from `LanguageModelDataPart`s — the two paths are
+ * payload-equivalent.
+ *
+ * History: the ADR 0007 version SKIPPED `image_url` parts with a
+ * debug log on the belief that vision content never reaches the
+ * shaped path (the vision gate was assumed to rewrite it first). That
+ * premise is FALSE for vision-capable primaries: the ADR 0013
+ * lifecycle passes the FIRST send of an image hash RAW
+ * (`applyVisionHistoryLifecycle`, provider.ts), so a raw `image_url`
+ * data URL legitimately flows through the filter/compaction output
+ * into this converter — and was silently dropped on native `/api/chat`
+ * at filter `safe`/`aggressive`, and (since the v0220-a dispatch gate)
+ * at the shipped defaults too. Lossless since v0220-a.
+ */
+function openAIContentToNativeParts(
+  content: OpenAICompatibleMessage['content'],
+): { text: string; images: string[] } {
+  if (content === null || content === undefined) {
+    return { text: '', images: [] };
+  }
+  if (typeof content === 'string') {
+    return { text: content, images: [] };
+  }
+  let text = '';
+  const images: string[] = [];
+  for (const part of content) {
+    if (part.type === 'text') {
+      text += part.text;
+    } else {
+      images.push(openAIImageUrlToNativeBase64(part.image_url.url));
+    }
+  }
+  return { text, images };
+}
+
+/**
+ * v0220-a P1 — strips the `data:<mime>;base64,` prefix from an OpenAI
+ * `image_url.url` (built by `toDataUrl` in `convertMessagesToOpenAI`),
+ * returning the bare base64 the native `images[]` array expects —
+ * byte-identical to what `toNativeImageBase64` produces on the legacy
+ * path. A URL without the data-URL prefix is returned verbatim
+ * (lossless: native accepts any string in `images[]`; dropping or
+ * mangling would lose content).
+ */
+function openAIImageUrlToNativeBase64(url: string): string {
+  const marker = ';base64,';
+  const index = url.indexOf(marker);
+  if (index !== -1 && url.startsWith('data:')) {
+    return url.slice(index + marker.length);
+  }
+  return url;
 }
 
 /**

@@ -2534,7 +2534,15 @@ describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Findi
       maxRetries: 0,
       apiKey: '',
       visionModels: [],
-      contextFilter: { level: globalContextFilterLevel },
+      // P3-b — FLAT key: the stub's `WorkspaceConfiguration.get` is a
+      // flat store lookup, so the provider's
+      // `get('contextFilter.level', 'off')` never saw the nested
+      // `contextFilter: { level }` form this test used before — the
+      // global level silently fell to the 'off' default. Every test in
+      // this describe passes 'off' as the global (the filter is driven
+      // by the per-connection override), so activating the real key
+      // changes no outcome — it just stops lying about what is set.
+      'contextFilter.level': globalContextFilterLevel,
       connections: [
         {
           id: 'cloud',
@@ -2750,7 +2758,9 @@ describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Findi
       requestTimeoutMs: 120000,
       maxRetries: 0,
       apiKey: '',
-      contextFilter: { level: 'off' },
+      // P3-b — flat key (see runTurn above): the nested form was dead
+      // config in the stub's flat store.
+      'contextFilter.level': 'off',
       connections: [
         {
           id: 'cloud',
