@@ -319,6 +319,11 @@ export interface StreamReaderOptions {
  *     AbortError / raw socket-close escaping `withRetry`) are re-thrown
  *     as `ZeroByteSocketCloseError` instead of a direct `onError`, so
  *     they follow this SAME policy — exactly one retry path per class.
+ *     D-2 review P3-3: if the caller already cancelled at this decision
+ *     point, the break completes QUIETLY via `onDone` (same hard-
+ *     invariant rationale as the CIE open-window branch — 0 chunks ⇒
+ *     nothing shown, so a cancelled request must surface no visible
+ *     error and no extra attempt).
  *
  * All hidden retries draw from the shared POST budget
  * (`MAX_POST_BUDGET_PER_MESSAGE`); the loop terminates because every
@@ -463,7 +468,20 @@ export async function readStream(
         // §3.4 design condition grants ONE additional VISIBLE attempt,
         // then terminal. No extra backoff: withRetry just ran its full
         // exponential schedule; the visible notice explains the wait.
-        if (zeroByteExtraAttemptUsed || cancelled || budget.remaining <= 0) {
+        if (cancelled) {
+          // D-2 review P3-3 (task v0220-s) — quiet-cancel symmetry: a
+          // 0-chunk peer reset racing the cancel tag used to surface
+          // onError for a request the user had already aborted. 0
+          // chunks ⇒ nothing was shown, so the quiet-completion branch
+          // of the D-2 hard invariant applies here too: onDone, no
+          // error, no extra visible attempt for a cancelled request.
+          logger.warn(
+            'Zero-byte close while cancelled — quiet completion (0 chunks, nothing user-visible; no extra attempt, no error)',
+          );
+          callbacks.onDone();
+          return;
+        }
+        if (zeroByteExtraAttemptUsed || budget.remaining <= 0) {
           // Surface through the callback contract (same as the
           // pre-window behaviour), then stop — readStreamOnce already
           // handled socket teardown.

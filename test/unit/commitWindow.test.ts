@@ -1000,6 +1000,59 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
     assert.equal(win.controller.hiddenRetryCount(), 0);
   });
 
+  it('cancel racing a 0-chunk close (zero-byte path) → quiet onDone, no error, no extra attempt (P3-3)', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // The production interleaving (D-2 review P3-3): the user cancels,
+      // then the peer reset lands as a 0-chunk close — the probe's
+      // first read resolves done AFTER the cancellation, so the
+      // zero-byte decision point in readStream sees an already-
+      // cancelled token.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          setTimeout(() => source.cancel(), 20);
+          setTimeout(() => controller.close(), 45);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'd2-zerobyte-cancel',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: sseLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'a cancelled 0-chunk break is a quiet completion, not a provider failure');
+    assert.equal(recorded.error, undefined, 'no visible error for a request the user aborted');
+    assert.equal(fetchCalls, 1, 'NO extra visible attempt after cancellation');
+    assert.equal(recorded.notices.length, 0, 'no visible notice after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+    // Diagnostics honesty: the quiet completion is disclosed via a
+    // distinct WARN line so field logs show why no extra attempt fired.
+    const recent = logger.getRecentErrors().join('\n');
+    assert.ok(
+      recent.includes('Zero-byte close while cancelled — quiet completion'),
+      'the quiet completion must be disclosed via a distinct WARN line',
+    );
+  });
+
   it('cancel before stream start → quiet onDone, no error, no retry (unchanged)', async function () {
     this.timeout(5000);
     const source = new vscode.CancellationTokenSource();
