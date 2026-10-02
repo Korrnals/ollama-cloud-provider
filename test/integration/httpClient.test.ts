@@ -484,11 +484,36 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3 + rework)',
     );
 
     // The proxy stops seeing traffic: the tunnel was torn down.
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    assert.equal(
-      tunnelState.bytesToUpstream,
-      bytesAtAbort,
-      'no further client→upstream bytes after the abort',
+    // QUIESCENCE, not byte-exact equality (issue #51): the abort can
+    // land while TLS records are still buffered in the client socket,
+    // so a deterministic remainder may flush into the tunnel AFTER
+    // bytesAtAbort was sampled — `bytesToUpstream === bytesAtAbort` at
+    // a fixed 150 ms grace was a record-timing lottery (4933 !== 1759
+    // on pipeline-shaped runs). What the pin MEANS: traffic DID flow
+    // before the abort (asserted above), and after the abort the
+    // counter eventually freezes. Poll until two samples QUIET_WINDOW_MS
+    // apart show no growth, bounded by QUIET_CAP_MS; the first window
+    // absorbs any in-flight flush, stability proves teardown. The
+    // poll also guarantees >= QUIET_WINDOW_MS of settle time before
+    // the WARN check below.
+    const QUIET_WINDOW_MS = 150;
+    const QUIET_CAP_MS = 1500;
+    const quietDeadline = Date.now() + QUIET_CAP_MS;
+    let prevSample = tunnelState.bytesToUpstream;
+    let quiet = false;
+    while (Date.now() < quietDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, QUIET_WINDOW_MS));
+      const sample = tunnelState.bytesToUpstream;
+      if (sample === prevSample) {
+        quiet = true;
+        break;
+      }
+      prevSample = sample;
+    }
+    assert.ok(
+      quiet,
+      `client→upstream traffic must go quiet within ${QUIET_CAP_MS} ms of the abort `
+        + `(counter ${bytesAtAbort} at the abort, last sample ${prevSample})`,
     );
 
     // The audit P3 pin: after the abort settles, NO
