@@ -355,16 +355,19 @@ describe('compaction stickiness — provider wiring (v0.21.0 slice d1)', () => {
     );
     assert.ok(
       capturedLogLines.some((line) =>
-        /Compaction check: usedTokens=\d+ windowTokens=131072 threshold=\d+ charsPerToken=\d+(\.\d+)? armed=\w+ reapply=\w+/.test(
+        /Compaction check: rawUsedTokens=\d+ windowTokens=131072 threshold=\d+ charsPerToken=\d+(\.\d+)? armed=\w+ reapply=\w+/.test(
           line,
         ),
       ),
       'P3-b per-request check INFO line present',
     );
 
-    // --- Call 3: a DIFFERENT conversation on the same model id — the
-    //     basis no longer matches → projection dropped, raw passthrough
-    //     (the cooldown still holds a fresh fire on this fresh machine).
+    // --- Call 3: a DIFFERENT conversation on the same model id
+    //     (v0220-cc P2: state is keyed by conversation, not model id).
+    //     The zz conversation gets its OWN fresh hysteresis state — it
+    //     fires its own compaction (own summarizer quota, no inherited
+    //     cooldown) and must NOT be served the first conversation's
+    //     projection.
     const progress3 = makeProgress();
     await provider.provideLanguageModelChatResponse(
       chatInfoFor('gpt-oss:120b'),
@@ -373,13 +376,117 @@ describe('compaction stickiness — provider wiring (v0.21.0 slice d1)', () => {
       progress3,
       new vscode.CancellationTokenSource().token,
     );
-    assert.equal(apiChatCalls.length, 1, 'call 3: still no new fire (cooldown + reset machine)');
+    assert.equal(apiChatCalls.length, 2, 'call 3: the foreign conversation fires its OWN compaction (fresh state, own quota)');
     const body3 = dispatchedBody(2);
-    assert.ok(body3.includes('zz01'), 'call 3: raw history passed through');
-    assert.ok(!body3.includes('[compacted-turns'), 'call 3: stale projection NOT served to a foreign history');
-    assert.ok(
-      capturedLogLines.some((line) => line.includes('Compaction projection dropped')),
-      'invalidation INFO line present',
+    assert.ok(!body3.includes('turn01'), "call 3: the first conversation's evicted prefix must not leak into zz");
+    assert.ok(!body3.includes('zz01'), 'call 3: zz01 evicted by zz own fire');
+    assert.ok(body3.includes('[compacted-turns'), 'call 3: zz served its own fresh checkpoint');
+
+    // --- Call 4 (v0220-cc P2): BACK to the FIRST conversation, grown
+    //     further. The zz activity must NOT have clobbered the first
+    //     conversation's state — its projection re-applies (before the
+    //     fix both windows shared one modelId-keyed slot and reset each
+    //     other every alternation, degenerating to the pre-d1 cadence).
+    const progress4 = makeProgress();
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      bigHistory(10),
+      { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      progress4,
+      new vscode.CancellationTokenSource().token,
     );
+    assert.equal(apiChatCalls.length, 2, 'call 4: NO new fire — the first conversation kept its projection across the zz interleave');
+    const body4 = dispatchedBody(3);
+    assert.ok(body4.includes('[compacted-turns'), 'call 4: first conversation projection re-applied after interleaving');
+    assert.ok(!body4.includes('turn01'), 'call 4: evicted prefix still evicted');
+    assert.ok(!body4.includes('zz01'), 'call 4: zz content never leaks into the first conversation');
+    assert.ok(body4.includes('turn22'), 'call 4: grown tail appended');
+    assert.ok(
+      !capturedLogLines.some((line) => line.includes('Compaction projection dropped')),
+      'no projection was dropped across the whole interleave',
+    );
+  });
+
+  // v0220-cc P2 (D-1 review) — two windows alternating the SAME model
+  // must keep independent projections. Before the fix the state map was
+  // keyed by bare modelId: every alternation re-keyed the same slot and
+  // reset the other window's projection + summary chain (pre-d1
+  // cadence, orphaned store blocks).
+  it('two interleaved conversations on the same model each keep their own projection across alternation', async () => {
+    startLogCapture();
+    const ctx = makeCompactionContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const call = (history: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        history,
+        { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        new vscode.CancellationTokenSource().token,
+      );
+
+    // A fires; B fires (own fresh state — no inherited cooldown).
+    await call(bigHistory(0, 'aa'));
+    assert.equal(apiChatCalls.length, 1, 'conversation A fires');
+    await call(bigHistory(0, 'bb'));
+    assert.equal(apiChatCalls.length, 2, 'conversation B fires its own compaction');
+
+    // A returns, grown — its projection must re-apply across the B
+    // interleave (no new fire, evicted prefix still evicted).
+    await call(bigHistory(4, 'aa'));
+    assert.equal(apiChatCalls.length, 2, 'A: no re-fire after the B interleave');
+    let bodyA = dispatchedBody(chatCalls.length - 1);
+    assert.ok(bodyA.includes('[compacted-turns'), 'A: projection re-applied');
+    assert.ok(!bodyA.includes('aa01'), 'A: evicted prefix stays evicted');
+    assert.ok(!bodyA.includes('bb01'), 'A: B content never leaks in');
+    assert.ok(bodyA.includes('aa16'), 'A: grown tail appended');
+
+    // B returns, grown — SAME in the other direction.
+    await call(bigHistory(4, 'bb'));
+    assert.equal(apiChatCalls.length, 2, 'B: no re-fire after the A interleave');
+    const bodyB = dispatchedBody(chatCalls.length - 1);
+    assert.ok(bodyB.includes('[compacted-turns'), 'B: projection re-applied');
+    assert.ok(!bodyB.includes('bb01'), 'B: evicted prefix stays evicted');
+    assert.ok(!bodyB.includes('aa01'), 'B: A content never leaks in');
+    assert.ok(bodyB.includes('bb16'), 'B: grown tail appended');
+    assert.ok(
+      !capturedLogLines.some((line) => line.includes('Compaction projection dropped')),
+      'neither projection was dropped across the alternation',
+    );
+  });
+
+  // v0220-cc P2 — the per-conversation state map is an LRU capped at 8
+  // entries: abandoned conversations (closed windows) garbage-collect
+  // instead of accumulating projection + chain state forever. After 9
+  // distinct conversations the OLDEST (first-touched) entry is evicted,
+  // so conversation 1 returns to a fresh machine and fires again.
+  it('LRU-caps per-conversation states at 8 entries (oldest evicted, fresh machine on return)', async () => {
+    startLogCapture();
+    const ctx = makeCompactionContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const call = (tag: string, extraTurns = 0) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        bigHistory(extraTurns, tag),
+        { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        new vscode.CancellationTokenSource().token,
+      );
+
+    const tags = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c8', 'c9'];
+    for (const tag of tags) {
+      await call(tag);
+    }
+    assert.equal(apiChatCalls.length, 9, 'each of the 9 conversations fired once');
+
+    // c9's set evicted c1 (LRU-oldest). c1 returns grown → fresh state,
+    // no cooldown → fires again (with the cap this is the DESIRED
+    // bounded-memory behavior; without the cap c1's projection would
+    // have survived and no 10th fire would happen).
+    await call('c1', 4);
+    assert.equal(apiChatCalls.length, 10, 'c1 was LRU-evicted — fresh machine fires again');
+    const body = dispatchedBody(chatCalls.length - 1);
+    assert.ok(body.includes('[compacted-turns'), 'c1 re-fire serves a fresh checkpoint');
+    assert.ok(!body.includes('c101'), 'c1 evicted prefix stays evicted by the fresh fire');
   });
 });

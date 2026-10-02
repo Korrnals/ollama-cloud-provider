@@ -80,7 +80,7 @@ import {
   resolveRawResendCap,
   resolveVisionHistoryMode,
 } from './visionHistory.js';
-import { executeTwoPhaseVision } from './visionTwoPhase.js';
+import { executeTwoPhaseVision, sha256ShortHex } from './visionTwoPhase.js';
 import type {
   NativeChatMessage,
   NativeChatTool,
@@ -89,7 +89,7 @@ import type {
   UsageInfo,
 } from './protocolTypes.js';
 import { filterContext, type ContextFilterLevel } from './contextFilter.js';
-import { compactIfNeeded, type CompactionState } from './compaction.js';
+import { compactIfNeeded, fingerprintText, type CompactionState } from './compaction.js';
 import { CompactionStore } from './compactionStore.js';
 import { createSummarizer } from './compactionSummarizer.js';
 
@@ -493,14 +493,46 @@ export class OllamaCloudChatProvider
   private readonly charsPerTokenEMA = new Map<string, number>();
   private static readonly CHARS_PER_TOKEN_DEFAULT = 4;
   /**
-   * v0.13.0 Slice 2 — per-conversation compaction hysteresis state,
-   * keyed by model id (per-model windows differ; spec:
-   * docs/compaction-spec.md § Slice 2). Constructor-created.
+   * v0.13.0 Slice 2 — per-conversation compaction hysteresis state
+   * (per-model windows differ; spec: docs/compaction-spec.md § Slice 2).
+   * Constructor-created.
    * v0.21.0 (slice d1) — the state is generic in the message type
    * because it now carries the remembered compaction projection
    * (stickiness); OpenAI-format messages here.
+   * v0.22.0 (v0220-cc, D-1 review P2) — keyed by CONVERSATION, not
+   * bare model id: two windows alternating the same model used to
+   * clobber each other's state (each request re-keyed the same slot,
+   * resetting the other window's projection + summary chain and
+   * degenerating to the pre-d1 cadence with orphaned store blocks).
+   * The key is `${modelId}::${conversationFingerprint}` — see
+   * {@link conversationKey}. Accessed ONLY through the LRU accessors
+   * {@link getCompactionState} / {@link setCompactionState} so stale
+   * conversations are garbage-collected (cap
+   * {@link COMPACTION_STATES_MAX}).
    */
   private readonly compactionStates = new Map<string, CompactionState<OpenAICompatibleMessage>>();
+  /** v0220-cc P2 — conversation fingerprint: how many leading raw messages identify a conversation (K). */
+  private static readonly CONVERSATION_KEY_PREFIX = 4;
+  /** v0220-cc P2 — LRU cap on remembered per-conversation states (bounded memory). */
+  private static readonly COMPACTION_STATES_MAX = 8;
+  /**
+   * v0220-cc P3-b — per-message WIRE render memo (JSON.stringify).
+   * One compaction check renders the same message objects 2-3×
+   * (raw usage estimate, re-apply estimate over head+summary+tail,
+   * evicted-block text, assembled-result estimate) — on multi-MB
+   * vision histories that is 2-3 full-history stringify passes per
+   * request. WeakMap keyed on the message OBJECT: entries die with
+   * the message (VS Code re-sends fresh objects each turn, so the map
+   * never grows stale); within one request the shared references hit
+   * the memo. Accessed via {@link memoizedWireRender}.
+   */
+  private readonly wireRenderMemo = new WeakMap<object, string>();
+  /**
+   * v0220-cc P3-b — per-message BASIS render memo (canonical form),
+   * same rationale as {@link wireRenderMemo}. Accessed via
+   * {@link memoizedBasisRender}.
+   */
+  private readonly basisRenderMemo = new WeakMap<object, string>();
   /**
    * v0.12.1 — tracks model ids for which the context-inflation warning
    * has already fired this session. Prevents spamming the user on every
@@ -2034,6 +2066,164 @@ export class OllamaCloudChatProvider
   }
 
   /**
+   * v0.22.0 (v0220-cc, QA-audit P2) — recognizes the three in-band
+   * image markers emitted by `visionHistory.ts` (`MARKER_TEMPLATE`,
+   * `degradedImageMarker`, `neverSentImageMarker`): all open with
+   * `[Image <16-hex hash> — `; the never-sent variant appends an
+   * attempts note after the closing bracket. Captures the hash so
+   * {@link renderCompactionBasis} can canonicalize a marker back to
+   * the identity of the image it replaced.
+   */
+  private static readonly IMAGE_MARKER_RE =
+    /\[Image ([0-9a-f]{16}) — [^\]]*\](?: \[image never successfully sent — \d+ attempts failed\])?/g;
+
+  /**
+   * v0.22.0 (v0220-cc, QA-audit P2) — vision-state-INDEPENDENT render
+   * of an OpenAI-format message, used ONLY as the projection-basis
+   * fingerprint render (`compactIfNeeded`'s `basisRender`).
+   *
+   * Why: vision-state transitions (raw→marker on the v0.20.1 commit,
+   * raw→never-sent-marker on the D-3 cap) rewrite a message INSIDE the
+   * d1 prefix basis. A basis fingerprinted over the WIRE render
+   * (`JSON.stringify`, raw base64 vs ~100-char marker) flips on the
+   * very next turn → projection dropped → one-turn full-history
+   * whiplash + cooldown-gated re-fire (self-healing but real).
+   *
+   * Canonical form per message — `user␂<text>␂<sorted hashes>`:
+   *   - text: the concatenated text of the message with every image
+   *     marker STRIPPED (markers are state, not content);
+   *   - hashes: the sorted set of image identities — the 16-hex sha
+   *     extracted from markers, or recomputed from a raw
+   *     `data:…;base64,` URL (`sha256ShortHex` over the decoded bytes
+   *     — byte-identical to the hash the vision lifecycle computed on
+   *     the raw part, so the SAME image yields the SAME identity in
+   *     raw and marker form). Sorted because the raw form separates
+   *     text/image parts while the marker form concatenates them,
+   *     losing the interleave order — ordering of image identities
+   *     themselves is preserved by sorting deterministically.
+   * Non-user messages never change render across vision states (the
+   * lifecycle rewrites user messages only) — the wire render is
+   * already stable for them. The WIRE render is untouched: estimates,
+   * store payloads and summarizer prompts keep seeing raw/markers
+   * exactly as before.
+   */
+  private renderCompactionBasis(m: OpenAICompatibleMessage): string {
+    const hashFromDataUrl = (url: string): string => {
+      // Mirror visionHistory's empty-data sentinel so a zero-byte
+      // image canonicalizes identically in raw and marker form.
+      const prefix = 'data:';
+      const sep = ';base64,';
+      const at = url.indexOf(sep);
+      if (!url.startsWith(prefix) || at < 0) {
+        return url; // non-data URL: opaque but stable (never rewritten)
+      }
+      const b64 = url.slice(at + sep.length);
+      if (b64.length === 0) return 'no-image';
+      return sha256ShortHex(Buffer.from(b64, 'base64'));
+    };
+    if (m.role !== 'user') return JSON.stringify(m);
+    let text = '';
+    const hashes: string[] = [];
+    const stripMarkers = (s: string): string =>
+      s.replace(OllamaCloudChatProvider.IMAGE_MARKER_RE, (_, hash: string) => {
+        hashes.push(hash);
+        return '';
+      });
+    const content = m.content;
+    if (typeof content === 'string') {
+      text = stripMarkers(content);
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === 'text') {
+          text += stripMarkers(part.text);
+        } else if (part.type === 'image_url') {
+          hashes.push(hashFromDataUrl(part.image_url.url));
+        }
+      }
+    }
+    hashes.sort();
+    return `user\u0002${JSON.stringify(text)}\u0002${hashes.join(',')}`;
+  }
+
+  /**
+   * v0.22.0 (v0220-cc, D-1 review P2) — stable per-CONVERSATION key for
+   * the compaction state map: `${modelId}::<fingerprint of the first K
+   * raw messages>`. The fingerprint runs over the vision-state-
+   * INDEPENDENT canonical form ({@link renderCompactionBasis}) — an
+   * image committing to a marker inside the first K messages must not
+   * re-key the conversation (that would reproduce the exact state-loss
+   * bug this key exists to fix). Conversation identity lives in the
+   * immutable head VS Code re-sends every turn; tail growth never
+   * changes the key. Degenerate histories (fewer than K messages, even
+   * empty) fingerprint over whatever exists — two brand-new
+   * conversations share a slot only until their first request
+   * differentiates the head (and an empty history no-ops compaction
+   * anyway).
+   */
+  private conversationKey(modelId: string, openaiMessages: readonly OpenAICompatibleMessage[]): string {
+    const k = Math.min(
+      OllamaCloudChatProvider.CONVERSATION_KEY_PREFIX,
+      openaiMessages.length,
+    );
+    let joined = '';
+    for (let i = 0; i < k; i++) {
+      joined += this.memoizedBasisRender(openaiMessages[i]!) + '\u0001';
+    }
+    return `${modelId}::${fingerprintText(joined)}`;
+  }
+
+  /**
+   * v0220-cc P2 — LRU get for {@link compactionStates}: a hit refreshes
+   * the entry's recency (Map iteration order = insertion order; delete
+   * + re-insert moves it to the newest end).
+   */
+  private getCompactionState(key: string): CompactionState<OpenAICompatibleMessage> | undefined {
+    const hit = this.compactionStates.get(key);
+    if (hit !== undefined) {
+      this.compactionStates.delete(key);
+      this.compactionStates.set(key, hit);
+    }
+    return hit;
+  }
+
+  /**
+   * v0220-cc P2 — LRU set for {@link compactionStates}: writes the
+   * entry as newest, then evicts the oldest entries beyond
+   * {@link COMPACTION_STATES_MAX} so abandoned conversations (closed
+   * windows) garbage-collect instead of accumulating projection +
+   * chain state forever.
+   */
+  private setCompactionState(key: string, state: CompactionState<OpenAICompatibleMessage>): void {
+    this.compactionStates.delete(key);
+    this.compactionStates.set(key, state);
+    while (this.compactionStates.size > OllamaCloudChatProvider.COMPACTION_STATES_MAX) {
+      const oldest = this.compactionStates.keys().next().value;
+      if (oldest === undefined) break;
+      this.compactionStates.delete(oldest);
+    }
+  }
+
+  /** v0220-cc P3-b — memoized wire render (see {@link wireRenderMemo}). */
+  private memoizedWireRender(m: OpenAICompatibleMessage): string {
+    let s = this.wireRenderMemo.get(m);
+    if (s === undefined) {
+      s = JSON.stringify(m);
+      this.wireRenderMemo.set(m, s);
+    }
+    return s;
+  }
+
+  /** v0220-cc P3-b — memoized basis render (see {@link basisRenderMemo}). */
+  private memoizedBasisRender(m: OpenAICompatibleMessage): string {
+    let s = this.basisRenderMemo.get(m);
+    if (s === undefined) {
+      s = this.renderCompactionBasis(m);
+      this.basisRenderMemo.set(m, s);
+    }
+    return s;
+  }
+
+  /**
    * v0.13.0 Slice 2 — runs one compaction check over the OpenAI-format
    * history when `ollamaCloud.compaction.enabled` is on (default ON
    * since v0.19.0, ArchCom 2026-09-15 T2). Returns the messages to
@@ -2098,8 +2288,13 @@ export class OllamaCloudChatProvider
       return openaiMessages;
     }
     try {
+      // v0220-cc P2 — per-CONVERSATION state: two windows alternating
+      // the same model must not clobber each other's projection and
+      // summary chain. The key fingerprints the conversation head
+      // (vision-state-independent, so image commits keep the key).
+      const convKey = this.conversationKey(modelId, openaiMessages);
       const state: CompactionState<OpenAICompatibleMessage> =
-        this.compactionStates.get(modelId) ?? {
+        this.getCompactionState(convKey) ?? {
           armed: true,
           lastSummary: null,
           lastPointer: null,
@@ -2123,7 +2318,11 @@ export class OllamaCloudChatProvider
       const summarizerWindowTokens = this.modelCatalog
         .list()
         .find((m) => m.apiModel === summarizerModel)?.maxInputTokens;
-      const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(JSON.stringify(m).length / charsPerToken), 0);
+      // v0220-cc P3-b — computed through the memoized wire render so
+      // the check line shares the per-message stringify with the
+      // compactIfNeeded estimates instead of adding one more
+      // full-history pass.
+      const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(this.memoizedWireRender(m).length / charsPerToken), 0);
       const hadProjection = state.projection != null;
       const result = await compactIfNeeded<OpenAICompatibleMessage>({
         messages: openaiMessages,
@@ -2132,7 +2331,13 @@ export class OllamaCloudChatProvider
         state,
         summarize: summarizer,
         store,
-        render: (m) => JSON.stringify(m),
+        render: (m) => this.memoizedWireRender(m),
+        // v0220-cc P2 — basis fingerprints are computed over the
+        // vision-state-INDEPENDENT canonical form so a raw→marker
+        // transition inside the evicted prefix cannot drop the
+        // projection (whiplash). The wire render above is unchanged.
+        // v0220-cc P3-b — both renders memoized per message object.
+        basisRender: (m) => this.memoizedBasisRender(m),
         ...(summarizerWindowTokens !== undefined
           ? { summarizerWindowTokens }
           : {}),
@@ -2141,15 +2346,23 @@ export class OllamaCloudChatProvider
       // fires: passthrough results now carry meaningful transitions
       // (projection invalidation resets, re-arm re-evaluations on the
       // re-applied usage) that must survive to the next request.
-      this.compactionStates.set(modelId, result.state);
+      // v0220-cc P2 — persisted under the conversation key (LRU).
+      this.setCompactionState(convKey, result.state);
       // P3-b (d1 rider) — per-request check line at INFO level. The
       // old line was logger.debug and invisible in the field with
       // debug=false; every number is already computed, so one cheap
       // line per request buys the RCA data the 2026-10-02 incident
       // lacked. `reapply` distinguishes "projection remembered and
       // re-applied" (true/false) from "no projection in play" (n/a).
+      // v0220-cc P2 — `conv` carries the conversation-key fingerprint
+      // so interleaved windows are tellable apart in field logs.
+      // v0220-cc P3-a — the token number is renamed `rawUsedTokens=`:
+      // it is the estimate over the RAW incoming history, while the
+      // fire/re-apply gate inside compactIfNeeded operates on the
+      // PROJECTED (re-applied) usage — the old `usedTokens=` label
+      // invited reading it as the gate's number (D-1 review P3).
       logger.info(
-        `Compaction check: usedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'}`,
+        `Compaction check: rawUsedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'} conv=${convKey.split('::')[1] ?? '?'}`,
       );
       if (result.reapply) {
         // d1 stickiness observability — distinct from the fire line so
@@ -2184,15 +2397,17 @@ export class OllamaCloudChatProvider
       // renderer in the chat transcript, so it never becomes assistant
       // text. The durable human-readable record stays the
       // `Compaction: before=… after=…` INFO line above.
+      // v0220-cc P3-d — built via the static `LanguageModelDataPart.json`
+      // factory (present in @types/vscode 1.118 and the test stub):
+      // same bytes as the hand-rolled TextEncoder payload, minus the
+      // hand-rolling.
       progress.report(
-        new vscode.LanguageModelDataPart(
-          new TextEncoder().encode(
-            JSON.stringify({
-              notice: 'context-compacted',
-              beforeTokens: stats?.beforeTokens ?? null,
-              afterTokens: stats?.afterTokens ?? null,
-            }),
-          ),
+        vscode.LanguageModelDataPart.json(
+          {
+            notice: 'context-compacted',
+            beforeTokens: stats?.beforeTokens ?? null,
+            afterTokens: stats?.afterTokens ?? null,
+          },
           'application/json',
         ),
       );
