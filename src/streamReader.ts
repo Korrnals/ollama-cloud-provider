@@ -389,7 +389,14 @@ export async function readStream(
         //      content already streamed to the user; an honest error
         //      is the only non-duplicating outcome (silent retry would
         //      duplicate visible text; a quiet onDone would silently
-        //      truncate shown content).
+        //      truncate shown content — the already-shown fragment
+        //      would read as the complete answer with no signal it was
+        //      cut short). This deliberately includes USER-initiated
+        //      cancels landing after the flush: the asymmetry vs
+        //      branch 2 is the point — before the flush nothing
+        //      user-visible existed, so a quiet onDone is honest;
+        //      after it, only the honest error says "incomplete"
+        //      without duplicating anything.
         //   2. cancelled + window open → QUIET COMPLETION (onDone) —
         //      a cancellation with nothing shown must look to VS Code
         //      like a clean cancel, never like a provider failure.
