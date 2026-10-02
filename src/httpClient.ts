@@ -240,6 +240,22 @@ function proxyAuthorizationHeader(parsedProxy: URL): Record<string, string> {
 }
 
 /**
+ * Sec F2 (task v0221-p3) — the proxy port defaults by the PROXY URL's
+ * own protocol, never by the target's scheme: `http://` → 80,
+ * `https://` → 443; an explicit port is always honored. The CONNECT
+ * path used to hardcode 443, so a port-less `http://` proxy connected
+ * (and sent `Proxy-Authorization`) to whatever happens to listen on
+ * :443 instead of the proxy's own :80 listener. Both proxy transport
+ * paths share this so the defaults stay consistent.
+ */
+function proxyPortOrDefault(parsedProxy: URL): number {
+  if (parsedProxy.port !== '') {
+    return Number(parsedProxy.port);
+  }
+  return parsedProxy.protocol === 'https:' ? 443 : 80;
+}
+
+/**
  * HTTP target via HTTP proxy — the proxy receives the request with the
  * FULL absolute URL in the request line (RFC 7230 §5.3.2). No tunnel
  * is needed because the payload is plaintext to the proxy.
@@ -252,7 +268,7 @@ function requestViaHttpProxy(
   const parsedTarget = new URL(url);
   const parsedProxy = new URL(proxyUrl);
   const proxyHost = parsedProxy.hostname;
-  const proxyPort = parsedProxy.port || '80';
+  const proxyPort = proxyPortOrDefault(parsedProxy);
 
   return new Promise<HttpResponse>((resolve, reject) => {
     // Assigned by `wireRequestLifecycle` below (the req must exist
@@ -265,7 +281,7 @@ function requestViaHttpProxy(
     const req = http.request(
       {
         host: proxyHost,
-        port: Number(proxyPort),
+        port: proxyPort,
         method: options.method ?? 'GET',
         path: url,
         headers: { ...options.headers, ...proxyAuthorizationHeader(parsedProxy) },
@@ -299,7 +315,9 @@ function requestViaTlsConnectTunnel(
   const parsedTarget = new URL(url);
   const parsedProxy = new URL(proxyUrl);
   const proxyHost = parsedProxy.hostname;
-  const proxyPort = Number(parsedProxy.port || 443);
+  // Sec F2 (task v0221-p3): default by the PROXY's protocol, not the
+  // target's — a port-less `http://` proxy must be reached on :80.
+  const proxyPort = proxyPortOrDefault(parsedProxy);
   const targetHost = parsedTarget.hostname;
   const targetPort = parsedTarget.port || 443;
 
