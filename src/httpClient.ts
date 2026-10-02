@@ -53,6 +53,7 @@
 import * as http from 'node:http';
 import * as https from 'node:https';
 import * as net from 'node:net';
+import * as tls from 'node:tls';
 import { Readable } from 'node:stream';
 import type { Readable as NodeReadable } from 'node:stream';
 import * as vscode from 'vscode';
@@ -222,6 +223,23 @@ function requestDirect(
 }
 
 /**
+ * P3-2 (task v0220-s rework): maps proxy userinfo (`user:pass@` in the
+ * `http.proxy` URL) to a `Proxy-Authorization: Basic ...` header. Both
+ * proxy transport paths share it; authenticated proxies answer 407
+ * without it. The header value is credential material — it is never
+ * logged and never surfaced in error messages.
+ */
+function proxyAuthorizationHeader(parsedProxy: URL): Record<string, string> {
+  if (parsedProxy.username === '' && parsedProxy.password === '') {
+    return {};
+  }
+  const user = decodeURIComponent(parsedProxy.username);
+  const password = decodeURIComponent(parsedProxy.password);
+  const token = Buffer.from(`${user}:${password}`).toString('base64');
+  return { 'Proxy-Authorization': `Basic ${token}` };
+}
+
+/**
  * HTTP target via HTTP proxy — the proxy receives the request with the
  * FULL absolute URL in the request line (RFC 7230 §5.3.2). No tunnel
  * is needed because the payload is plaintext to the proxy.
@@ -241,14 +259,16 @@ function requestViaHttpProxy(
     // first). The response callback marks the lifecycle BEFORE
     // resolving — see `wireRequestLifecycle` for why.
     let markResponseReceived: (res: http.IncomingMessage) => void = () => undefined;
-    // Absolute-URI form: the proxy forwards to the target.
+    // Absolute-URI form: the proxy forwards to the target. P3-2:
+    // proxy credentials from the userinfo ride along as
+    // Proxy-Authorization, same as the CONNECT tunnel path.
     const req = http.request(
       {
         host: proxyHost,
         port: Number(proxyPort),
         method: options.method ?? 'GET',
         path: url,
-        headers: options.headers,
+        headers: { ...options.headers, ...proxyAuthorizationHeader(parsedProxy) },
       },
       (res) => {
         markResponseReceived(res);
@@ -285,6 +305,9 @@ function requestViaTlsConnectTunnel(
 
   const connectHeaders = {
     Host: `${targetHost}:${targetPort}`,
+    // P3-2 (rework): proxy credentials from the userinfo of the
+    // configured proxy URL — authenticated proxies 407 without it.
+    ...proxyAuthorizationHeader(parsedProxy),
   };
 
   return new Promise<HttpResponse>((resolve, reject) => {
@@ -317,6 +340,10 @@ function requestViaTlsConnectTunnel(
       headers: connectHeaders,
     });
     connectReq.on('connect', (connectRes, socket, head) => {
+      // P3-1 (rework): mark the lifecycle FIRST, on EVERY response
+      // status — the response DID arrive; a teardown error racing the
+      // rejection below must not add a spurious WARN on top.
+      markConnectResponseReceived(connectRes);
       if (connectRes.statusCode !== 200) {
         connectRes.resume();
         // The socket is detached to us the moment 'connect' fires —
@@ -329,36 +356,58 @@ function requestViaTlsConnectTunnel(
         );
         return;
       }
-      // Tell the CONNECT lifecycle the tunnel was established — same
-      // invariant as the two sibling transport paths (mark BEFORE
-      // anything settles): teardown errors on the CONNECT request
-      // after this point are classified as artifacts (debug only, no
-      // WARN) instead of request failures.
-      markConnectResponseReceived(connectRes);
       // Bytes the proxy sent between the 200 head and our handler
       // belong to the tunnelled protocol — put them back.
       if (head.length > 0) {
         socket.unshift(head);
       }
-      // Upgrade the raw socket to TLS and issue the real request.
-      const tlsOptions: https.RequestOptions = {
-        method: options.method ?? 'GET',
-        headers: options.headers,
-        agent: false,
-        createConnection: () => socket,
-      };
-      // Test seam (same pattern as OLLAMA_HTTP_TEST_DELEGATE in
-      // httpRequest): the tunnel integration test targets a local
-      // self-signed HTTPS server, and NODE_EXTRA_CA_CERTS cannot be
-      // used there (Node reads it during process bootstrap, before any
-      // test code runs). Production never sets this var — certificate
-      // verification stays fully on.
-      if (process.env.OLLAMA_HTTP_TEST_TLS_INSECURE === '1') {
-        tlsOptions.rejectUnauthorized = false;
-      }
+      // P1 (rework): upgrade the TUNNELLED socket itself. The previous
+      // `https.request(url, { agent: false, createConnection: ... })`
+      // wiring never used the tunnel: with `agent: false` Node
+      // instantiates a one-off Agent and IGNORES options.createConnection
+      // (createConnection applies only when the agent option is
+      // absent), so the TLS request connected DIRECTLY to the target —
+      // silently bypassing the user's proxy and leaking the CONNECT
+      // socket. Build the TLS layer explicitly over the tunnel socket
+      // and hand THAT socket to https.request with NO agent option
+      // (Connection: close, no pooling — same no-pooling contract).
+      //
+      // Test seam (hardened per rework P3-3): requires BOTH test sims —
+      // the loader-set OLLAMA_HTTP_TEST_DELEGATE must be present AND
+      // the explicit insecure opt-in — so a stray TLS_INSECURE in
+      // production (where DELEGATE is never set) cannot disable
+      // certificate verification. The DELEGATE check is intentionally
+      // `!== undefined` rather than `=== '1'`: the tunnel tests run
+      // the native transport with DELEGATE='0' (delegation off), so an
+      // equality check would make the seam unreachable from the only
+      // tests that can exercise the tunnel.
+      const insecureTestTransport =
+        process.env.OLLAMA_HTTP_TEST_TLS_INSECURE === '1' &&
+        process.env.OLLAMA_HTTP_TEST_DELEGATE !== undefined;
+      const tlsSocket = tls.connect({
+        socket,
+        // SNI/hostname verification against the URL host; SNI is
+        // invalid for literal IPs, so pass it only for names.
+        ...(net.isIP(targetHost) ? {} : { servername: targetHost }),
+        ...(insecureTestTransport ? { rejectUnauthorized: false } : {}),
+      });
+      // Handshake failure (bad cert, proxy error page, RST): destroy
+      // the tunnel socket and reject BEFORE the request layer settles.
+      // Attached synchronously — ahead of the async handshake.
+      tlsSocket.on('error', (err) => {
+        socket.destroy();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
       const tlsReq = https.request(
         url,
-        tlsOptions,
+        {
+          method: options.method ?? 'GET',
+          headers: options.headers,
+          // NO `agent` option here: only then does ClientRequest honor
+          // createConnection — the request rides the tunnelled TLS
+          // socket instead of opening a direct connection.
+          createConnection: () => tlsSocket,
+        },
         (res) => {
           markResponseReceived(res);
           resolve(buildResponse(res, parsedTarget));

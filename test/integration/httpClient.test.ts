@@ -265,42 +265,58 @@ describe('httpClient — nodeReadableToWebReadable', () => {
 });
 
 /**
- * Security audit P3 (task v0220-s) — TLS-CONNECT tunnel lifecycle.
+ * Security audit P3 + review rework (task v0220-s) — TLS-CONNECT tunnel.
  *
  * `requestViaTlsConnectTunnel` runs TWO wired lifecycles: the CONNECT
  * request and the TLS request issued over the tunnelled socket. The
- * CONNECT marker used to be discarded, so its lifecycle never learned
- * the tunnel was established — a mid-stream abort through an HTTP
- * proxy then logged a spurious "httpClient: request to <host> failed"
- * WARN for an already-succeeded CONNECT.
+ * CONNECT marker used to be discarded (spurious WARN on mid-stream
+ * abort), and the response-callback form never fired at all (Node
+ * delivers CONNECT responses only via the 'connect' event).
  *
- * While pinning the audit item a deeper routing defect surfaced: Node
- * delivers a CONNECT response ONLY via the 'connect' event (the old
- * response-callback body — TLS upgrade and non-200 reject — never
- * ran, so the tunnel hung until the caller aborted, producing exactly
- * the audit's WARN). These tests exercise a REAL tunnel end-to-end:
- * a local HTTP proxy answers CONNECT and pipes raw TCP to a local
- * HTTPS target. The target uses the committed self-signed fixture
- * cert; the tunnel's TLS leg trusts it via the
- * OLLAMA_HTTP_TEST_TLS_INSECURE test seam (NODE_EXTRA_CA_CERTS cannot
- * be used — Node reads it during process bootstrap, before any test
- * code runs).
+ * Rework hardening (all pinned here):
+ *   - P1: the TLS leg MUST ride the tunnelled socket. Topology: the
+ *     HTTPS target listens ONLY on 127.0.0.2 while the request URL
+ *     says `localhost` (= 127.0.0.1) — a direct connection (the
+ *     defect: `agent: false` silently ignores createConnection)
+ *     cannot reach the target. The proxy counts bytes piped
+ *     client→upstream after CONNECT; the tests assert the tunnel
+ *     actually carries traffic.
+ *   - P3-2: the proxy ENFORCES Proxy-Authorization (credentials from
+ *     the userinfo of the configured proxy URL) on CONNECT — without
+ *     it the proxy answers 407.
+ *   - P3-1: the non-200 branch marks the CONNECT lifecycle BEFORE
+ *     rejecting, so the 407 path surfaces no spurious WARN.
+ *   - P3-3: the OLLAMA_HTTP_TEST_TLS_INSECURE seam requires the
+ *     loader-set DELEGATE var to be present as well; here DELEGATE is
+ *     '0' (native transport) — defined, not '1'. NODE_EXTRA_CA_CERTS
+ *     cannot replace the seam (Node reads it during bootstrap).
  */
-describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
+describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3 + rework)', () => {
+  const PROXY_USER = 'ocp-test';
+  const PROXY_PASS = 'proxy-pass';
+  const EXPECTED_PROXY_AUTH = `Basic ${Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString('base64')}`;
+
   let proxy: http.Server;
   let proxyUrl: string;
+  let plainProxy: http.Server;
+  let plainProxyUrl: string;
   let target: https.Server;
   let targetPort: number;
   let savedDelegate: string | undefined;
   let savedTlsInsecure: string | undefined;
+  // Per-test tunnel observability: bytes piped client→upstream after
+  // CONNECT 200 (P1 regression pin) and the CONNECT request count.
+  const tunnelState = { bytesToUpstream: 0, connectCount: 0 };
 
   before(async () => {
-    // Native node:http/node:https transport — disable the test
-    // delegation env var (same as the direct-transport suite above).
+    // Native node:http/node:https transport with the delegation var
+    // DEFINED but off ('0'): delegation must be off for the request to
+    // reach the native path, while its presence is one of the two sims
+    // the hardened TLS test seam requires (rework P3-3 — a stray
+    // TLS_INSECURE var alone can never disable certificate
+    // verification in production, where DELEGATE is never set).
     savedDelegate = process.env.OLLAMA_HTTP_TEST_DELEGATE;
-    delete process.env.OLLAMA_HTTP_TEST_DELEGATE;
-    // Trust the self-signed fixture cert for the tunnel's TLS leg
-    // (test seam — see src/httpClient.ts).
+    process.env.OLLAMA_HTTP_TEST_DELEGATE = '0';
     savedTlsInsecure = process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
     process.env.OLLAMA_HTTP_TEST_TLS_INSECURE = '1';
 
@@ -324,17 +340,36 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
         res.end('not found');
       },
     );
-    await new Promise<void>((resolve) => target.listen(0, '127.0.0.1', resolve));
+    // ONLY via 127.0.0.2: the direct path (localhost = 127.0.0.1)
+    // cannot reach this server — any wiring that bypasses the proxy
+    // fails loudly.
+    await new Promise<void>((resolve) => target.listen(0, '127.0.0.2', resolve));
     targetPort = (target.address() as AddressInfo).port;
 
     proxy = http.createServer();
     proxy.on('connect', (req, clientSocket, head) => {
+      tunnelState.connectCount += 1;
+      const auth = req.headers['proxy-authorization'];
+      const authHeader = Array.isArray(auth) ? auth.join(',') : auth;
+      if (authHeader !== EXPECTED_PROXY_AUTH) {
+        // P3-2 enforcement: no/incorrect proxy credentials → 407.
+        clientSocket.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\n');
+        return;
+      }
+      // Rewrite to the true target address (the URL says localhost,
+      // the server lives on 127.0.0.2 — only the proxy can reach it).
       const [host, portStr] = (req.url ?? '').split(':');
-      const upstream = net.connect(Number(portStr), host, () => {
+      const upstream = net.connect(Number(portStr), host === 'localhost' ? '127.0.0.2' : host, () => {
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
         if (head.length > 0) {
+          tunnelState.bytesToUpstream += head.length;
           upstream.write(head);
         }
+        // P1 byte counter: everything the client sends through the
+        // tunnel after establishment (TLS ClientHello, records).
+        clientSocket.on('data', (chunk: Buffer) => {
+          tunnelState.bytesToUpstream += chunk.length;
+        });
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
       });
@@ -344,16 +379,39 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
       };
       upstream.on('error', kill);
       clientSocket.on('error', kill);
+      clientSocket.on('close', () => upstream.destroy());
     });
     await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
-    proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+    proxyUrl = `http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${(proxy.address() as AddressInfo).port}`;
+
+    // Plain-HTTP proxy path (P3-2): requires Proxy-Authorization on the
+    // absolute-URI request. No forwarding needed — the pin is that the
+    // client sends the header.
+    plainProxy = http.createServer((req, res) => {
+      const auth = req.headers['proxy-authorization'];
+      const authHeader = Array.isArray(auth) ? auth.join(',') : auth;
+      if (authHeader !== EXPECTED_PROXY_AUTH) {
+        res.writeHead(407);
+        res.end('proxy auth required');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('plain-proxy-ok');
+    });
+    await new Promise<void>((resolve) => plainProxy.listen(0, '127.0.0.1', resolve));
+    plainProxyUrl = `http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${(plainProxy.address() as AddressInfo).port}`;
+  });
+
+  beforeEach(() => {
+    tunnelState.bytesToUpstream = 0;
+    tunnelState.connectCount = 0;
   });
 
   after(() => {
     // Restore process-global state SYNCHRONOUSLY first — never gate
     // the env restore behind an awaited server close (a lingering
-    // tunnel socket would stall the hook and leak the deleted env var
-    // into every later suite in this mocha process).
+    // tunnel socket would stall the hook and leak the env var into
+    // every later suite in this mocha process).
     if (savedDelegate !== undefined) {
       process.env.OLLAMA_HTTP_TEST_DELEGATE = savedDelegate;
     } else {
@@ -368,22 +426,32 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
     void proxy.close();
     target.closeAllConnections?.();
     void target.close();
+    plainProxy.closeAllConnections?.();
+    void plainProxy.close();
   });
 
   afterEach(() => {
     restoreHttpProxyConfig();
   });
 
-  it('request through an established tunnel succeeds end-to-end (CONNECT routed via the connect event)', async function () {
-    this.timeout(4000); // pre-fix this hung forever — fail fast, not at the suite timeout
+  it('request rides the tunnel end-to-end: proxy-carried bytes > 0, target unreachable directly', async function () {
+    this.timeout(4000);
     setHttpProxyConfig(proxyUrl);
 
     const res = await httpRequest(`https://localhost:${targetPort}/tunnel-echo`);
     assert.equal(res.status, 200, 'the tunnelled HTTPS request must resolve');
     assert.equal(await res.text(), 'tunnel-ok');
+    // P1 regression pin: the TLS leg went THROUGH the proxy. The
+    // direct-bypass wiring fails here twice — the request cannot reach
+    // the 127.0.0.2-only target, and the counter stays at 0.
+    assert.ok(
+      tunnelState.bytesToUpstream > 0,
+      `the tunnel must carry traffic (client→upstream bytes after CONNECT), got ${tunnelState.bytesToUpstream}`,
+    );
+    assert.equal(tunnelState.connectCount, 1, 'exactly one CONNECT');
   });
 
-  it('mid-stream abort through an established tunnel: tagged AbortError on the reader, ZERO "request failed" WARNs', async function () {
+  it('mid-stream abort on the REAL tunnel topology: tagged AbortError, ZERO WARNs, proxy traffic goes quiet', async function () {
     this.timeout(4000);
     setHttpProxyConfig(proxyUrl);
 
@@ -395,6 +463,8 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
     const reader = res.body.getReader();
     const first = await reader.read();
     assert.ok(!first.done && first.value, 'first chunk must arrive through the tunnel');
+    const bytesAtAbort = tunnelState.bytesToUpstream;
+    assert.ok(bytesAtAbort > 0, 'traffic flowed through the proxy before the abort');
 
     controller.abort();
 
@@ -413,11 +483,18 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
       },
     );
 
+    // The proxy stops seeing traffic: the tunnel was torn down.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(
+      tunnelState.bytesToUpstream,
+      bytesAtAbort,
+      'no further client→upstream bytes after the abort',
+    );
+
     // The audit P3 pin: after the abort settles, NO
     // "request to localhost failed" WARN — the TLS leg is
     // post-response (teardown artifact, debug only) and the CONNECT
     // leg was marked established by the fix.
-    await new Promise((resolve) => setTimeout(resolve, 50));
     const recent = logger.getRecentErrors().slice(before).join('\n');
     const warnCount = recent.split('request to localhost failed').length - 1;
     assert.equal(
@@ -425,5 +502,40 @@ describe('httpClient — TLS-CONNECT tunnel via HTTP proxy (audit P3)', () => {
       0,
       `no WARN may fire for an established tunnel abort; recent errors:\n${recent}`,
     );
+  });
+
+  it('CONNECT without proxy credentials → 407 rejection naming the status, no spurious WARN (P3-2 + P3-1)', async function () {
+    this.timeout(4000);
+    // Same proxy, credentials stripped from the URL.
+    setHttpProxyConfig(proxyUrl.replace(`${PROXY_USER}:${PROXY_PASS}@`, ''));
+
+    const before = logger.getRecentErrors().length;
+    await assert.rejects(
+      httpRequest(`https://localhost:${targetPort}/tunnel-echo`),
+      (err: unknown) => {
+        assert.match(
+          (err as Error).message,
+          /CONNECT failed with 407/,
+          'the rejection must name the proxy status',
+        );
+        return true;
+      },
+    );
+    assert.equal(tunnelState.connectCount, 1, 'the CONNECT was attempted once');
+    // P3-1: the lifecycle was marked BEFORE the rejection — the
+    // teardown racing the 407 must not produce a WARN.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const recent = logger.getRecentErrors().slice(before).join('\n');
+    const warnCount = recent.split('request to localhost failed').length - 1;
+    assert.equal(warnCount, 0, `no WARN on the 407 rejection path; recent:\n${recent}`);
+  });
+
+  it('plain-HTTP proxy path sends Proxy-Authorization from the proxy URL userinfo (P3-2)', async function () {
+    this.timeout(4000);
+    setHttpProxyConfig(plainProxyUrl);
+
+    const res = await httpRequest(`http://localhost:${(plainProxy.address() as AddressInfo).port}/some-path`);
+    assert.equal(res.status, 200, 'the auth-enforcing plain proxy must accept the request');
+    assert.equal(await res.text(), 'plain-proxy-ok');
   });
 });
