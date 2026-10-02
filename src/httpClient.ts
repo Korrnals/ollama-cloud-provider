@@ -247,6 +247,13 @@ function proxyAuthorizationHeader(parsedProxy: URL): Record<string, string> {
  * (and sent `Proxy-Authorization`) to whatever happens to listen on
  * :443 instead of the proxy's own :80 listener. Both proxy transport
  * paths share this so the defaults stay consistent.
+ *
+ * Scope note (review P3-1): an `https://` proxy scheme only changes
+ * the DEFAULT PORT — both transport paths still speak PLAINTEXT to
+ * the proxy (http.request / plaintext CONNECT). TLS-to-the-proxy is
+ * not implemented; a real TLS proxy listener will receive plaintext
+ * and fail the handshake. HTTPS-proxy support is a separate feature
+ * if ever needed.
  */
 function proxyPortOrDefault(parsedProxy: URL): number {
   if (parsedProxy.port !== '') {
