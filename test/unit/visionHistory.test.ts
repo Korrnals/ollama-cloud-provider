@@ -11,8 +11,11 @@ import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import {
   applyVisionHistoryLifecycle,
+  neverSentImageMarker,
+  resolveRawResendCap,
   resolveVisionHistoryMode,
 } from '../../src/visionHistory.js';
+import { sha256ShortHex } from '../../src/visionTwoPhase.js';
 
 function imagePart(bytes: Uint8Array): vscode.LanguageModelDataPart {
   return new vscode.LanguageModelDataPart(bytes, 'image/png');
@@ -114,5 +117,85 @@ describe('visionHistory lifecycle (ADR 0013 extension)', () => {
       'visionHistory.mode': 'banana',
     });
     assert.equal(resolveVisionHistoryMode(), 'marker');
+  });
+});
+
+describe('visionHistory raw-resend cap (v0.21.0 D-3)', () => {
+  const HASH_A = sha256ShortHex(Buffer.from(PNG_A));
+
+  beforeEach(() => {
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      'visionHistory.mode': 'marker',
+    });
+  });
+
+  it('resolveRawResendCap: default 3, 0 = unlimited legacy, invalid clamps to 3, negatives clamp to 0', () => {
+    // Default when the key is absent.
+    assert.equal(resolveRawResendCap(), 3);
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      'visionHistory.rawResendCap': 0,
+    });
+    assert.equal(resolveRawResendCap(), 0, 'explicit 0 = unlimited legacy');
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      'visionHistory.rawResendCap': 5,
+    });
+    assert.equal(resolveRawResendCap(), 5);
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      'visionHistory.rawResendCap': -2,
+    });
+    assert.equal(resolveRawResendCap(), 0, 'negative clamps to unlimited');
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      'visionHistory.rawResendCap': 'banana',
+    });
+    assert.equal(resolveRawResendCap(), 3, 'non-number clamps to default');
+  });
+
+  it('a CAPPED hash degrades to the never-sent marker — not raw, not recorded into pending', () => {
+    const sent = new Set<string>();
+    const pending = new Set<string>();
+    const capped = new Map<string, number>([[HASH_A, 3]]);
+    const out = applyVisionHistoryLifecycle(
+      [userMsg([imagePart(PNG_A)])],
+      sent,
+      pending,
+      capped,
+    );
+    const parts = out[0]!.content;
+    assert.equal(parts.length, 1);
+    assert.ok(parts[0] instanceof vscode.LanguageModelTextPart, 'capped image → text marker');
+    const marker = (parts[0] as vscode.LanguageModelTextPart).value;
+    assert.ok(marker.includes('[Image'), 'same in-band marker shape as repeats');
+    assert.ok(
+      marker.includes('[image never successfully sent — 3 attempts failed]'),
+      `never-sent note carries the attempt count: ${marker}`,
+    );
+    assert.equal(marker, neverSentImageMarker(HASH_A, 3));
+    assert.equal(pending.size, 0, 'capped hash is NOT recorded into pending (nothing raw sent)');
+    assert.equal(sent.size, 0, 'capped hash is NOT committed');
+    assert.ok(marker.length < 300, `marker must stay short, got ${marker.length}`);
+  });
+
+  it('a capped hash degrades even on its FIRST lifecycle appearance (uncommitted failures)', () => {
+    // The amplifier scenario: every prior turn FAILED, so the hash is in
+    // neither sent nor pending — only the failure counter knows it. The
+    // capped map alone must gate the raw re-send.
+    const out = applyVisionHistoryLifecycle(
+      [userMsg([imagePart(PNG_A)])],
+      new Set<string>(),
+      new Set<string>(),
+      new Map<string, number>([[HASH_A, 3]]),
+    );
+    assert.ok(
+      out[0]!.content[0] instanceof vscode.LanguageModelTextPart,
+      'capped hash → marker even with empty sent/pending sets',
+    );
+  });
+
+  it('capped check does not disturb the plain lifecycle (no cappedHashes → v0.20.1 behavior)', () => {
+    const sent = new Set<string>();
+    const pending = new Set<string>();
+    const out = applyVisionHistoryLifecycle([userMsg([imagePart(PNG_A)])], sent, pending);
+    assert.ok(out[0]!.content[0] instanceof vscode.LanguageModelDataPart, 'first send raw');
+    assert.equal(pending.size, 1);
   });
 });

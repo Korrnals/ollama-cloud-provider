@@ -267,6 +267,13 @@
           "description": "How images are handled for vision-capable models. Marker mode (default, ArchCom 2026-09-15) unifies the describe path: a vision model describes every image and the primary model answers from the description — an image never lives in the context as raw bytes. Raw mode means the FIRST send of each image goes raw to the primary (not \"everything raw always\"): repeats from history still become markers, so sessions stay lean either way.",
           "scope": "application"
         },
+        "ollamaCloud.visionHistory.rawResendCap": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "description": "How many times an image whose turn failed (stream error, or a cancel before the answer completed) is re-sent as raw base64 before it degrades to a short text marker for the rest of the session. Caps request-size blowups when the same screenshot keeps failing. 0 means unlimited raw re-sends (the previous behavior). Successfully delivered images are never re-sent raw regardless of this setting.",
+          "scope": "application"
+        },
         "ollamaCloud.visionFallback.model": {
           "type": "string",
           "default": "",
