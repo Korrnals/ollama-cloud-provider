@@ -132,6 +132,19 @@ function assistantMsg(text: string): vscode.LanguageModelChatRequestMessage {
   };
 }
 
+// The stub defines a `System` member (value 1) that the official
+// @types/vscode enum does not declare — same cast trick as
+// `compactionOffDispatch.test.ts`. Used by the v0220-t2 T2 pin: a
+// leading per-client system message shared byte-identically across two
+// windows.
+function systemMsg(text: string): vscode.LanguageModelChatRequestMessage {
+  return {
+    role: 1 as unknown as vscode.LanguageModelChatMessageRole,
+    content: [new vscode.LanguageModelTextPart(text)] as vscode.LanguageModelChatRequestMessage['content'],
+    name: undefined,
+  };
+}
+
 function makeProgress(): vscode.Progress<vscode.LanguageModelResponsePart> & {
   parts: vscode.LanguageModelResponsePart[];
 } {
@@ -443,6 +456,67 @@ describe('compaction stickiness — provider wiring (v0.21.0 slice d1)', () => {
 
     // B returns, grown — SAME in the other direction.
     await call(bigHistory(4, 'bb'));
+    assert.equal(apiChatCalls.length, 2, 'B: no re-fire after the A interleave');
+    const bodyB = dispatchedBody(chatCalls.length - 1);
+    assert.ok(bodyB.includes('[compacted-turns'), 'B: projection re-applied');
+    assert.ok(!bodyB.includes('bb01'), 'B: evicted prefix stays evicted');
+    assert.ok(!bodyB.includes('aa01'), 'B: A content never leaks in');
+    assert.ok(bodyB.includes('bb16'), 'B: grown tail appended');
+    assert.ok(
+      !capturedLogLines.some((line) => line.includes('Compaction projection dropped')),
+      'neither projection was dropped across the alternation',
+    );
+  });
+
+  // v0220-t2 (review follow-up T2) — anchor blind spot: production
+  // histories may lead with a per-client SYSTEM prompt; two windows on
+  // the same model with a byte-identical leading system prompt (same
+  // client, same default prompt — plausible) collapsed into ONE slot
+  // under the messages[0] anchor, recreating the interleaved-window
+  // clobbering CC P2 fixed (each alternation dropped the other's
+  // projection; B never even got its own fresh machine — it inherited
+  // A's cooldown and was served raw). The first-USER-message anchor
+  // keeps them in DISTINCT slots: both fire their own compaction and
+  // each projection survives the alternation. Mirrors the alternation
+  // test above, plus the shared leading system message.
+  it('two conversations sharing a byte-identical leading system prompt keep DISTINCT slots and projections across alternation', async () => {
+    startLogCapture();
+    const ctx = makeCompactionContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const SHARED_SYSTEM = 'You are a coding assistant operating in the user workspace. Use tools when needed.';
+    const history = (tag: string, extraTurns = 0): vscode.LanguageModelChatRequestMessage[] => [
+      systemMsg(SHARED_SYSTEM),
+      ...bigHistory(extraTurns, tag),
+    ];
+    const call = (h: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        h,
+        { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        new vscode.CancellationTokenSource().token,
+      );
+
+    // A fires; B fires its OWN compaction — a distinct slot means a
+    // fresh machine with no inherited cooldown (under the messages[0]
+    // anchor B inherited A's just-stamped cooldown and was served raw).
+    await call(history('aa'));
+    assert.equal(apiChatCalls.length, 1, 'conversation A fires');
+    await call(history('bb'));
+    assert.equal(apiChatCalls.length, 2, 'conversation B fires its own compaction (distinct slot despite the shared system prompt)');
+
+    // A returns, grown — its projection must re-apply across the B
+    // interleave (no new fire, evicted prefix still evicted).
+    await call(history('aa', 4));
+    assert.equal(apiChatCalls.length, 2, 'A: no re-fire after the B interleave');
+    const bodyA = dispatchedBody(chatCalls.length - 1);
+    assert.ok(bodyA.includes('[compacted-turns'), 'A: projection re-applied');
+    assert.ok(!bodyA.includes('aa01'), 'A: evicted prefix stays evicted');
+    assert.ok(!bodyA.includes('bb01'), 'A: B content never leaks in');
+    assert.ok(bodyA.includes('aa16'), 'A: grown tail appended');
+
+    // B returns, grown — SAME in the other direction.
+    await call(history('bb', 4));
     assert.equal(apiChatCalls.length, 2, 'B: no re-fire after the A interleave');
     const bodyB = dispatchedBody(chatCalls.length - 1);
     assert.ok(bodyB.includes('[compacted-turns'), 'B: projection re-applied');
