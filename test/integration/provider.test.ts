@@ -4,6 +4,7 @@ import { OllamaCloudChatProvider, classifyStreamError } from '../../src/provider
 import {
   ConnectionInterruptedError,
   HttpError,
+  MaxDurationError,
   MidStreamError,
   ZeroByteSocketCloseError,
 } from '../../src/retry.js';
@@ -2996,6 +2997,19 @@ describe('classifyStreamError — ADR 0008 provider-level mapping', () => {
     const result = classifyStreamError(err);
     assert.ok(result instanceof vscode.LanguageModelError);
     assert.equal((result as vscode.LanguageModelError).code, 'NotFound');
+  });
+
+  // D-2 review P3-1 (task v0220-s) — the tagged teardown makes a
+  // maxDuration abort surface deterministically as MaxDurationError;
+  // the classification must name the configured ceiling (minutes) and
+  // the setting, not fall into the generic catch-all.
+  it('maps MaxDurationError to Blocked naming the ceiling in minutes and the setting', () => {
+    const result = classifyStreamError(new MaxDurationError(30 * 60000));
+    assert.ok(result instanceof vscode.LanguageModelError);
+    assert.equal((result as vscode.LanguageModelError).code, 'Blocked');
+    assert.match(result.message, /лимит длительности запроса \(30 мин\)/);
+    assert.match(result.message, /ollamaCloud\.requestMaxDurationMin/);
+    assert.match(result.message, /\[ref [0-9a-f]{8}\]/, 'carries the correlatable ref id');
   });
 
   it('maps a raw socket-close Error to Blocked (unclassified network drop)', () => {
