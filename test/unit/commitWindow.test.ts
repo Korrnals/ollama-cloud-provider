@@ -841,7 +841,13 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
   // v0210-d2) lands in the AbortError branch of readStreamOnce and is
   // additionally pinned by test/integration/httpClient.test.ts against
   // the real node:http transport.
-  const WINDOW_MS = 60;
+  // D-2 review P3-4 (task v0220-s) — the window margin is ~200ms, not
+  // the former 60ms: on a loaded CI runner a 40-60ms gap between the
+  // scheduled event and the window-close timer can invert (the close
+  // fires first), flipping which contract branch the test exercises.
+  // The interleaving CLASS per test is unchanged (inside-window vs
+  // after-close); only the separation widened.
+  const WINDOW_MS = 200;
   const TARGET_URL = 'https://ollama.com/v1/test-d2-cancel-race';
   const ORIGINAL_RANDOM = Math.random;
 
@@ -894,8 +900,9 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
       }
       fetchCalls += 1;
       // One delta (buffered, window armed), then 20ms in — inside the
-      // 60ms window — the production interleaving: cancel fires, the
-      // teardown surfaces as an UNTAGGED socket-close.
+      // 200ms window (180ms margin) — the production interleaving:
+      // cancel fires, the teardown surfaces as an UNTAGGED
+      // socket-close.
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
@@ -950,16 +957,17 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
         return new Response('busy', { status: 400 });
       }
       fetchCalls += 1;
-      // Delta at ~0ms; the 60ms window closes and FLUSHES it (the user
-      // has seen it); cancel + untagged close land at 120ms — after
-      // the window. Terminal per contract #3 even though cancelled.
+      // Delta at ~0ms; the 200ms window closes and FLUSHES it (the
+      // user has seen it); cancel + untagged close land at 400ms —
+      // 200ms after the window. Terminal per contract #3 even though
+      // cancelled.
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(encode('data: {"delta":"visible"}\n\n'));
           setTimeout(() => {
             source.cancel();
             controller.error(socketCloseError());
-          }, 120);
+          }, 400);
         },
       });
       return new Response(body, { status: 200 });
@@ -998,6 +1006,197 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
     );
     assert.equal(recorded.done, false, 'a terminal break is not a quiet success');
     assert.equal(win.controller.hiddenRetryCount(), 0);
+  });
+
+  it('cancel racing a 0-chunk close (zero-byte path) → quiet onDone, no error, no extra attempt (P3-3)', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // The production interleaving (D-2 review P3-3): the user cancels,
+      // then the peer reset lands as a 0-chunk close — the probe's
+      // first read resolves done AFTER the cancellation, so the
+      // zero-byte decision point in readStream sees an already-
+      // cancelled token.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          setTimeout(() => source.cancel(), 20);
+          setTimeout(() => controller.close(), 45);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'd2-zerobyte-cancel',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: sseLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'a cancelled 0-chunk break is a quiet completion, not a provider failure');
+    assert.equal(recorded.error, undefined, 'no visible error for a request the user aborted');
+    assert.equal(fetchCalls, 1, 'NO extra visible attempt after cancellation');
+    assert.equal(recorded.notices.length, 0, 'no visible notice after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+    // Diagnostics honesty: the quiet completion is disclosed via a
+    // distinct WARN line so field logs show why no extra attempt fired.
+    const recent = logger.getRecentErrors().join('\n');
+    assert.ok(
+      recent.includes('Zero-byte close while cancelled — quiet completion'),
+      'the quiet completion must be disclosed via a distinct WARN line',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // v0220-s discard-on-cancel (cross-slice finding from v0220-v T-3):
+  // on quiet-cancel with buffered tool_call/text deltas and the window
+  // open, the wrapped onDone used to FLUSH the buffer first — emitting a
+  // LanguageModelToolCallPart into an already-cancelled turn (ghost
+  // tool-call risk). Contract: cancel-caused completions DISCARD;
+  // non-cancel completions keep flush-first semantics.
+  // -------------------------------------------------------------------------
+
+  /** SSE-ish processor: `data: tool` buffers a toolCall, `data: text` buffers text. */
+  function toolAndTextLine(callbacks: StreamCallbacks): StreamLineProcessor {
+    return (line, ctx) => {
+      const trimmed = line.trim();
+      if (trimmed === 'data: tool') {
+        ctx.markParsed();
+        callbacks.onToolCall({ id: 'call_1', name: 'get_weather', input: {} });
+        return false;
+      }
+      if (trimmed === 'data: text') {
+        ctx.markParsed();
+        callbacks.onText('partial');
+        return false;
+      }
+      return false;
+    };
+  }
+
+  it('cancel + untagged close with buffered tool_call + text → discard-on-cancel: NOTHING emitted, quiet done (CIE route)', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // A tool_call delta and a text delta arrive (buffered, window
+      // armed), then 20ms in — window still open — the user cancels and
+      // the teardown surfaces as an UNTAGGED socket-close (CIE route
+      // into the D-2 quiet-completion branch).
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: tool\n\n'));
+          controller.enqueue(encode('data: text\n\n'));
+          setTimeout(() => {
+            source.cancel();
+            controller.error(socketCloseError());
+          }, 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    // The D-2 invariant holds (resolves, never rethrows) AND the buffer
+    // is discarded, not flushed: no part may be emitted after cancel.
+    await readStream(
+      {
+        logTag: 'd2-discard-cie',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: toolAndTextLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'quiet completion via onDone (D-2 invariant unchanged)');
+    assert.equal(recorded.error, undefined, 'no error on the cancelled break');
+    assert.deepStrictEqual(
+      recorded.events,
+      [],
+      'discard-on-cancel: buffered tool_call/text must NOT be emitted after the cancel',
+    );
+    assert.equal(fetchCalls, 1, 'no retry after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+  });
+
+  it('plain cancel (tagged AbortError) with buffered tool_call + text → discard-on-cancel: NOTHING emitted, quiet done', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (
+      url: unknown,
+      init?: { signal?: AbortSignal },
+    ) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // Same buffered deltas, but the teardown surfaces as the TAGGED
+      // AbortError (the transport honors the abort signal) — the plain
+      // cancel branch inside readStreamOnce.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: tool\n\n'));
+          controller.enqueue(encode('data: text\n\n'));
+          init?.signal?.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted');
+            err.name = 'AbortError';
+            controller.error(err);
+          });
+          setTimeout(() => source.cancel(), 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'd2-discard-plain',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: toolAndTextLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'quiet completion via onDone');
+    assert.equal(recorded.error, undefined, 'no error on a plain cancel');
+    assert.deepStrictEqual(
+      recorded.events,
+      [],
+      'discard-on-cancel: buffered tool_call/text must NOT be emitted after the cancel',
+    );
+    assert.equal(fetchCalls, 1, 'no retry after cancellation');
   });
 
   it('cancel before stream start → quiet onDone, no error, no retry (unchanged)', async function () {
@@ -1062,7 +1261,7 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
       }
       fetchCalls += 1;
       if (fetchCalls === 1) {
-        // Genuine network reset 20ms in — inside the 60ms window, no
+        // Genuine network reset 20ms in — inside the 200ms window, no
         // cancellation involved.
         const body = new ReadableStream<Uint8Array>({
           start(controller) {
@@ -1129,7 +1328,7 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
       fetchCalls += 1;
       // Odd calls: connect-phase retriable socket-close (no headers).
       // Even calls: 200 + one delta, untagged socket-close 20ms in
-      // (inside the 60ms window).
+      // (inside the 200ms window).
       if (fetchCalls % 2 === 1) {
         throw socketCloseError();
       }

@@ -90,6 +90,17 @@ export interface CommitWindowController {
    * must not vanish silently.
    */
   flush(): void;
+  /**
+   * Task v0220-s (cross-slice finding from v0220-v T-3, discard-on-
+   * cancel): drops the buffered deltas WITHOUT emitting them and closes
+   * the window (idempotent). Called by the stream reader on
+   * CANCEL-caused quiet completion, BEFORE `onDone` — emitting buffered
+   * parts after the user cancelled would push a
+   * `LanguageModelToolCallPart` into an already-dead turn (ghost tool
+   * call risk). NON-cancel completions keep flush-first semantics: only
+   * a completion caused by cancellation may discard.
+   */
+  discard(): void;
 }
 
 /** A `StreamCallbacks` object carrying an attached window controller. */
@@ -171,6 +182,18 @@ export function createCommitWindow(
     }
   };
 
+  // v0220-s discard-on-cancel — the mirror of flush() minus delivery:
+  // same state transitions (timer cleared, window closed, idempotent),
+  // but the buffered deltas are dropped, never emitted.
+  const discard = (): void => {
+    if (state === 'flushed') {
+      return;
+    }
+    clearTimer();
+    buffer = [];
+    state = 'flushed';
+  };
+
   const handleDelta = (delta: BufferedDelta): void => {
     if (state === 'flushed') {
       deliver(delta);
@@ -199,6 +222,7 @@ export function createCommitWindow(
     },
     hiddenRetryCount: () => hiddenRetries,
     flush,
+    discard,
   };
 
   return {
@@ -226,7 +250,11 @@ export function createCommitWindow(
         onDone: () => {
           // A stream can complete while the window is still open (short
           // tool-call responses) — the buffered deltas must still reach
-          // the user, exactly once, before termination.
+          // the user, exactly once, before termination. EXCEPT when the
+          // reader already called controller.discard() for a
+          // cancel-caused completion: then the window is closed and this
+          // flush is a no-op, so nothing is emitted into the dead turn
+          // (v0220-s discard-on-cancel).
           flush();
           callbacks.onDone();
         },

@@ -60,6 +60,7 @@ import {
   ConnectionInterruptedError,
   UpstreamIdleTimeoutError,
   PostBudgetExhaustedError,
+  MaxDurationError,
   isSocketCloseError,
 } from './retry.js';
 import {
@@ -276,6 +277,17 @@ export function classifyStreamError(error: unknown): Error {
     // the owner understands this is not the extension's timers.
     return vscode.LanguageModelError.Blocked(
       `Ollama Cloud: облако закрыло соединение после ${Math.round(error.quietMs / 1000)} с без данных — модель долго размышляла. Известная проблема Ollama Cloud (ollama/ollama#16108), на стороне расширения таймеры стрим не прерывали. Повторите запрос. [ref ${ref}]`,
+    );
+  }
+  if (error instanceof MaxDurationError) {
+    // D-2 review P3-1 — since the D-2 tagged teardown, a maxDuration
+    // abort during read deterministically surfaces here as
+    // MaxDurationError (readStreamOnce routes by the abortReason tag);
+    // without this branch it fell into the generic catch-all and the
+    // user lost the reason. Name the configured ceiling (in minutes)
+    // and the setting that controls it.
+    return vscode.LanguageModelError.Blocked(
+      `Ollama Cloud: достигнут лимит длительности запроса (${Math.round(error.timeoutMs / 60000)} мин) — поток прерван. Лимит настраивается параметром «ollamaCloud.requestMaxDurationMin»; при необходимости завершить длинный ответ повторите запрос. [ref ${ref}]`,
     );
   }
   if (error instanceof ConnectionInterruptedError) {

@@ -319,6 +319,11 @@ export interface StreamReaderOptions {
  *     AbortError / raw socket-close escaping `withRetry`) are re-thrown
  *     as `ZeroByteSocketCloseError` instead of a direct `onError`, so
  *     they follow this SAME policy — exactly one retry path per class.
+ *     D-2 review P3-3: if the caller already cancelled at this decision
+ *     point, the break completes QUIETLY via `onDone` (same hard-
+ *     invariant rationale as the CIE open-window branch — 0 chunks ⇒
+ *     nothing shown, so a cancelled request must surface no visible
+ *     error and no extra attempt).
  *
  * All hidden retries draw from the shared POST budget
  * (`MAX_POST_BUDGET_PER_MESSAGE`); the loop terminates because every
@@ -384,7 +389,14 @@ export async function readStream(
         //      content already streamed to the user; an honest error
         //      is the only non-duplicating outcome (silent retry would
         //      duplicate visible text; a quiet onDone would silently
-        //      truncate shown content).
+        //      truncate shown content — the already-shown fragment
+        //      would read as the complete answer with no signal it was
+        //      cut short). This deliberately includes USER-initiated
+        //      cancels landing after the flush: the asymmetry vs
+        //      branch 2 is the point — before the flush nothing
+        //      user-visible existed, so a quiet onDone is honest;
+        //      after it, only the honest error says "incomplete"
+        //      without duplicating anything.
         //   2. cancelled + window open → QUIET COMPLETION (onDone) —
         //      a cancellation with nothing shown must look to VS Code
         //      like a clean cancel, never like a provider failure.
@@ -402,6 +414,11 @@ export async function readStream(
           logger.warn(
             'Mid-stream interrupt while cancelled, window open — quiet completion (nothing user-visible from the attempt; no retry, no rethrow)',
           );
+          // v0220-s discard-on-cancel — the buffer holds this
+          // attempt's unflushed deltas; emitting them after the user
+          // cancelled would push parts into a dead turn (ghost tool
+          // call). Discard, then the quiet onDone flush is a no-op.
+          commitWindow?.discard();
           callbacks.onDone();
           return;
         }
@@ -463,7 +480,23 @@ export async function readStream(
         // §3.4 design condition grants ONE additional VISIBLE attempt,
         // then terminal. No extra backoff: withRetry just ran its full
         // exponential schedule; the visible notice explains the wait.
-        if (zeroByteExtraAttemptUsed || cancelled || budget.remaining <= 0) {
+        if (cancelled) {
+          // D-2 review P3-3 (task v0220-s) — quiet-cancel symmetry: a
+          // 0-chunk peer reset racing the cancel tag used to surface
+          // onError for a request the user had already aborted. 0
+          // chunks ⇒ nothing was shown, so the quiet-completion branch
+          // of the D-2 hard invariant applies here too: onDone, no
+          // error, no extra visible attempt for a cancelled request.
+          // v0220-s discard-on-cancel: same rule as the CIE branch —
+          // never emit buffered parts into a cancelled turn.
+          logger.warn(
+            'Zero-byte close while cancelled — quiet completion (0 chunks, nothing user-visible; no extra attempt, no error)',
+          );
+          commitWindow?.discard();
+          callbacks.onDone();
+          return;
+        }
+        if (zeroByteExtraAttemptUsed || budget.remaining <= 0) {
           // Surface through the callback contract (same as the
           // pre-window behaviour), then stop — readStreamOnce already
           // handled socket teardown.
@@ -963,6 +996,12 @@ async function readStreamOnce(
     // no retry). MaxDuration → onError (terminal). Cancel → onDone.
     if (error instanceof Error && error.name === 'AbortError') {
       if (abortReason === 'cancel') {
+        // v0220-s discard-on-cancel — the quiet completion must not
+        // FLUSH the window's buffer into the dead turn: a buffered
+        // tool_call part emitted after the user cancelled is a ghost
+        // tool call. Only KNOWN-cancel completions discard; the
+        // ambiguous-default branch below keeps flush-first semantics.
+        getAttachedCommitWindow(callbacks)?.discard();
         callbacks.onDone();
         return;
       }

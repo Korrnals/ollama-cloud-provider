@@ -37,6 +37,11 @@ desktop.ini
 *.key
 *.p12
 *.pfx
+# Whitelist: self-signed TEST fixtures for the TLS-CONNECT tunnel
+# integration test (task v0220-s). Generated for localhost only, hold
+# no secret value, and are required on CI — NOT production material.
+!test/fixtures/tls-test-cert.pem
+!test/fixtures/tls-test-key.pem
 
 # === GPG signing keys (local only, NEVER commit) ===
 *.gpg
