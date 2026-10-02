@@ -21,13 +21,18 @@
  *     THROWS — the caller (provider) logs a warning and proceeds with
  *     the uncompacted history (fallback contract: compaction never
  *     fails the chat).
- *   - Request body: `{ model, messages: [user prompt], stream: false,
- *     think: false }` — non-streaming, thinking disabled (the
- *     checkpoint summary needs no chain-of-thought; `think: false`
- *     keeps the cheap model's output short and cheap).
+ *   - Request body: `{ model, messages: [system data-handling
+ *     contract, user prompt], stream: false, think: false }` —
+ *     non-streaming, thinking disabled (the checkpoint summary needs no
+ *     chain-of-thought; `think: false` keeps the cheap model's output
+ *     short and cheap). v0220-t (CC review P3-2): the data-handling
+ *     contract rides a dedicated `role:'system'` message ahead of the
+ *     user prompt (native `/api/chat` accepts system messages), so the
+ *     security contract never depends on instruction-precedence inside
+ *     the one user payload that also carries the hostile evicted block.
  */
 
-import type { Summarizer } from './compaction.js';
+import { SUMMARY_DATA_HANDLING_SYSTEM, type Summarizer } from './compaction.js';
 
 /** Default single-call timeout (spec: 60s). */
 export const SUMMARIZER_TIMEOUT_MS_DEFAULT = 60_000;
@@ -71,7 +76,14 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
         deps.request(
           {
             model: deps.model,
-            messages: [{ role: 'user', content: prompt }],
+            // v0220-t (CC review P3-2) — the data-handling contract rides
+            // its own role:'system' message; the user message carries the
+            // prompt (hostile evicted data included). Role separation is
+            // stronger than in-payload instruction precedence.
+            messages: [
+              { role: 'system', content: SUMMARY_DATA_HANDLING_SYSTEM },
+              { role: 'user', content: prompt },
+            ],
             stream: false,
             think: false,
           },

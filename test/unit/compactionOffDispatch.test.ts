@@ -565,18 +565,40 @@ describe('compaction reaches the wire at filter=off — v0220-a P1 pins', functi
     // image-carrying user message — the native wire lost the image on
     // every shaped dispatch (filter safe/aggressive since ADR 0007;
     // the shipped defaults since the v0220-a dispatch gate).
+    //
+    // v0220-t (A-review follow-up) — the history also carries TOOL
+    // shapes (assistant tool_calls + user tool result): the equivalence
+    // contract must cover the native tool mapping (arguments STRING on
+    // the OpenAI side parsed into an OBJECT, tool results as role:'tool'
+    // with tool_call_id), not just text+image.
     const history = [
       systemMsg('You are a coding assistant.'),
       userMsg('hello world'),
       imageMsg(IMG_A, 'what is this?'),
       imageMsg(IMG_B, ''), // image-only user message (empty-text guard parity)
+      {
+        role: vscode.LanguageModelChatMessageRole.Assistant,
+        content: [
+          new vscode.LanguageModelToolCallPart('call-1', 'get_weather', { city: 'Paris' }),
+        ],
+        name: undefined,
+      },
+      {
+        role: vscode.LanguageModelChatMessageRole.User,
+        content: [
+          new vscode.LanguageModelToolResultPart('call-1', [
+            new vscode.LanguageModelTextPart('18C sunny'),
+          ]),
+        ],
+        name: undefined,
+      },
       assistantMsg('a png header'),
       userMsg('bye'),
     ];
     assert.deepStrictEqual(
       convertOpenAIMessagesToNative(convertMessagesToOpenAI(history)),
       convertMessagesToNative(history),
-      'shaped and legacy native converters must be payload-equivalent (images in images[])',
+      'shaped and legacy native converters must be payload-equivalent (images in images[], tool_calls parsed, tool results kept)',
     );
     // And the equivalence is not vacuous: the legacy output carries
     // BOTH images on their user messages.
@@ -587,6 +609,22 @@ describe('compaction reaches the wire at filter=off — v0220-a P1 pins', functi
     assert.equal(withImages.length, 2, 'both image user messages carry images[]');
     assert.ok(withImages[0]!.images!.includes(base64Of(IMG_A)));
     assert.ok(withImages[1]!.images!.includes(base64Of(IMG_B)));
+    // Not vacuous on the TOOL side either: the legacy output carries
+    // the assistant tool_call with native OBJECT arguments and the
+    // tool-result message with its tool_call_id.
+    const toolCaller = legacy.find((m) => Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
+    assert.ok(toolCaller, 'legacy output carries the assistant tool_call');
+    assert.equal(toolCaller!.tool_calls![0]!.id, 'call-1');
+    assert.equal(toolCaller!.tool_calls![0]!.function.name, 'get_weather');
+    assert.deepStrictEqual(
+      toolCaller!.tool_calls![0]!.function.arguments,
+      { city: 'Paris' },
+      'native tool_call arguments are an OBJECT',
+    );
+    const toolResult = legacy.find((m) => m.role === 'tool');
+    assert.ok(toolResult, 'legacy output carries the tool result');
+    assert.equal(toolResult!.content, '18C sunny');
+    assert.equal(toolResult!.tool_call_id, 'call-1');
   });
 
   it('(P1) native + filter=off + compaction fire: image in recency reaches the wire in images[] (raw first send)', async () => {

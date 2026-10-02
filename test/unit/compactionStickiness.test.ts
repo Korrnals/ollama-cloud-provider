@@ -489,4 +489,59 @@ describe('compaction stickiness — provider wiring (v0.21.0 slice d1)', () => {
     assert.ok(body.includes('[compacted-turns'), 'c1 re-fire serves a fresh checkpoint');
     assert.ok(!body.includes('c101'), 'c1 evicted prefix stays evicted by the fresh fire');
   });
+
+  // v0220-t (CC review P3-4) — the conversation key must be a STABLE
+  // anchor. The state slot is created on the conversation's FIRST
+  // request; with the old min(4, len) head fingerprint a fire at len=3
+  // wrote its projection under a 3-message key, and the next turn
+  // (len>=4) computed a 4-message key — the slot was orphaned (fresh
+  // state, no inherited cooldown, immediate re-fire). Here the len=3
+  // history crosses the 75% threshold via two giant messages; the
+  // grown len=5 turn must land in the SAME slot and re-apply.
+  it('a conversation that fires at len=3 keeps its projection when grown to len=5 (stable key anchor)', async () => {
+    startLogCapture();
+    const ctx = makeCompactionContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const call = (history: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('gpt-oss:120b'),
+        history,
+        { modelOptions: {}, justification: 'test' } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        new vscode.CancellationTokenSource().token,
+      );
+    // Sizing: u0 ≈ 65.5k tokens, u1 ≈ 32.8k tokens → ≈ 98.4k tokens ≥
+    // the 98304-token (75%) threshold; u1 alone covers the 25% recency
+    // quota so u0 stays evictable (recency = [a0, u1]).
+    const shortFire = (): vscode.LanguageModelChatRequestMessage[] => [
+      userMsg('u0 ' + 'x'.repeat(262_200)),
+      assistantMsg('ok'),
+      userMsg('u1 ' + 'x'.repeat(131_200)),
+    ];
+
+    await call(shortFire());
+    assert.equal(apiChatCalls.length, 1, 'len=3: over threshold — compaction fires');
+    assert.ok(dispatchedBody(0).includes('[compacted-turns'), 'len=3 fire serves the checkpoint');
+    assert.ok(!dispatchedBody(0).includes('u0 '), 'the giant first message was evicted');
+
+    // Grown by one exchange → len=5: the key anchor (FIRST message) is
+    // unchanged, so the projection re-applies within the cooldown — no
+    // orphan, no second summarizer charge.
+    const grown = [...shortFire(), assistantMsg('ok'), userMsg('u2 final')];
+    await call(grown);
+    assert.equal(apiChatCalls.length, 1, 'len=5 turn: SAME state slot — projection re-applied, NO orphan re-fire');
+    assert.equal(chatCalls.length, 2, 'len=5 turn dispatched');
+    const body2 = dispatchedBody(1);
+    assert.ok(body2.includes('[compacted-turns'), 'projection survived the head growth');
+    assert.ok(!body2.includes('u0 '), 'evicted prefix stays evicted');
+    assert.ok(body2.includes('u2 final'), 'grown tail appended');
+    assert.ok(
+      capturedLogLines.some((line) => /Compaction re-applied: projectedTokens=\d+ tailMessages=\d+/.test(line)),
+      're-apply INFO line present (no fresh-fire line)',
+    );
+    assert.ok(
+      !capturedLogLines.some((line) => line.includes('Compaction projection dropped')),
+      'the projection was never dropped',
+    );
+  });
 });
