@@ -2073,9 +2073,16 @@ export class OllamaCloudChatProvider
    * attempts note after the closing bracket. Captures the hash so
    * {@link renderCompactionBasis} can canonicalize a marker back to
    * the identity of the image it replaced.
+   *
+   * v0220-t (CC review P3-3) — the hash alternation also captures the
+   * `no-image` sentinel: a zero-byte image hashes to `'no-image'`
+   * (mirroring `visionHistory`), so its marker reads
+   * `[Image no-image — …]`. Without the alternation the marker was not
+   * stripped and the sentinel not pushed, so raw↔marker canonicalization
+   * diverged for zero-byte images.
    */
   private static readonly IMAGE_MARKER_RE =
-    /\[Image ([0-9a-f]{16}) — [^\]]*\](?: \[image never successfully sent — \d+ attempts failed\])?/g;
+    /\[Image ([0-9a-f]{16}|no-image) — [^\]]*\](?: \[image never successfully sent — \d+ attempts failed\])?/g;
 
   /**
    * v0.22.0 (v0220-cc, QA-audit P2) — vision-state-INDEPENDENT render
