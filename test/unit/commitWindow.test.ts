@@ -841,7 +841,13 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
   // v0210-d2) lands in the AbortError branch of readStreamOnce and is
   // additionally pinned by test/integration/httpClient.test.ts against
   // the real node:http transport.
-  const WINDOW_MS = 60;
+  // D-2 review P3-4 (task v0220-s) — the window margin is ~200ms, not
+  // the former 60ms: on a loaded CI runner a 40-60ms gap between the
+  // scheduled event and the window-close timer can invert (the close
+  // fires first), flipping which contract branch the test exercises.
+  // The interleaving CLASS per test is unchanged (inside-window vs
+  // after-close); only the separation widened.
+  const WINDOW_MS = 200;
   const TARGET_URL = 'https://ollama.com/v1/test-d2-cancel-race';
   const ORIGINAL_RANDOM = Math.random;
 
@@ -894,8 +900,9 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
       }
       fetchCalls += 1;
       // One delta (buffered, window armed), then 20ms in — inside the
-      // 60ms window — the production interleaving: cancel fires, the
-      // teardown surfaces as an UNTAGGED socket-close.
+      // 200ms window (180ms margin) — the production interleaving:
+      // cancel fires, the teardown surfaces as an UNTAGGED
+      // socket-close.
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(encode('data: {"delta":"partial"}\n\n'));
@@ -950,16 +957,17 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
         return new Response('busy', { status: 400 });
       }
       fetchCalls += 1;
-      // Delta at ~0ms; the 60ms window closes and FLUSHES it (the user
-      // has seen it); cancel + untagged close land at 120ms — after
-      // the window. Terminal per contract #3 even though cancelled.
+      // Delta at ~0ms; the 200ms window closes and FLUSHES it (the
+      // user has seen it); cancel + untagged close land at 400ms —
+      // 200ms after the window. Terminal per contract #3 even though
+      // cancelled.
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(encode('data: {"delta":"visible"}\n\n'));
           setTimeout(() => {
             source.cancel();
             controller.error(socketCloseError());
-          }, 120);
+          }, 400);
         },
       });
       return new Response(body, { status: 200 });
@@ -1115,7 +1123,7 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
       }
       fetchCalls += 1;
       if (fetchCalls === 1) {
-        // Genuine network reset 20ms in — inside the 60ms window, no
+        // Genuine network reset 20ms in — inside the 200ms window, no
         // cancellation involved.
         const body = new ReadableStream<Uint8Array>({
           start(controller) {
@@ -1182,7 +1190,7 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
       fetchCalls += 1;
       // Odd calls: connect-phase retriable socket-close (no headers).
       // Even calls: 200 + one delta, untagged socket-close 20ms in
-      // (inside the 60ms window).
+      // (inside the 200ms window).
       if (fetchCalls % 2 === 1) {
         throw socketCloseError();
       }
