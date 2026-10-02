@@ -191,6 +191,30 @@ function base64Of(bytes: number[]): string {
   return Buffer.from(new Uint8Array(bytes)).toString('base64');
 }
 
+/**
+ * Collects the `image_url` of every `input_image` part inside a
+ * `/v1/responses` `input[]` array, in order. Used by the P2-1 pin to
+ * assert exactly WHICH images reached the responses wire (and that
+ * evicted/markerized ones did not).
+ */
+function inputImageUrls(input: unknown[]): string[] {
+  const urls: string[] = [];
+  for (const item of input as Array<{
+    type?: string;
+    role?: string;
+    content?: Array<{ type?: string; image_url?: string }>;
+  }>) {
+    if (item?.type === 'message' && item.role === 'user' && Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part?.type === 'input_image' && typeof part.image_url === 'string') {
+          urls.push(part.image_url);
+        }
+      }
+    }
+  }
+  return urls;
+}
+
 // Vision tests use kimi-k3 (snapshot: imageInput TRUE, window
 // 1048576) — the vision-capable primary sees the image RAW on the
 // first send (ArchCom variant (v)). ~640k chars per padded turn ≈
@@ -743,5 +767,108 @@ describe('compaction reaches the wire at filter=off — v0220-a P1 pins', functi
       !wire2.includes('data:image/png;base64,'),
       'turn 2: data-URL prefixes stripped',
     );
+  });
+
+  it('(P2-1) responses + filter=off + compaction fire: image in recency reaches /v1/responses as input_image, checkpoint folds into instructions (fire + sticky re-apply)', async () => {
+    // v0221-p2-composition-tests (cascade QA audit v0.22.0, P2-1) — the
+    // responses-leg mirror of the native image pins above. The native
+    // endpoint has dedicated provider-level image pins (fire turn +
+    // marker turn); `/v1/responses` was pinned TEXT-ONLY (test (b)), and
+    // the input_image mapping was unit-pinned in convertResponses.test.ts
+    // — nothing proved the COMPACTED array reaches the responses
+    // converter with the image intact. This is that composition pin:
+    // compaction shaping (shapedMessages identity signal) ×
+    // convertOpenAIMessagesToResponsesInput × the checkpoint fold into
+    // `instructions` × the recency image as `input_image`. A regression
+    // in ANY link (dispatch gate, shaped converter image handling,
+    // checkpoint fold, sticky re-apply) drops the image or the checkpoint
+    // from the responses wire while native keeps working — exactly the
+    // class the audit flagged.
+    configure({
+      'visionHistory.mode': 'marker',
+    });
+    const ctx = makeCompactionContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+
+    // --- Turn 1 (FIRE): 7 padded turns + the image turn LAST
+    //     (recency). Compaction fires at filter=off; the image must
+    //     survive the compacted array onto the responses wire.
+    await runTurn(provider, visionHistory(), 'kimi-k3');
+    assert.equal(summarizerCalls.length, 1, 'call 1: compaction fired at filter=off');
+    assert.equal(responsesCalls.length, 1, 'call 1: /v1/responses dispatched');
+
+    const body1 = responsesCalls[0]!.body as { instructions?: string; input: unknown[] };
+    // The checkpoint lives ONLY in `instructions` on this endpoint (the
+    // converter folds the SUMMARY_MARKER system message; a regression to
+    // the drop-as-extra-system behaviour makes the evicted memory
+    // permanently invisible on /v1/responses).
+    assert.ok(
+      body1.instructions !== undefined &&
+        body1.instructions.startsWith('You are a coding assistant.'),
+      'call 1: real system prompt still leads instructions',
+    );
+    assert.ok(
+      body1.instructions!.includes('[compacted-turns'),
+      'call 1: SUMMARY_MARKER checkpoint folded into instructions',
+    );
+    assert.ok(
+      body1.instructions!.includes('CHECKPOINT SUMMARY'),
+      'call 1: checkpoint summary body folded into instructions',
+    );
+    // The image rides input[] as an input_image part carrying the FULL
+    // data URL (responses keeps the data: prefix — unlike native, which
+    // strips to bare base64 in images[]).
+    assert.deepStrictEqual(
+      inputImageUrls(body1.input),
+      [`data:image/png;base64,${base64Of(IMG_A)}`],
+      'call 1: the recency image is the ONE input_image part, base64 data URL intact',
+    );
+    // Compaction shaped this payload: evicted prefix gone, recency tail
+    // (with the image turn's text) kept.
+    const input1 = JSON.stringify(body1.input);
+    assert.ok(!input1.includes('turn01'), 'call 1: evicted turn01 absent from input');
+    assert.ok(input1.includes('what is this?'), 'call 1: image-turn text kept (recency)');
+
+    // --- Turn 2 (STICKY RE-APPLY): same conversation grown, inside the
+    //     cooldown — the remembered projection is re-applied (no second
+    //     summarizer charge) and must STILL shape the responses wire.
+    //     The committed IMG_A repeat becomes its lifecycle marker (no
+    //     pixel re-upload) while a NEW image attaches raw — mirroring
+    //     the native marker-turn pin above.
+    const grown = [
+      ...visionHistory(),
+      imageMsg(IMG_B, 'and what is THIS?'),
+      assistantMsg('ok'),
+      userMsg('final question'),
+    ];
+    await runTurn(provider, grown, 'kimi-k3');
+    assert.equal(
+      summarizerCalls.length,
+      1,
+      'call 2: no second summarizer call (sticky projection re-applied)',
+    );
+    assert.equal(responsesCalls.length, 2, 'call 2: /v1/responses dispatched');
+
+    const body2 = responsesCalls[1]!.body as { instructions?: string; input: unknown[] };
+    assert.ok(
+      body2.instructions !== undefined && body2.instructions.includes('[compacted-turns'),
+      'call 2 (sticky re-apply): checkpoint still folded into instructions',
+    );
+    assert.ok(
+      body2.instructions!.includes('CHECKPOINT SUMMARY'),
+      'call 2 (sticky re-apply): checkpoint summary body still present',
+    );
+    const input2 = JSON.stringify(body2.input);
+    assert.ok(
+      input2.includes('duplicate of an image already sent'),
+      'call 2: repeated image A replaced by the lifecycle marker',
+    );
+    assert.deepStrictEqual(
+      inputImageUrls(body2.input),
+      [`data:image/png;base64,${base64Of(IMG_B)}`],
+      'call 2: the NEW image is the one input_image part (raw first send); IMG_A pixels did not re-enter input[]',
+    );
+    assert.ok(!input2.includes('turn01'), 'call 2: evicted prefix stays evicted');
+    assert.ok(input2.includes('final question'), 'call 2: grown tail present');
   });
 });
