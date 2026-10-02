@@ -5,9 +5,10 @@
  * expressible in comments (sentImageHashes, failedImageSendCounts,
  * cappedImageHashes, visionResendCapWarned, the per-turn
  * pendingImageHashes container). Extracted verbatim from
- * `OllamaCloudChatProvider` (pure refactor — semantics byte-identical;
- * the 797-test suite incl. the ADR 0013 lifecycle and D-3 raw-resend
- * pins is the safety net).
+ * `OllamaCloudChatProvider` — pure refactor, semantics byte-identical
+ * for ALL request shapes (sequential AND concurrent) after rework
+ * P2-1; the suite incl. the ADR 0013 lifecycle, D-3 raw-resend and
+ * the interleaved-turn isolation pins is the safety net.
  *
  * Two lifetimes, one ledger:
  *   - INSTANCE-level (per provider, per window/session): the
@@ -15,13 +16,16 @@
  *     as a provider field; a window reload re-creates it (each image
  *     re-sends once per session — the accepted posture, see
  *     visionHistory.ts).
- *   - TURN-level: the `pendingImageHashes` container. The provider
- *     calls {@link beginTurn} at the top of every
- *     `provideLanguageModelChatResponse`; `applyVisionHistoryLifecycle`
- *     records first-send hashes into it; ONLY the branch whose stream
- *     genuinely resolved commits them ({@link commitTurn}); a turn
- *     that ends without its stream completing routes them into the
- *     failed-send counter instead ({@link recordFailedTurn}).
+ *   - TURN-level: the {@link TurnHandle} minted by {@link beginTurn}
+ *     at the top of every `provideLanguageModelChatResponse` CALL.
+ *     The handle is CALL-LOCAL state — exactly the lifetime of the
+ *     original `const pendingImageHashes = new Set()` local — so
+ *     concurrent requests are fully isolated (B's turn can never wipe
+ *     or commit A's pending hashes). ONLY the attempt whose stream
+ *     genuinely resolved commits the handle's hashes
+ *     ({@link commitTurn}); a turn that ends without its stream
+ *     completing routes them into the failed-send counter instead
+ *     ({@link recordFailedTurn}).
  *
  * Contract (unchanged since extraction):
  *   - commit-on-success (v0.20.1): a failed/cancelled turn must NOT
@@ -43,6 +47,18 @@ import {
   applyVisionHistoryLifecycle,
   resolveRawResendCap,
 } from './visionHistory.js';
+
+/**
+ * The per-turn PENDING hash container, minted by
+ * {@link TurnLedger.beginTurn} — one per
+ * `provideLanguageModelChatResponse` call (call-local lifetime; see
+ * the ledger's module docblock for the concurrency contract). Opaque
+ * by convention: callers hold it and hand it back to the ledger; they
+ * never read or mutate the set directly.
+ */
+export interface TurnHandle {
+  readonly pendingImageHashes: Set<string>;
+}
 
 export class TurnLedger {
   /**
@@ -82,41 +98,51 @@ export class TurnLedger {
   private readonly cappedImageHashes = new Map<string, number>();
   /** v0.21.0 D-3 — WARN-once-per-session latch for the first capped hash. */
   private visionResendCapWarned = false;
-  /**
-   * v0.20.1 (commit-on-success) — per-turn PENDING hash container.
-   * `applyVisionHistoryLifecycle` records first-send hashes HERE, not
-   * into {@link sentImageHashes}. Only the dispatch branch that
-   * actually completes commits. One container per request — a 404
-   * fallback that retries a second endpoint within the SAME request
-   * shares it. Re-created by {@link beginTurn} at the top of every
-   * request (above the provider's try, so the catch path can route
-   * the leftover pending hashes into the failed-send counter).
-   */
-  private pendingImageHashes = new Set<string>();
 
   /**
-   * Opens a new turn: fresh pending container. Called at the very top
-   * of `provideLanguageModelChatResponse`, above the try/catch, so a
-   * turn that fails anywhere can still account for its pending hashes
-   * (v0.21.0 D-3).
+   * v0.20.1 (commit-on-success) — the per-turn PENDING hash container.
+   * {@link TurnLedger.beginTurn} mints ONE handle per
+   * `provideLanguageModelChatResponse` CALL — exactly the lifetime of
+   * the original `const pendingImageHashes = new Set()` local.
+   * `applyVisionHistoryLifecycle` records first-send hashes into the
+   * HANDLE, not into {@link sentImageHashes}; only the attempt whose
+   * stream genuinely resolved commits them ({@link commitTurn}); a
+   * turn that ends without completing routes them into the failed-send
+   * counter instead ({@link recordFailedTurn}). A 404 fallback that
+   * retries a second endpoint within the SAME request shares the one
+   * handle.
+   *
+   * Rework P2-1 (falsified 2026-10-02, fix-then-ship): the first
+   * extraction stored this as a shared per-INSTANCE field reset by
+   * `beginTurn()` — under VS Code's PARALLEL provider calls
+   * (multi-participant chats, background title generation), request
+   * B's `beginTurn()` wiped in-flight request A's pending set (A
+   * under-committed → raw re-send amplifier, RCA-class 2026-09-25)
+   * and A's commit committed B's not-yet-sent hashes (broken
+   * commit-on-success). The handle restores call-local isolation:
+   * concurrent requests each hold their own container and cannot
+   * touch each other's turn state; only the INSTANCE-level maps above
+   * are shared (per-window session state, as before).
    */
-  beginTurn(): void {
-    this.pendingImageHashes = new Set<string>();
+  beginTurn(): TurnHandle {
+    return { pendingImageHashes: new Set<string>() };
   }
 
   /**
    * ADR 0013 lifecycle application — first send of a hash goes RAW,
    * repeats become in-band markers, capped hashes degrade to the
-   * never-sent marker. Thin pass-through so the provider does not
-   * thread the three instance maps at every call site.
+   * never-sent marker. Operates on the given turn's pending container
+   * (call-local — see {@link beginTurn}); the provider does not thread
+   * the three instance maps at every call site.
    */
   applyLifecycle(
     messages: readonly vscode.LanguageModelChatRequestMessage[],
+    turn: TurnHandle,
   ): vscode.LanguageModelChatRequestMessage[] {
     return applyVisionHistoryLifecycle(
       messages,
       this.sentImageHashes,
-      this.pendingImageHashes,
+      turn.pendingImageHashes,
       this.cappedImageHashes,
     );
   }
@@ -141,8 +167,11 @@ export class TurnLedger {
    * path). With `rawResendCap = 0` the check is skipped entirely:
    * the legacy commit-on-resolve behavior applies unchanged.
    */
-  commitTurn(token?: vscode.CancellationToken): void {
-    const pending = this.pendingImageHashes;
+  commitTurn(
+    turn: TurnHandle,
+    token?: vscode.CancellationToken,
+  ): void {
+    const pending = turn.pendingImageHashes;
     if (pending.size === 0) {
       return;
     }
@@ -171,8 +200,8 @@ export class TurnLedger {
    * container: no counting, no degradation, byte-identical v0.20.1
    * behavior.
    */
-  recordFailedTurn(): void {
-    this.recordFailedImageSends(this.pendingImageHashes);
+  recordFailedTurn(turn: TurnHandle): void {
+    this.recordFailedImageSends(turn.pendingImageHashes);
   }
 
   /**

@@ -746,15 +746,18 @@ export class OllamaCloudChatProvider
       throw new Error(`Unknown Ollama Cloud model: ${modelInfo.id}`);
     }
 
-    // v0.20.1 (commit-on-success) — open the turn's PENDING hash
-    // container on the ledger. The lifecycle records first-send hashes
+    // v0.20.1 (commit-on-success) — mint the turn's PENDING hash
+    // handle on the ledger. The lifecycle records first-send hashes
     // THERE, not into the instance sent-set; only the attempt whose
     // stream genuinely resolved commits them (a 404 fallback that
     // retries a second endpoint within the SAME request shares the
-    // container). Opened ABOVE the try (v0.21.0 D-3) so the catch path
-    // can route the leftover pending hashes into the failed-send
-    // counter. See turnLedger.ts for the full contract.
-    this.turnLedger.beginTurn();
+    // handle). The handle is CALL-LOCAL (rework P2-1): concurrent
+    // provideLanguageModelChatResponse calls each hold their own —
+    // a parallel request can never wipe or commit this turn's pending
+    // hashes. Opened ABOVE the try (v0.21.0 D-3) so the catch path can
+    // route the leftover pending hashes into the failed-send counter.
+    // See turnLedger.ts for the full contract.
+    const turn = this.turnLedger.beginTurn();
 
     try {
       // Resolve the connection for this model. Cloud connection models
@@ -877,7 +880,7 @@ export class OllamaCloudChatProvider
             // committed only after the pass-through stream resolved.
             const passThroughMessages =
               resolveVisionHistoryMode() === 'marker'
-                ? this.turnLedger.applyLifecycle(messages)
+                ? this.turnLedger.applyLifecycle(messages, turn)
                 : messages;
             const passThroughResult = await executePassThrough({
               primaryModel: model,
@@ -890,7 +893,7 @@ export class OllamaCloudChatProvider
               catalog: this.modelCatalog.list(),
               connections,
             });
-            this.turnLedger.commitTurn(token);
+            this.turnLedger.commitTurn(turn, token);
             return passThroughResult;
           }
           // two-phase — phase 1: vision describes the image, rewrite
@@ -962,7 +965,7 @@ export class OllamaCloudChatProvider
       // repeat-marker protection (that is the v0.18 lifecycle that
       // shipped with `'raw'` already in effect).
       if (requestHasImages && !twoPhaseRewroteHistory) {
-        messages = this.turnLedger.applyLifecycle(messages);
+        messages = this.turnLedger.applyLifecycle(messages, turn);
       }
 
       const clientBaseUrl = connection
@@ -1350,7 +1353,7 @@ export class OllamaCloudChatProvider
         if (outcome.kind === 'success') {
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.turnLedger.commitTurn(token);
+          this.turnLedger.commitTurn(turn, token);
           return; // success — no fallback needed
         }
         if (outcome.kind === 'terminal') {
@@ -1372,7 +1375,7 @@ export class OllamaCloudChatProvider
       // RAW counts as a failed send toward the raw-resend cap. Empty
       // for turns that failed before any raw send (vision gate, etc.)
       // and already cleared when a commit point ran.
-      this.turnLedger.recordFailedTurn();
+      this.turnLedger.recordFailedTurn(turn);
       logger.error('provideLanguageModelChatResponse failed.', error);
       throw classifyStreamError(error);
     }

@@ -15,10 +15,16 @@
  * {@link AttemptOutcome} per attempt and commits/records in ONE
  * place.
  *
- * Semantics are byte-identical to the pre-extraction branches
- * (cascade QA audit P2-2; the 797-test suite incl. the Issue #40
- * fallback-policy, OCP-2 410, native 3×404 and tunnel pins is the
- * safety net):
+ * Semantics are byte-identical to the pre-extraction branches for
+ * ALL request shapes, sequential AND concurrent (cascade QA audit
+ * P2-2 + rework P2-1; the suite incl. the Issue #40 fallback-policy,
+ * OCP-2 410, native 3×404, tunnel and interleaved-turn isolation
+ * pins is the safety net). Concurrency note: this module holds NO
+ * turn-scoped mutable state — everything it touches per request is
+ * captured call-locally in {@link EndpointDispatchInputs} (and the
+ * vision pending hashes live in the call-local TurnHandle, see
+ * turnLedger.ts); the only cross-request state it mutates is the
+ * module-level capability cache, exactly as the branches did:
  *   - the chain order is EXACT: responses-primary → native
  *     auto-recovery check → native-primary → responses-repeat →
  *     chat-primary → responses-last-resort → chat-final;
