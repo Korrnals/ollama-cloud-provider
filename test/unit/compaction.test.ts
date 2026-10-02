@@ -989,3 +989,179 @@ describe('compaction (v0.13.0 slice 1)', () => {
     });
   });
 });
+
+  // v0.22.0 (v0220-cc, QA-audit P2) — vision-state-INDEPENDENT basis.
+  // Vision-state transitions (raw→marker on the v0.20.1 commit,
+  // raw→never-sent-marker on the D-3 cap) rewrite a message INSIDE the
+  // d1 prefix basis; a basis fingerprinted over the wire render flips
+  // on the next turn and the projection is dropped (one-turn
+  // full-history whiplash + cooldown-gated re-fire). The `basisRender`
+  // seam lets the caller fingerprint a canonical form that is stable
+  // across those states. These tests use a miniature of the provider's
+  // canonicalization (raw image payload ↔ in-band marker → same
+  // `img:<hash>` token); the provider-level composition (T-1) lives in
+  // compactionVisionBasis.test.ts.
+  describe('basisRender — vision-state-independent projection basis (v0220-cc P2)', () => {
+    const HASH_A = 'a1b2c3d4e5f60718';
+    const HASH_B = 'b2c3d4e5f607189a';
+    const RAW_A = `t01u IMGDATA:${'A'.repeat(40)}`;
+    const MARK_A = `t01u [Image ${HASH_A} — duplicate of an image already sent in this session]`;
+    const RAW_B = `t15u IMGDATA:${'B'.repeat(40)}`;
+    const MARK_B = `t15u [Image ${HASH_B} — duplicate of an image already sent in this session]`;
+
+    // Wire render: `m.content` — raw payload and marker are DIFFERENT
+    // strings (exactly the production problem). Basis render: both
+    // canonicalize to the same `img:<hash>` token.
+    const basisRender = (m: Msg): string =>
+      m.content
+        .replace(/\[Image ([0-9a-f]{16}) — [^\]]*\]/g, 'img:$1')
+        .replace(/IMGDATA:A+/, `img:${HASH_A}`)
+        .replace(/IMGDATA:B+/, `img:${HASH_B}`);
+
+    const history = (first: string, fifteenth: string): Msg[] => {
+      const t = turns(20);
+      t[0] = { role: 'user', content: first };
+      t[28] = { role: 'user', content: fifteenth };
+      return [sys('s1'), ...t];
+    };
+    const grownTail = (): Msg[] => turns(5, 50, 21);
+
+    it('projection SURVIVES a raw→marker flip of a prefix image when basisRender is stable', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const first = await compactIfNeeded({
+        messages: history(RAW_A, RAW_B),
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        basisRender,
+        nowMs: 1_000_000,
+      });
+      assert.strictEqual(first.compacted, true, 'fixture: fire 1 fires');
+      assert.ok(first.state.projection, 'projection remembered');
+
+      // Next turn, inside the cooldown: the SAME image now arrives in
+      // marker form (its raw send committed), tail grown. Wire renders
+      // differ; basis renders must match.
+      const second = await compactIfNeeded({
+        messages: [...history(MARK_A, MARK_B), ...grownTail()],
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        basisRender,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.reapplied, true, 'projection re-applied across the vision-state flip');
+      assert.strictEqual(second.droppedProjection, false);
+      assert.strictEqual(summarize.calls.length, 1, 'no re-fire inside the cooldown');
+      assert.strictEqual(second.compacted, false);
+      assert.ok(second.messages.some((m) => (m as Msg).content.startsWith(SUMMARY_MARKER)));
+      assert.ok(!second.messages.some((m) => (m as Msg).content.includes('t01u')), 'evicted prefix stays evicted');
+      assert.ok(second.messages.some((m) => (m as Msg).content.includes('t25a')), 'grown tail appended');
+    });
+
+    it('negative control: the same flip WITHOUT basisRender drops the projection (the P2 whiplash)', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const first = await compactIfNeeded({
+        messages: history(RAW_A, RAW_B),
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        nowMs: 1_000_000,
+      });
+      assert.strictEqual(first.compacted, true);
+      const second = await compactIfNeeded({
+        messages: [...history(MARK_A, MARK_B), ...grownTail()],
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.reapplied, false);
+      assert.strictEqual(second.droppedProjection, true, 'wire-render basis flips → projection dropped');
+    });
+
+    it('a chained re-fire fingerprints NEW basis entries with basisRender too', async () => {
+      const store = fakeStore('ptr-1');
+      const summarize = fakeSummarizer('SUMMARY-ONE');
+      const first = await compactIfNeeded({
+        messages: history(RAW_A, RAW_B),
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: { armed: true },
+        summarize,
+        store,
+        render,
+        basisRender,
+        nowMs: 1_000_000,
+      });
+      assert.strictEqual(first.compacted, true);
+      const basisLen1 = first.state.projection!.basis.length;
+
+      // Turn 2 (cooldown): markerized t01 only — t15 still raw. Re-apply.
+      const t2 = [...history(MARK_A, RAW_B), ...grownTail()];
+      const second = await compactIfNeeded({
+        messages: t2,
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: first.state,
+        summarize,
+        store,
+        render,
+        basisRender,
+        nowMs: 1_060_000,
+      });
+      assert.strictEqual(second.reapplied, true);
+
+      // Fire 2 past the cooldown consumes the t15 region into the
+      // basis — fingerprinted with basisRender, over the RAW form.
+      const fired2 = await compactIfNeeded({
+        messages: t2,
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: second.state,
+        summarize,
+        store,
+        render,
+        basisRender,
+        nowMs: 1_500_000,
+      });
+      assert.strictEqual(fired2.compacted, true, 'fixture: fire 2 fires');
+      assert.ok(fired2.state.projection, 'fire 2 remembers a projection');
+      assert.ok(
+        fired2.state.projection!.basis.length > basisLen1,
+        'fire 2 extended the basis (t15 region consumed)',
+      );
+
+      // Turn 3 (cooldown of fire 2): t15 now arrives MARKERIZED. If the
+      // extended basis entries were wire-render fingerprints, this flip
+      // would drop the projection; with basisRender it re-applies.
+      const third = await compactIfNeeded({
+        messages: [...history(MARK_A, MARK_B), ...grownTail()],
+        windowTokens: 1400,
+        charsPerToken: 1,
+        state: fired2.state,
+        summarize,
+        store,
+        render,
+        basisRender,
+        nowMs: 1_560_000,
+      });
+      assert.strictEqual(third.reapplied, true, 'extended basis survives the t15 raw→marker flip');
+      assert.strictEqual(third.droppedProjection, false);
+      assert.strictEqual(summarize.calls.length, 2, 'no re-fire beyond the two fixture fires');
+    });
+  });

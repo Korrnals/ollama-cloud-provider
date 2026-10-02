@@ -80,7 +80,7 @@ import {
   resolveRawResendCap,
   resolveVisionHistoryMode,
 } from './visionHistory.js';
-import { executeTwoPhaseVision } from './visionTwoPhase.js';
+import { executeTwoPhaseVision, sha256ShortHex } from './visionTwoPhase.js';
 import type {
   NativeChatMessage,
   NativeChatTool,
@@ -1996,6 +1996,86 @@ export class OllamaCloudChatProvider
   }
 
   /**
+   * v0.22.0 (v0220-cc, QA-audit P2) — recognizes the three in-band
+   * image markers emitted by `visionHistory.ts` (`MARKER_TEMPLATE`,
+   * `degradedImageMarker`, `neverSentImageMarker`): all open with
+   * `[Image <16-hex hash> — `; the never-sent variant appends an
+   * attempts note after the closing bracket. Captures the hash so
+   * {@link renderCompactionBasis} can canonicalize a marker back to
+   * the identity of the image it replaced.
+   */
+  private static readonly IMAGE_MARKER_RE =
+    /\[Image ([0-9a-f]{16}) — [^\]]*\](?: \[image never successfully sent — \d+ attempts failed\])?/g;
+
+  /**
+   * v0.22.0 (v0220-cc, QA-audit P2) — vision-state-INDEPENDENT render
+   * of an OpenAI-format message, used ONLY as the projection-basis
+   * fingerprint render (`compactIfNeeded`'s `basisRender`).
+   *
+   * Why: vision-state transitions (raw→marker on the v0.20.1 commit,
+   * raw→never-sent-marker on the D-3 cap) rewrite a message INSIDE the
+   * d1 prefix basis. A basis fingerprinted over the WIRE render
+   * (`JSON.stringify`, raw base64 vs ~100-char marker) flips on the
+   * very next turn → projection dropped → one-turn full-history
+   * whiplash + cooldown-gated re-fire (self-healing but real).
+   *
+   * Canonical form per message — `user␂<text>␂<sorted hashes>`:
+   *   - text: the concatenated text of the message with every image
+   *     marker STRIPPED (markers are state, not content);
+   *   - hashes: the sorted set of image identities — the 16-hex sha
+   *     extracted from markers, or recomputed from a raw
+   *     `data:…;base64,` URL (`sha256ShortHex` over the decoded bytes
+   *     — byte-identical to the hash the vision lifecycle computed on
+   *     the raw part, so the SAME image yields the SAME identity in
+   *     raw and marker form). Sorted because the raw form separates
+   *     text/image parts while the marker form concatenates them,
+   *     losing the interleave order — ordering of image identities
+   *     themselves is preserved by sorting deterministically.
+   * Non-user messages never change render across vision states (the
+   * lifecycle rewrites user messages only) — the wire render is
+   * already stable for them. The WIRE render is untouched: estimates,
+   * store payloads and summarizer prompts keep seeing raw/markers
+   * exactly as before.
+   */
+  private renderCompactionBasis(m: OpenAICompatibleMessage): string {
+    const hashFromDataUrl = (url: string): string => {
+      // Mirror visionHistory's empty-data sentinel so a zero-byte
+      // image canonicalizes identically in raw and marker form.
+      const prefix = 'data:';
+      const sep = ';base64,';
+      const at = url.indexOf(sep);
+      if (!url.startsWith(prefix) || at < 0) {
+        return url; // non-data URL: opaque but stable (never rewritten)
+      }
+      const b64 = url.slice(at + sep.length);
+      if (b64.length === 0) return 'no-image';
+      return sha256ShortHex(Buffer.from(b64, 'base64'));
+    };
+    if (m.role !== 'user') return JSON.stringify(m);
+    let text = '';
+    const hashes: string[] = [];
+    const stripMarkers = (s: string): string =>
+      s.replace(OllamaCloudChatProvider.IMAGE_MARKER_RE, (_, hash: string) => {
+        hashes.push(hash);
+        return '';
+      });
+    const content = m.content;
+    if (typeof content === 'string') {
+      text = stripMarkers(content);
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part.type === 'text') {
+          text += stripMarkers(part.text);
+        } else if (part.type === 'image_url') {
+          hashes.push(hashFromDataUrl(part.image_url.url));
+        }
+      }
+    }
+    hashes.sort();
+    return `user\u0002${JSON.stringify(text)}\u0002${hashes.join(',')}`;
+  }
+
+  /**
    * v0.13.0 Slice 2 — runs one compaction check over the OpenAI-format
    * history when `ollamaCloud.compaction.enabled` is on (default ON
    * since v0.19.0, ArchCom 2026-09-15 T2). Returns the messages to
@@ -2095,6 +2175,11 @@ export class OllamaCloudChatProvider
         summarize: summarizer,
         store,
         render: (m) => JSON.stringify(m),
+        // v0220-cc P2 — basis fingerprints are computed over the
+        // vision-state-INDEPENDENT canonical form so a raw→marker
+        // transition inside the evicted prefix cannot drop the
+        // projection (whiplash). The wire render above is unchanged.
+        basisRender: (m) => this.renderCompactionBasis(m),
         ...(summarizerWindowTokens !== undefined
           ? { summarizerWindowTokens }
           : {}),
