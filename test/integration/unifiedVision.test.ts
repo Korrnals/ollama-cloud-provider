@@ -1491,8 +1491,13 @@ describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)',
       // Tightened post-discard assertion: the buffered tool_call deltas
       // were in the OPEN window when the cancel fired — they must be
       // DISCARDED, never delivered to the host after the cancel.
+      // v0221-p2-composition-tests: the filter matches the part by
+      // instanceof — the previous `(p as {toolCallId}).toolCallId`
+      // filter was VACUOUS on the test stub (the part exposes `callId`,
+      // mirroring the real API), so it could never go red on a
+      // discard-on-cancel regression.
       const leakedToolCalls = progress.parts.filter(
-        (p) => (p as { toolCallId?: unknown }).toolCallId !== undefined,
+        (p) => p instanceof vscode.LanguageModelToolCallPart,
       );
       assert.strictEqual(
         leakedToolCalls.length,
