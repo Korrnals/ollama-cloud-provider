@@ -415,30 +415,31 @@ function resolveResponsesTools(
 }
 
 /**
- * ADR 0007 — resolves the native `/api/chat` `messages[]` array from
- * the filter state. When the context filter ran (`filterReport !==
- * undefined`, i.e. `safe`/`aggressive`), the filter produced a
- * filtered `OpenAICompatibleMessage[]` (`filteredMessages`) — convert
- * it directly to the native schema via
- * `convertOpenAIMessagesToNative` (no VS Code ↔ OpenAI round-trip,
- * symmetric with `convertOpenAIMessagesToResponsesInput` for
- * `/v1/responses`). When the filter did NOT run (`off` fast path,
- * `filterReport === undefined`), convert the ORIGINAL VS Code
- * `messages` via `convertMessagesToNative` — the regression path is
- * untouched.
+ * ADR 0007 + v0220-a — resolves the native `/api/chat` `messages[]`
+ * array from the upstream-transform state. When the context filter ran
+ * (`safe`/`aggressive`) OR compaction shaped the history (fire or
+ * sticky re-apply — `shapedMessages` true), convert the shaped
+ * `OpenAICompatibleMessage[]` (`filteredMessages`) directly to the
+ * native schema via `convertOpenAIMessagesToNative` (no VS Code ↔
+ * OpenAI round-trip, symmetric with
+ * `convertOpenAIMessagesToResponsesInput` for `/v1/responses`). When
+ * NEITHER transform ran (`off` fast path below the compaction
+ * threshold), convert the ORIGINAL VS Code `messages` via
+ * `convertMessagesToNative` — the regression path is untouched.
  *
- * Without this, the native path — the DEFAULT endpoint for cloud
- * (`auto` → native) — silently bypassed the filter: default users got
- * zero filtering and the `Context filter:` log line never fired for
- * them. `requestChars` (computed AFTER the filter) is now accurate
- * for the native path too.
+ * History: the original ADR 0007 fix made the native path (the
+ * DEFAULT endpoint for cloud, `auto` → native) stop bypassing the
+ * filter. v0220-a extended the same routing to compaction output:
+ * gating on `filterReport` alone meant that at the shipped defaults
+ * (filter `off`, compaction ON) native converted the RAW messages and
+ * the compaction state machine ran for nothing.
  */
 function resolveNativeMessages(
-  filterReport: ReturnType<typeof filterContext>['report'] | undefined,
+  shapedMessages: boolean,
   filteredMessages: readonly OpenAICompatibleMessage[],
   originalMessages: readonly vscode.LanguageModelChatRequestMessage[],
 ): NativeChatMessage[] {
-  if (filterReport !== undefined) {
+  if (shapedMessages) {
     return convertOpenAIMessagesToNative(filteredMessages);
   }
   return convertMessagesToNative(originalMessages);
@@ -1219,6 +1220,14 @@ export class OllamaCloudChatProvider
         modelOptions,
       );
       let openaiMessages = convertMessagesToOpenAI(messages);
+      // v0220-a (P1) — capture the PRE-compaction array reference.
+      // `maybeCompact` returns this exact reference on every passthrough
+      // path and a NEW array only when it shaped the history (a fire or
+      // a sticky projection re-apply), so the identity check
+      // `openaiMessages !== rawOpenAIMessages` after the call is the
+      // precise "compaction shaped this turn" signal for endpoint
+      // dispatch (see `shapedMessages` at the dispatch block).
+      const rawOpenAIMessages = openaiMessages;
 
       // v0.13.0 Slice 2 — context compaction (spec:
       // docs/compaction-spec.md). Runs BEFORE the ADR 0007
@@ -1508,6 +1517,30 @@ export class OllamaCloudChatProvider
         throw endpointExplicitUnavailableError('native', connectionId);
       }
 
+      // v0220-a (P1) — dispatch gate for the message SOURCE. The
+      // shaped `filteredMessages` array reaches the wire when EITHER
+      // upstream transform ran:
+      //   - the ADR 0007 context filter (`safe`/`aggressive` —
+      //     `filterReport` set), or
+      //   - compaction (fire or sticky projection re-apply), which runs
+      //     at ANY filter level including `off` — detected by array
+      //     identity (`maybeCompact` passes the original reference
+      //     through otherwise).
+      // Before this, the gate was `filterReport !== undefined` alone, so
+      // at the shipped defaults (filter `off`, compaction ON since
+      // v0.19.0) the two converter-based endpoints (native `/api/chat`,
+      // `/v1/responses`) converted the RAW VS Code messages — the
+      // compaction state machine ran (summarizer charged, store writes,
+      // sticky projections) but its output never shaped the wire on
+      // those endpoints. Filter level semantics are UNTOUCHED: `off`
+      // still means no truncation, no `filterContext` call, no
+      // `Context filter:` log — it does not mean "no compaction". When
+      // NEITHER transform ran, every endpoint keeps its original VS
+      // Code conversion path byte-for-byte (default-config users below
+      // the compaction threshold see zero wire change; pinned by test).
+      const shapedMessages =
+        filterReport !== undefined || openaiMessages !== rawOpenAIMessages;
+
       // native `/api/chat` path — reached when primaryEndpoint==='native',
       // i.e. explicit 'native' OR 'auto' (the default) resolving to native
       // for cloud. Auto mode uses the 3×404 auto-recovery below; explicit
@@ -1522,17 +1555,19 @@ export class OllamaCloudChatProvider
             connection,
             ssrfGuard,
           );
-          // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
-          // When the filter ran (`filterReport !== undefined`), shape
-          // the filtered `OpenAICompatibleMessage[]` directly into
+          // ADR 0007 + v0220-a — `/v1/responses` consumes the SHAPED
+          // payload. When the filter ran (`filterReport !== undefined`)
+          // OR compaction shaped the history (`shapedMessages`), shape
+          // the `OpenAICompatibleMessage[]` directly into
           // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
-          // (no VS Code ↔ OpenAI round-trip — keeps the filter
-          // endpoint-agnostic and avoids lossy re-conversion). When the
-          // filter did NOT run (`off` fast path), use the original
+          // (no VS Code ↔ OpenAI round-trip — keeps the upstream
+          // transforms endpoint-agnostic and avoids lossy
+          // re-conversion). When NEITHER ran (`off` fast path below the
+          // compaction threshold), use the original
           // `convertToResponsesInput` on the VS Code `messages` (the
-          // 375-test regression path is untouched).
+          // pre-#39 regression path stays untouched).
           const { input, instructions } =
-            filterReport !== undefined
+            shapedMessages
               ? convertOpenAIMessagesToResponsesInput(filteredMessages)
               : convertToResponsesInput(messages);
           const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
@@ -1620,16 +1655,17 @@ export class OllamaCloudChatProvider
             'native',
             ssrfGuard,
           );
-          // ADR 0007 — native `/api/chat` consumes the FILTERED
-          // payload, mirroring the `/v1/responses` path above: when
-          // the filter ran, convert the filtered OpenAI messages/tools
-          // directly (no VS Code ↔ OpenAI round-trip); when the filter
-          // is `off`, the original conversion path runs unchanged.
-          // Before this, the native path — the DEFAULT for cloud
-          // (`auto` → native) — silently bypassed the filter.
+          // ADR 0007 + v0220-a — native `/api/chat` consumes the SHAPED
+          // payload, mirroring the `/v1/responses` path above: when the
+          // filter ran OR compaction shaped the history, convert the
+          // shaped OpenAI messages/tools directly (no VS Code ↔ OpenAI
+          // round-trip); when neither ran, the original conversion path
+          // runs unchanged. Before ADR 0007, the native path silently
+          // bypassed the filter; before v0220-a it silently bypassed
+          // compaction at filter `off`.
           // ADR 0013 lifecycle — already applied once above the
           // dispatch (all three branches share it); no per-branch copy.
-          const nativeMessages = resolveNativeMessages(filterReport, filteredMessages, messages);
+          const nativeMessages = resolveNativeMessages(shapedMessages, filteredMessages, messages);
           const nativeTools = resolveNativeTools(filterReport, filteredTools, options.tools);
           const nativeConfig = resolveModelRequestConfiguration(model, modelOptions, 'native');
           await this.runStream(
@@ -1706,17 +1742,19 @@ export class OllamaCloudChatProvider
             connection,
             ssrfGuard,
           );
-          // ADR 0007 — `/v1/responses` consumes the FILTERED payload.
-          // When the filter ran (`filterReport !== undefined`), shape
-          // the filtered `OpenAICompatibleMessage[]` directly into
+          // ADR 0007 + v0220-a — `/v1/responses` consumes the SHAPED
+          // payload. When the filter ran (`filterReport !== undefined`)
+          // OR compaction shaped the history (`shapedMessages`), shape
+          // the `OpenAICompatibleMessage[]` directly into
           // `/v1/responses` input via `convertOpenAIMessagesToResponsesInput`
-          // (no VS Code ↔ OpenAI round-trip — keeps the filter
-          // endpoint-agnostic and avoids lossy re-conversion). When the
-          // filter did NOT run (`off` fast path), use the original
+          // (no VS Code ↔ OpenAI round-trip — keeps the upstream
+          // transforms endpoint-agnostic and avoids lossy
+          // re-conversion). When NEITHER ran (`off` fast path below the
+          // compaction threshold), use the original
           // `convertToResponsesInput` on the VS Code `messages` (the
-          // 375-test regression path is untouched).
+          // pre-#39 regression path stays untouched).
           const { input, instructions } =
-            filterReport !== undefined
+            shapedMessages
               ? convertOpenAIMessagesToResponsesInput(filteredMessages)
               : convertToResponsesInput(messages);
           const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);
@@ -1841,10 +1879,10 @@ export class OllamaCloudChatProvider
             connection,
             ssrfGuard,
           );
-          // ADR 0007 — same filtered-payload routing as the primary
-          // /v1/responses path above.
+          // ADR 0007 + v0220-a — same shaped-payload routing as the
+          // primary /v1/responses path above.
           const { input, instructions } =
-            filterReport !== undefined
+            shapedMessages
               ? convertOpenAIMessagesToResponsesInput(filteredMessages)
               : convertToResponsesInput(messages);
           const responsesTools = resolveResponsesTools(filterReport, filteredTools, options.tools);

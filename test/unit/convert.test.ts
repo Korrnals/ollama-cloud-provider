@@ -248,10 +248,16 @@ describe('convert.convertOpenAIMessagesToNative (ADR 0007 — filtered payload �
     assert.deepEqual(result, [{ role: 'user', content: 'hello' }]);
   });
 
-  it('keeps text parts and skips image parts from part-array content', () => {
-    // Vision content never reaches this path by design (the vision
-    // gate routes image requests before the filter) — the image part
-    // is skipped without crashing (defence-in-depth).
+  it('keeps text parts and maps image_url parts to the user message images[] array (v0220-a P1)', () => {
+    // v0220-a P1 — the shaped path is LOSSLESS: `image_url` parts map
+    // to the user message's `images[]` array as bare base64
+    // (data-URL prefix stripped), mirroring `convertMessagesToNative`.
+    // The ADR 0007-era skip was based on the false premise that
+    // vision content never reaches this path — the ADR 0013 lifecycle
+    // passes the FIRST send of an image hash RAW, so a raw data URL
+    // legitimately flows here (filter safe/aggressive, and the shipped
+    // defaults since the v0220-a dispatch gate). Before the fix this
+    // test pinned the defect (image dropped, debug log only).
     const result = convertOpenAIMessagesToNative([
       {
         role: 'user',
@@ -262,7 +268,9 @@ describe('convert.convertOpenAIMessagesToNative (ADR 0007 — filtered payload �
         ],
       },
     ]);
-    assert.deepEqual(result, [{ role: 'user', content: 'look at this' }]);
+    assert.deepEqual(result, [
+      { role: 'user', content: 'look at this', images: ['xxx'] },
+    ]);
   });
 
   it('parses assistant tool_calls arguments from JSON string to object', () => {
