@@ -46,6 +46,11 @@
  *
  * Opt-out: `ollamaCloud.visionHistory.mode = 'raw'` (first-send raw;
  * repeats still become markers). Default: `'marker'`.
+ *
+ * v0.21.0 D-3 (owner-ratified 2026-10-02) — raw-resend cap: a hash
+ * whose raw send failed `rawResendCap` times (default 3, config
+ * `ollamaCloud.visionHistory.rawResendCap`, 0 = unlimited legacy)
+ * degrades permanently for the session to the never-sent marker.
  */
 
 import * as vscode from 'vscode';
@@ -71,6 +76,34 @@ export function resolveVisionHistoryMode(): VisionHistoryMode {
   return mode === 'raw' ? 'raw' : 'marker';
 }
 
+/**
+ * v0.21.0 D-3 (owner-ratified 2026-10-02) — default number of failed
+ * raw sends after which an image hash degrades to a marker for the
+ * rest of the session. See {@link resolveRawResendCap}.
+ */
+export const DEFAULT_RAW_RESEND_CAP = 3;
+
+/**
+ * v0.21.0 D-3 — resolves `ollamaCloud.visionHistory.rawResendCap`.
+ * Caps the resend amplifier RCA: a turn whose stream fails never
+ * commits its pending hashes (v0.20.1 commit-on-success), so every
+ * subsequent turn re-sent those images as RAW base64 — requestChars
+ * spiked (3.3M chars observed), over-window compaction fired and
+ * evicted mass history. After this many failed attempts the hash
+ * degrades permanently (per session) to the never-sent marker.
+ * 0 = unlimited raw re-sends (the pre-v0.21 legacy behavior).
+ * Invalid values clamp to the default.
+ */
+export function resolveRawResendCap(): number {
+  const value = vscode.workspace
+    .getConfiguration('ollamaCloud')
+    .get<unknown>('visionHistory.rawResendCap', DEFAULT_RAW_RESEND_CAP);
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return DEFAULT_RAW_RESEND_CAP;
+  }
+  return Math.max(0, Math.floor(value));
+}
+
 const MARKER_TEMPLATE =
   (hash: string) =>
   `[Image ${hash} — duplicate of an image already sent in this session; if you cannot find its analysis in the history above, ask the user to re-attach it]`;
@@ -87,6 +120,15 @@ const MARKER_TEMPLATE =
  */
 export const degradedImageMarker = (hash: string): string =>
   `[Image ${hash} — attached image could not be described (no vision model available or the description failed); if you need its content, ask the user to re-attach it]`;
+
+/**
+ * v0.21.0 D-3 — marker for a hash that exhausted the raw-resend cap:
+ * the same in-band marker shape as a committed repeat, with an
+ * appended note stating the image never reached the model. The model
+ * must not mistake a capped image for one it has already analyzed.
+ */
+export const neverSentImageMarker = (hash: string, attempts: number): string =>
+  `${MARKER_TEMPLATE(hash)} [image never successfully sent — ${attempts} attempts failed]`;
 
 /**
  * Rewrites `messages`: first-send hashes pass through RAW and are
@@ -108,6 +150,10 @@ export const degradedImageMarker = (hash: string): string =>
  * 2026-09-25: a hash committed at dispatch time survived a DNS-failed
  * turn, and the image was never shown to the model).
  *
+ * v0.21.0 D-3 — `cappedHashes` (optional) carries hashes whose failed
+ * raw sends reached `rawResendCap`: those degrade to the never-sent
+ * marker INSTEAD of a raw re-send, capping the resend amplifier.
+ *
  * Returns a NEW array; untouched messages are shared by reference
  * (message objects are copied only where a substitution happened).
  */
@@ -115,6 +161,7 @@ export function applyVisionHistoryLifecycle(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
   sentHashes: ReadonlySet<string>,
   pendingHashes: Set<string>,
+  cappedHashes?: ReadonlyMap<string, number>,
 ): vscode.LanguageModelChatRequestMessage[] {
   let changed = false;
   const result: vscode.LanguageModelChatRequestMessage[] = [];
@@ -151,7 +198,19 @@ export function applyVisionHistoryLifecycle(
         data && data.length > 0
           ? sha256ShortHex(Buffer.from(data))
           : 'no-image';
-      if (sentHashes.has(hash) || pendingHashes.has(hash)) {
+      const cappedAttempts = cappedHashes?.get(hash);
+      if (cappedAttempts !== undefined) {
+        // v0.21.0 D-3 — the hash exhausted the raw-resend cap: degrade
+        // permanently (per session) to the never-sent marker instead of
+        // re-uploading raw base64. Not recorded into pending — nothing
+        // raw is being sent for this hash.
+        changed = true;
+        newContent.push(
+          new vscode.LanguageModelTextPart(
+            neverSentImageMarker(hash, cappedAttempts),
+          ),
+        );
+      } else if (sentHashes.has(hash) || pendingHashes.has(hash)) {
         // Second+ send of the same image — substitute the marker.
         changed = true;
         newContent.push(new vscode.LanguageModelTextPart(MARKER_TEMPLATE(hash)));

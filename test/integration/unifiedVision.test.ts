@@ -932,3 +932,369 @@ describe('vision hash commit-on-success (v0.20.1 RCA) — G3 gates', () => {
     assert.ok(turn3.includes('[Image'), 'marker text present');
   });
 });
+
+/**
+ * v0.21.0 D-3 (owner-ratified 2026-10-02) — raw-resend cap. The v0.20.1
+ * commit-on-success contract left a failed turn's hashes uncommitted, so
+ * every subsequent turn re-sent those images RAW (~2M base64 chars per
+ * screenshot per turn) until a success landed — the cascade amplifier
+ * behind the 3.3M-char requests and over-window compaction. After
+ * `visionHistory.rawResendCap` (default 3) failed sends the hash
+ * degrades for the session to the never-sent marker.
+ *
+ * Failure accounting hooks: (1) the provideLanguageModelChatResponse
+ * catch (terminal error path) and (2) the commit points, where a
+ * cancelled token distinguishes the D-2 quiet-completed cancel from a
+ * genuine stream completion (a cancel fires onDone, which resolves
+ * runStream — the token is the discriminator available at the commit
+ * site).
+ */
+describe('vision raw-resend cap (v0.21.0 D-3)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    clearImageDescriptionCache();
+    apiChatCalls = [];
+    chatCalls = [];
+    logger.getRecentErrors().splice(0);
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+    });
+    originalFetch = global.fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    logger.getRecentErrors().splice(0);
+    clearImageDescriptionCache();
+    setConfig({});
+    for (const dir of storageDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /** Fetch stub with a controllable primary outcome: 'fail' → HTTP 500, 'ok' → SSE stream. */
+  function installPrimaryFetch(mode: 'fail' | 'ok'): void {
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        return new Response(JSON.stringify({ message: { content: 'unused' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      chatCalls.push({ url: urlStr, body: parsed ?? {} });
+      if (mode === 'fail') {
+        return new Response('upstream exploded', { status: 500 });
+      }
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+  }
+
+  function makeCall(provider: OllamaCloudChatProvider, token: vscode.CancellationToken) {
+    return (msgs: vscode.LanguageModelChatRequestMessage[]) =>
+      provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        msgs,
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        token,
+      );
+  }
+
+  it('(a) below the cap — failed turns keep re-sending RAW; a success commits and exempts', async () => {
+    installPrimaryFetch('fail');
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const call = makeCall(provider, new vscode.CancellationTokenSource().token);
+
+    // Turns 1–2 fail (default cap 3 → two failures stay below it):
+    // v0.20.1 semantics intact — every retry re-sends the image RAW.
+    for (let turn = 1; turn <= 2; turn++) {
+      await assert.rejects(
+        () => call([imageMsg(IMG_A)]),
+        /Server error \(HTTP 500\)/,
+        `turn ${turn} failed with a surfaced server error`,
+      );
+      assert.ok(
+        JSON.stringify(chatCalls[chatCalls.length - 1]!.body).includes('image_url'),
+        `turn ${turn} re-sent the image RAW (below the cap)`,
+      );
+    }
+
+    // Turn 3 succeeds with the RAW re-send (the model finally sees it)
+    // and COMMITS the hash — the success exempts it forever.
+    installPrimaryFetch('ok');
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('partial answer'),
+      userMsg('and now?'),
+    ]);
+    const turn3 = JSON.stringify(chatCalls[2]!.body);
+    assert.ok(turn3.includes('image_url'), 'turn 3 still re-sends RAW at N-1 failures');
+    // Turn 4: committed hash → the plain repeat marker, WITHOUT the
+    // never-sent note (the image DID reach the model on turn 3).
+    await call([
+      imageMsg(IMG_A),
+      assistantMsg('answer from primary'),
+      userMsg('what else?'),
+    ]);
+    const turn4 = JSON.stringify(chatCalls[3]!.body);
+    assert.ok(!turn4.includes('image_url'), 'committed repeat is a marker');
+    assert.ok(turn4.includes('[Image'), 'marker text present');
+    assert.ok(
+      !turn4.includes('never successfully sent'),
+      'committed repeats never carry the never-sent note',
+    );
+  });
+
+  it('(b) at the cap — after N failed turns the hash degrades: never-sent marker, no raw payload', async () => {
+    installPrimaryFetch('fail');
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const call = makeCall(provider, new vscode.CancellationTokenSource().token);
+
+    // Turns 1–3 fail → the failure counter reaches the default cap 3.
+    for (let turn = 1; turn <= 3; turn++) {
+      await assert.rejects(
+        () => call([imageMsg(IMG_A)]),
+        /Server error \(HTTP 500\)/,
+        `turn ${turn} failed`,
+      );
+      assert.ok(
+        JSON.stringify(chatCalls[turn - 1]!.body).includes('image_url'),
+        `turn ${turn} re-sent the image RAW (attempt ${turn})`,
+      );
+    }
+
+    // Turn 4: the capped hash is NOT re-uploaded — the never-sent
+    // marker replaces the image part entirely.
+    await assert.rejects(
+      () => call([imageMsg(IMG_A), assistantMsg('x'), userMsg('again?')]),
+      /Server error \(HTTP 500\)/,
+      'turn 4 still fails on the server',
+    );
+    const turn4 = JSON.stringify(chatCalls[3]!.body);
+    assert.ok(!turn4.includes('image_url'), 'turn 4 carries NO raw image payload');
+    assert.ok(
+      turn4.includes('never successfully sent') && turn4.includes('3 attempts failed'),
+      `never-sent note with the attempt count present: ${turn4.slice(0, 400)}`,
+    );
+
+    // The degradation is permanent for the session, not per-request:
+    // a later healthy turn still gets the marker, not a re-upload.
+    installPrimaryFetch('ok');
+    await call([imageMsg(IMG_A), assistantMsg('x'), userMsg('healthy now?')]);
+    const turn5 = JSON.stringify(chatCalls[4]!.body);
+    assert.ok(!turn5.includes('image_url'), 'capped hash stays degraded after the server recovers');
+    assert.ok(turn5.includes('never successfully sent'), 'never-sent note persists for the session');
+  });
+
+  it('(c) cap=0 — unlimited raw re-sends (legacy behavior, no counting)', async () => {
+    // getRecentErrors() returns a COPY (and accumulates for the whole
+    // session) — assert on the DELTA of cap lines, not absolute absence.
+    const capLinesBefore = logger
+      .getRecentErrors()
+      .filter((line) => line.includes('vision resend cap')).length;
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionHistory.rawResendCap': 0,
+    });
+    installPrimaryFetch('fail');
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const call = makeCall(provider, new vscode.CancellationTokenSource().token);
+
+    // 5 failed turns — far past the default cap of 3; with cap=0 every
+    // turn must still re-send the image RAW (the pre-v0.21 behavior).
+    for (let turn = 1; turn <= 5; turn++) {
+      await assert.rejects(
+        () => call([imageMsg(IMG_A)]),
+        /Server error \(HTTP 500\)/,
+        `turn ${turn} failed`,
+      );
+      assert.ok(
+        JSON.stringify(chatCalls[turn - 1]!.body).includes('image_url'),
+        `turn ${turn} re-sent the image RAW (cap=0 → unlimited)`,
+      );
+    }
+    const capLinesAfter = logger
+      .getRecentErrors()
+      .filter((line) => line.includes('vision resend cap')).length;
+    assert.equal(
+      capLinesAfter,
+      capLinesBefore,
+      'no NEW cap diagnostics with cap=0',
+    );
+  });
+
+  it('(d) a quiet-completed cancel (D-2 onDone path) counts as a failed send', async () => {
+    // Hanging SSE body: 200 + a stream that never completes on its
+    // own. Only the caller's cancellation ends it — the token's abort
+    // errors the body, readStreamOnce routes AbortError + abortReason
+    // 'cancel' to onDone (the D-2 quiet completion), runStream
+    // resolves, and the commit site sees the cancelled token.
+    global.fetch = (async (url: unknown, init?: { body?: unknown; signal?: AbortSignal }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        return new Response(JSON.stringify({ message: { content: 'unused' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      chatCalls.push({ url: urlStr, body: parsed ?? {} });
+      const signal = init?.signal;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            signal?.addEventListener('abort', () => {
+              const err = new Error('The operation was aborted');
+              err.name = 'AbortError';
+              controller.error(err);
+            });
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+
+    // Turns 1–3: cancelled mid-stream → each resolves QUIETLY (no
+    // provider failure — the D-2 invariant) and each counts as one
+    // failed raw send for the cap.
+    for (let turn = 1; turn <= 3; turn++) {
+      const cts = new vscode.CancellationTokenSource();
+      const pending = provider.provideLanguageModelChatResponse(
+        chatInfoFor('kimi-k3'),
+        [imageMsg(IMG_A)],
+        {
+          modelOptions: {},
+          justification: 'test',
+        } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+        makeProgress(),
+        cts.token,
+      );
+      await waitFor(() => chatCalls.length === turn);
+      cts.cancel();
+      await pending; // resolves quietly — must NOT reject (D-2)
+      assert.ok(
+        JSON.stringify(chatCalls[turn - 1]!.body).includes('image_url'),
+        `cancelled turn ${turn} had sent the image RAW`,
+      );
+    }
+
+    // Turn 4: three quiet-completed cancels exhausted the cap — the
+    // hash degrades to the never-sent marker instead of a 4th upload.
+    const cts4 = new vscode.CancellationTokenSource();
+    const call4 = provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      [imageMsg(IMG_A), assistantMsg('partial'), userMsg('again?')],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      cts4.token,
+    );
+    await waitFor(() => chatCalls.length === 4);
+    cts4.cancel();
+    await call4;
+    const turn4 = JSON.stringify(chatCalls[3]!.body);
+    assert.ok(!turn4.includes('image_url'), 'no 4th raw upload after three quiet-completed cancels');
+    assert.ok(
+      turn4.includes('never successfully sent') && turn4.includes('3 attempts failed'),
+      'never-sent note present after quiet-completed cancels',
+    );
+  });
+
+  it('(e) diagnostics — one INFO per capped hash, WARN only on the first capped hash per session', async () => {
+    // Capture the logger's OutputChannel so INFO lines (which do not
+    // enter getRecentErrors) are observable — same pattern as
+    // compactionOscillation.test.ts.
+    const captured: string[] = [];
+    const originalCreateOutputChannel = vscode.window.createOutputChannel;
+    vscode.window.createOutputChannel = (() => ({
+      name: 'Ollama Cloud (Debug)',
+      appendLine: (line: string) => {
+        captured.push(line);
+      },
+      show: () => undefined,
+      dispose: () => undefined,
+    })) as unknown as typeof vscode.window.createOutputChannel;
+    logger.setDebugMode(true);
+    try {
+      installPrimaryFetch('fail');
+      const provider = new OllamaCloudChatProvider(makeMockContext());
+      const call = makeCall(provider, new vscode.CancellationTokenSource().token);
+
+      // Turn 1: BOTH images in one history — each raw send fails.
+      await assert.rejects(
+        () => call([imageMsg(IMG_A), imageMsg(IMG_B)]),
+        /Server error \(HTTP 500\)/,
+      );
+      // Turns 2–3: repeat the history — raw re-sends fail again; on
+      // turn 3 both hashes reach the cap.
+      for (let turn = 2; turn <= 3; turn++) {
+        await assert.rejects(
+          () => call([imageMsg(IMG_A), imageMsg(IMG_B)]),
+          /Server error \(HTTP 500\)/,
+          `turn ${turn} failed`,
+        );
+      }
+
+      const infoLines = captured.filter((line) => line.includes('vision resend cap reached'));
+      assert.equal(infoLines.length, 2, 'exactly one INFO line per capped hash');
+      assert.ok(
+        infoLines.every((line) => line.includes('attempts=3') && line.includes('degrading to marker')),
+        `INFO lines carry hash/attempts/degradation: ${infoLines.join(' | ')}`,
+      );
+      assert.ok(
+        infoLines.every((line) => /hash=[0-9a-f]{8} /.test(line)),
+        'INFO lines carry the first 8 hex chars of the hash',
+      );
+      const warnLines = captured.filter((line) => line.includes('WARN') && line.includes('vision resend cap'));
+      assert.equal(warnLines.length, 1, 'WARN fires exactly once per session (first capped hash only)');
+    } finally {
+      // Restore the factory FIRST, then leave debug mode —
+      // setDebugMode re-creates the channel via the factory, so the
+      // logger must already see the real one (order matters: the
+      // reverse leaves the logger on this test's capturing stub and
+      // poisons later channel-based tests).
+      vscode.window.createOutputChannel = originalCreateOutputChannel;
+      logger.setDebugMode(false);
+    }
+  });
+});
+
+/** Polls `cond` until it holds; rejects after `ms` (test pacing for async fetch stubs). */
+function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = (): void => {
+      if (cond()) {
+        resolve();
+      } else if (Date.now() - start > ms) {
+        reject(new Error('waitFor: condition not met before timeout'));
+      } else {
+        setTimeout(tick, 10);
+      }
+    };
+    tick();
+  });
+}
