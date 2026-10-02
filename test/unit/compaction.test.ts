@@ -427,7 +427,7 @@ describe('compaction (v0.13.0 slice 1)', () => {
       assert.strictEqual(defangFrameDelimiters(plain), plain);
       // Only exact occurrences break; near-miss text (single char off) is
       // content, not a delimiter, and passes through untouched.
-      const nearMiss = `[end machine-generated summaries]`;
+      const nearMiss = '[end machine-generated summaries]';
       assert.strictEqual(defangFrameDelimiters(nearMiss), nearMiss);
     });
   });
