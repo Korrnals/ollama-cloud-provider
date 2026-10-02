@@ -89,7 +89,7 @@ import type {
   UsageInfo,
 } from './protocolTypes.js';
 import { filterContext, type ContextFilterLevel } from './contextFilter.js';
-import { compactIfNeeded, type CompactionState } from './compaction.js';
+import { compactIfNeeded, fingerprintText, type CompactionState } from './compaction.js';
 import { CompactionStore } from './compactionStore.js';
 import { createSummarizer } from './compactionSummarizer.js';
 
@@ -492,14 +492,28 @@ export class OllamaCloudChatProvider
   private readonly charsPerTokenEMA = new Map<string, number>();
   private static readonly CHARS_PER_TOKEN_DEFAULT = 4;
   /**
-   * v0.13.0 Slice 2 — per-conversation compaction hysteresis state,
-   * keyed by model id (per-model windows differ; spec:
-   * docs/compaction-spec.md § Slice 2). Constructor-created.
+   * v0.13.0 Slice 2 — per-conversation compaction hysteresis state
+   * (per-model windows differ; spec: docs/compaction-spec.md § Slice 2).
+   * Constructor-created.
    * v0.21.0 (slice d1) — the state is generic in the message type
    * because it now carries the remembered compaction projection
    * (stickiness); OpenAI-format messages here.
+   * v0.22.0 (v0220-cc, D-1 review P2) — keyed by CONVERSATION, not
+   * bare model id: two windows alternating the same model used to
+   * clobber each other's state (each request re-keyed the same slot,
+   * resetting the other window's projection + summary chain and
+   * degenerating to the pre-d1 cadence with orphaned store blocks).
+   * The key is `${modelId}::${conversationFingerprint}` — see
+   * {@link conversationKey}. Accessed ONLY through the LRU accessors
+   * {@link getCompactionState} / {@link setCompactionState} so stale
+   * conversations are garbage-collected (cap
+   * {@link COMPACTION_STATES_MAX}).
    */
   private readonly compactionStates = new Map<string, CompactionState<OpenAICompatibleMessage>>();
+  /** v0220-cc P2 — conversation fingerprint: how many leading raw messages identify a conversation (K). */
+  private static readonly CONVERSATION_KEY_PREFIX = 4;
+  /** v0220-cc P2 — LRU cap on remembered per-conversation states (bounded memory). */
+  private static readonly COMPACTION_STATES_MAX = 8;
   /**
    * v0.12.1 — tracks model ids for which the context-inflation warning
    * has already fired this session. Prevents spamming the user on every
@@ -2076,6 +2090,64 @@ export class OllamaCloudChatProvider
   }
 
   /**
+   * v0.22.0 (v0220-cc, D-1 review P2) — stable per-CONVERSATION key for
+   * the compaction state map: `${modelId}::<fingerprint of the first K
+   * raw messages>`. The fingerprint runs over the vision-state-
+   * INDEPENDENT canonical form ({@link renderCompactionBasis}) — an
+   * image committing to a marker inside the first K messages must not
+   * re-key the conversation (that would reproduce the exact state-loss
+   * bug this key exists to fix). Conversation identity lives in the
+   * immutable head VS Code re-sends every turn; tail growth never
+   * changes the key. Degenerate histories (fewer than K messages, even
+   * empty) fingerprint over whatever exists — two brand-new
+   * conversations share a slot only until their first request
+   * differentiates the head (and an empty history no-ops compaction
+   * anyway).
+   */
+  private conversationKey(modelId: string, openaiMessages: readonly OpenAICompatibleMessage[]): string {
+    const k = Math.min(
+      OllamaCloudChatProvider.CONVERSATION_KEY_PREFIX,
+      openaiMessages.length,
+    );
+    let joined = '';
+    for (let i = 0; i < k; i++) {
+      joined += this.renderCompactionBasis(openaiMessages[i]!) + '\u0001';
+    }
+    return `${modelId}::${fingerprintText(joined)}`;
+  }
+
+  /**
+   * v0220-cc P2 — LRU get for {@link compactionStates}: a hit refreshes
+   * the entry's recency (Map iteration order = insertion order; delete
+   * + re-insert moves it to the newest end).
+   */
+  private getCompactionState(key: string): CompactionState<OpenAICompatibleMessage> | undefined {
+    const hit = this.compactionStates.get(key);
+    if (hit !== undefined) {
+      this.compactionStates.delete(key);
+      this.compactionStates.set(key, hit);
+    }
+    return hit;
+  }
+
+  /**
+   * v0220-cc P2 — LRU set for {@link compactionStates}: writes the
+   * entry as newest, then evicts the oldest entries beyond
+   * {@link COMPACTION_STATES_MAX} so abandoned conversations (closed
+   * windows) garbage-collect instead of accumulating projection +
+   * chain state forever.
+   */
+  private setCompactionState(key: string, state: CompactionState<OpenAICompatibleMessage>): void {
+    this.compactionStates.delete(key);
+    this.compactionStates.set(key, state);
+    while (this.compactionStates.size > OllamaCloudChatProvider.COMPACTION_STATES_MAX) {
+      const oldest = this.compactionStates.keys().next().value;
+      if (oldest === undefined) break;
+      this.compactionStates.delete(oldest);
+    }
+  }
+
+  /**
    * v0.13.0 Slice 2 — runs one compaction check over the OpenAI-format
    * history when `ollamaCloud.compaction.enabled` is on (default ON
    * since v0.19.0, ArchCom 2026-09-15 T2). Returns the messages to
@@ -2140,8 +2212,13 @@ export class OllamaCloudChatProvider
       return openaiMessages;
     }
     try {
+      // v0220-cc P2 — per-CONVERSATION state: two windows alternating
+      // the same model must not clobber each other's projection and
+      // summary chain. The key fingerprints the conversation head
+      // (vision-state-independent, so image commits keep the key).
+      const convKey = this.conversationKey(modelId, openaiMessages);
       const state: CompactionState<OpenAICompatibleMessage> =
-        this.compactionStates.get(modelId) ?? {
+        this.getCompactionState(convKey) ?? {
           armed: true,
           lastSummary: null,
           lastPointer: null,
@@ -2188,15 +2265,18 @@ export class OllamaCloudChatProvider
       // fires: passthrough results now carry meaningful transitions
       // (projection invalidation resets, re-arm re-evaluations on the
       // re-applied usage) that must survive to the next request.
-      this.compactionStates.set(modelId, result.state);
+      // v0220-cc P2 — persisted under the conversation key (LRU).
+      this.setCompactionState(convKey, result.state);
       // P3-b (d1 rider) — per-request check line at INFO level. The
       // old line was logger.debug and invisible in the field with
       // debug=false; every number is already computed, so one cheap
       // line per request buys the RCA data the 2026-10-02 incident
       // lacked. `reapply` distinguishes "projection remembered and
       // re-applied" (true/false) from "no projection in play" (n/a).
+      // v0220-cc P2 — `conv` carries the conversation-key fingerprint
+      // so interleaved windows are tellable apart in field logs.
       logger.info(
-        `Compaction check: usedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'}`,
+        `Compaction check: usedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'} conv=${convKey.split('::')[1] ?? '?'}`,
       );
       if (result.reapply) {
         // d1 stickiness observability — distinct from the fire line so
