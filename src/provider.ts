@@ -494,8 +494,11 @@ export class OllamaCloudChatProvider
    * v0.13.0 Slice 2 — per-conversation compaction hysteresis state,
    * keyed by model id (per-model windows differ; spec:
    * docs/compaction-spec.md § Slice 2). Constructor-created.
+   * v0.21.0 (slice d1) — the state is generic in the message type
+   * because it now carries the remembered compaction projection
+   * (stickiness); OpenAI-format messages here.
    */
-  private readonly compactionStates = new Map<string, CompactionState>();
+  private readonly compactionStates = new Map<string, CompactionState<OpenAICompatibleMessage>>();
   /**
    * v0.12.1 — tracks model ids for which the context-inflation warning
    * has already fired this session. Prevents spamming the user on every
@@ -1884,6 +1887,12 @@ export class OllamaCloudChatProvider
    * injected summary message (a `role:'system'` OpenAI message) flows
    * through every endpoint unchanged.
    *
+   * v0.21.0 (slice d1, stickiness): after a fire the compacted
+   * projection is remembered per model id and RE-APPLIED to every
+   * subsequent request whose history still carries the evicted prefix
+   * basis (see `compaction.ts`); the returned array on such requests
+   * is the re-applied projection, not the raw input.
+   *
    * Unknown-window safe path (ArchCom invariant 4): when the model's
    * window is unknown (`maxInputTokens` missing/non-positive),
    * compaction does NOT fire — the hysteresis has no denominator and
@@ -1933,12 +1942,13 @@ export class OllamaCloudChatProvider
       return openaiMessages;
     }
     try {
-      const state: CompactionState =
+      const state: CompactionState<OpenAICompatibleMessage> =
         this.compactionStates.get(modelId) ?? {
           armed: true,
           lastSummary: null,
           lastPointer: null,
           lastFiredAt: null,
+          projection: null,
         };
       const charsPerToken =
         this.charsPerTokenEMA.get(model.apiModel ?? model.id) ??
@@ -1958,7 +1968,7 @@ export class OllamaCloudChatProvider
         .list()
         .find((m) => m.apiModel === summarizerModel)?.maxInputTokens;
       const usedTokensDebug = openaiMessages.reduce((s, m) => s + Math.ceil(JSON.stringify(m).length / charsPerToken), 0);
-      logger.debug(`Compaction DEBUG: enabled=true windowTokens=${model.maxInputTokens} usedTokens=${usedTokensDebug} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${state.armed}`);
+      const hadProjection = state.projection != null;
       const result = await compactIfNeeded<OpenAICompatibleMessage>({
         messages: openaiMessages,
         windowTokens: model.maxInputTokens,
@@ -1971,17 +1981,63 @@ export class OllamaCloudChatProvider
           ? { summarizerWindowTokens }
           : {}),
       });
-      if (!result.compacted) {
-        return openaiMessages;
-      }
+      // v0.21.0 d1 — persist the post-check state ALWAYS, not only on
+      // fires: passthrough results now carry meaningful transitions
+      // (projection invalidation resets, re-arm re-evaluations on the
+      // re-applied usage) that must survive to the next request.
       this.compactionStates.set(modelId, result.state);
+      // P3-b (d1 rider) — per-request check line at INFO level. The
+      // old line was logger.debug and invisible in the field with
+      // debug=false; every number is already computed, so one cheap
+      // line per request buys the RCA data the 2026-10-02 incident
+      // lacked. `reapply` distinguishes "projection remembered and
+      // re-applied" (true/false) from "no projection in play" (n/a).
+      logger.info(
+        `Compaction check: usedTokens=${usedTokensDebug} windowTokens=${model.maxInputTokens} threshold=${Math.floor(0.75 * model.maxInputTokens)} charsPerToken=${charsPerToken} armed=${result.state.armed} reapply=${hadProjection ? String(result.reapplied) : 'n/a'}`,
+      );
+      if (result.reapply) {
+        // d1 stickiness observability — distinct from the fire line so
+        // field logs show WHICH mechanism served the request.
+        logger.info(
+          `Compaction re-applied: projectedTokens=${result.reapply.projectedTokens} tailMessages=${result.reapply.tailMessages} (cooldown-held new fire skipped)`,
+        );
+      }
+      if (result.droppedProjection) {
+        logger.info(
+          'Compaction projection dropped: incoming history no longer matches the compacted basis (new session or pruned turns) — hysteresis reset.',
+        );
+      }
+      if (!result.compacted) {
+        // d1 — a re-applied projection must be served even though no
+        // new fire happened; plain passthrough returns the raw input.
+        return result.reapplied ? result.messages : openaiMessages;
+      }
       const stats = result.stats;
       logger.info(
         `Compaction: before=${stats?.beforeTokens} after=${stats?.afterTokens} tokens evicted=${stats?.evictedMessages} capped=${stats?.capped} pointer=${result.pointer}`,
       );
+      // P3-a (d1 rider) — compaction notice WITHOUT polluting the
+      // assistant text. The previous `LanguageModelTextPart` banner
+      // landed verbatim inside the assistant's message content in the
+      // chat UI and transcript (field-verified 2026-10-02). This API
+      // version (1.118) has no dedicated progress/status part; of the
+      // `LanguageModelResponsePart` alternatives, tool parts are
+      // semantically wrong and `LanguageModelDataPart` is the clean
+      // one: an `application/json` data part rides the response stream
+      // (readable by programmatic consumers) but has no markdown
+      // renderer in the chat transcript, so it never becomes assistant
+      // text. The durable human-readable record stays the
+      // `Compaction: before=… after=…` INFO line above.
       progress.report(
-        new vscode.LanguageModelTextPart(
-          `🧠 Context compacted ${stats?.beforeTokens}→${stats?.afterTokens} tokens`,
+        new vscode.LanguageModelDataPart(
+          new TextEncoder().encode(
+            JSON.stringify({
+              notice: 'context-compacted',
+              beforeTokens: stats?.beforeTokens ?? null,
+              afterTokens: stats?.afterTokens ?? null,
+            }),
+          ),
+          'application/json',
         ),
       );
       return result.messages;

@@ -16,10 +16,13 @@ import { clearCapabilityCache } from '../../src/capabilityCache.js';
  *     the fire threshold);
  *   - enabled + under threshold → passthrough, no summarizer call;
  *   - enabled + over threshold → messages REPLACED by the compacted
- *     list, summary-injected `role:'system'` message present, ONE 🧠
- *     annotation reported, and the ADR 0007 context filter applied
- *     to the COMPACTED list (proven via `safe`-level dedup of two
- *     identical recent user messages);
+ *     list, summary-injected `role:'system'` message present, ONE
+ *     compaction notice reported (v0.21.0 d1 P3-a: an
+ *     `application/json` `LanguageModelDataPart`, NOT a text part —
+ *     the old 🧠 TextPart banner polluted the assistant message text,
+ *     field-verified 2026-10-02), and the ADR 0007 context filter
+ *     applied to the COMPACTED list (proven via `safe`-level dedup of
+ *     two identical recent user messages);
  *   - summarizer failure → warn + proceed with UNCOMPACTED messages,
  *     single attempt (no retry).
  *
@@ -231,6 +234,40 @@ function occurrences(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1;
 }
 
+/**
+ * v0.21.0 d1 P3-a — decodes every compaction notice the provider
+ * reported. The notice is an `application/json` LanguageModelDataPart
+ * (NOT a TextPart) so it rides the response stream for programmatic
+ * consumers without landing in the assistant's message text.
+ */
+function compactionNotices(
+  parts: vscode.LanguageModelResponsePart[],
+): Array<{ notice: string; beforeTokens: number | null; afterTokens: number | null }> {
+  return parts
+    .filter(
+      (p): p is vscode.LanguageModelDataPart =>
+        p instanceof vscode.LanguageModelDataPart && p.mimeType === 'application/json',
+    )
+    .map((p) =>
+      JSON.parse(new TextDecoder().decode(p.data)) as {
+        notice: string;
+        beforeTokens: number | null;
+        afterTokens: number | null;
+      },
+    )
+    .filter((payload) => payload.notice === 'context-compacted');
+}
+
+/** The rider's core negative: no compaction banner may appear as assistant TEXT. */
+function assertNoBannerText(parts: vscode.LanguageModelResponsePart[]): void {
+  assert.ok(
+    !parts.some(
+      (p) => p instanceof vscode.LanguageModelTextPart && (p.value.includes('🧠') || p.value.includes('Context compacted')),
+    ),
+    'no compaction banner inside the assistant text stream (P3-a)',
+  );
+}
+
 describe('provider compaction wiring (v0.13.0 slice 2)', () => {
   let originalFetch: typeof fetch;
 
@@ -259,10 +296,8 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
     const chatBody = JSON.stringify(chatCalls[0]!.body);
     assert.ok(chatBody.includes('turn01'), 'evicted-zone turn still present (uncompacted)');
     assert.ok(!chatBody.includes('[compacted-turns'), 'no summary message injected');
-    assert.ok(
-      !progress.parts.some((p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠')),
-      'no compaction annotation reported',
-    );
+    assert.equal(compactionNotices(progress.parts).length, 0, 'no compaction notice reported');
+    assertNoBannerText(progress.parts);
     // v0.19.0 — the opt-out warning fires at 75% of the window: the
     // message must state compaction is DISABLED (not invite the user
     // to "enable" it as if it were off by default).
@@ -287,10 +322,10 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
     assert.equal(apiChatCalls.length, 1, 'compaction fired on the default setting');
     const chatBody = JSON.stringify(chatCalls[0]!.body);
     assert.ok(chatBody.includes('[compacted-turns'), 'summary message injected');
-    assert.ok(
-      progress.parts.some((p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠')),
-      'compaction annotation reported',
-    );
+    // d1 P3-a — the notice is a structured data part, and NOTHING lands
+    // in the assistant text stream.
+    assert.equal(compactionNotices(progress.parts).length, 1, 'one compaction notice reported');
+    assertNoBannerText(progress.parts);
   });
 
   it('enabled + under threshold → passthrough, no summarizer call', async () => {
@@ -301,13 +336,11 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
     assert.equal(apiChatCalls.length, 0, 'under 75% — summarizer not called');
     assert.equal(chatCalls.length, 1);
     assert.ok(JSON.stringify(chatCalls[0]!.body).includes('hi'));
-    assert.ok(
-      !progress.parts.some((p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠')),
-      'no compaction annotation reported',
-    );
+    assert.equal(compactionNotices(progress.parts).length, 0, 'no compaction notice reported');
+    assertNoBannerText(progress.parts);
   });
 
-  it('enabled + over threshold → compacted messages, summary injected, ONE annotation, filter applied to the compacted list', async () => {
+  it('enabled + over threshold → compacted messages, summary injected, ONE notice, filter applied to the compacted list', async () => {
     installFetch('ok');
     configure({
       'compaction.enabled': true,
@@ -355,17 +388,22 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
       'safe-level dedup applied to the compacted list',
     );
 
-    // --- exactly ONE 🧠 annotation with the before→after stats shape.
-    const annotations = progress.parts.filter(
-      (p): p is vscode.LanguageModelTextPart =>
-        p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠'),
+    // --- exactly ONE compaction notice, structured, with the
+    // before→after stats; and no banner text anywhere in the stream.
+    const notices = compactionNotices(progress.parts);
+    assert.equal(notices.length, 1, 'exactly one compaction notice');
+    assert.equal(notices[0]!.notice, 'context-compacted');
+    assert.ok(
+      typeof notices[0]!.beforeTokens === 'number' && notices[0]!.beforeTokens > 0,
+      `notice carries beforeTokens, got ${notices[0]!.beforeTokens}`,
     );
-    assert.equal(annotations.length, 1, 'exactly one compaction annotation');
-    assert.match(
-      annotations[0]!.value,
-      /🧠 Context compacted \d+→\d+ tokens/,
-      'annotation carries the before→after token stats',
+    assert.ok(
+      typeof notices[0]!.afterTokens === 'number' &&
+        notices[0]!.afterTokens > 0 &&
+        notices[0]!.afterTokens < notices[0]!.beforeTokens!,
+      `notice carries a reduced afterTokens, got ${notices[0]!.afterTokens}`,
     );
+    assertNoBannerText(progress.parts);
   });
 
   it('summarizer failure → warn + proceed with UNCOMPACTED messages, single attempt', async () => {
@@ -378,9 +416,7 @@ describe('provider compaction wiring (v0.13.0 slice 2)', () => {
     const chatBody = JSON.stringify(chatCalls[0]!.body);
     assert.ok(chatBody.includes('turn01'), 'uncompacted history dispatched');
     assert.ok(!chatBody.includes('[compacted-turns'), 'no summary message');
-    assert.ok(
-      !progress.parts.some((p) => p instanceof vscode.LanguageModelTextPart && p.value.includes('🧠')),
-      'no compaction annotation on failure',
-    );
+    assert.equal(compactionNotices(progress.parts).length, 0, 'no compaction notice on failure');
+    assertNoBannerText(progress.parts);
   });
 });
