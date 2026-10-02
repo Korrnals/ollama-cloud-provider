@@ -663,8 +663,14 @@ export class OllamaCloudChatProvider
         );
         if (!this.visionResendCapWarned) {
           this.visionResendCapWarned = true;
+          // P3-d (cascade cosmetics 2026-10-02): the old advice said
+          // "re-attach the image" — but cappedImageHashes keys on the
+          // sha256 of the bytes, so a byte-identical re-attach silently
+          // stays capped. The advice must name what actually clears the
+          // cap: a MODIFIED copy (new bytes → new hash) or a window
+          // reload (the sets are per-session, see sentImageHashes).
           logger.warn(
-            `vision resend cap: an image (${hash.slice(0, 8)}) failed ${attempts} raw sends and stays a text marker for the rest of the session — re-attach the image if the model needs to see it`,
+            `vision resend cap: an image (${hash.slice(0, 8)}) failed ${attempts} raw sends and stays a text marker for the rest of the session — прикрепите изменённую копию изображения или перезагрузите окно, чтобы модель его увидела; побайтово идентичная копия даёт тот же хеш и остаётся маркером до конца сессии`,
           );
         }
       } else {

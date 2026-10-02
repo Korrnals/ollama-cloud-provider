@@ -8,6 +8,7 @@
 // the ADR 0007 semantics directly against `filterContext`.
 import { strict as assert } from 'node:assert';
 import { filterContext } from '../../src/contextFilter.js';
+import { SUMMARY_MARKER } from '../../src/compaction.js';
 import type {
   OpenAICompatibleMessage,
   OpenAICompatibleTool,
@@ -90,6 +91,7 @@ describe('contextFilter.filterContext — off', () => {
     assert.equal(result.report.droppedTools, 0);
     assert.equal(result.report.mergedMessages, 0);
     assert.equal(result.report.truncatedMessages, 0);
+    assert.equal(result.report.truncatedCheckpoints, 0);
     assert.equal(result.report.compactedSystemPrompt, false);
     assert.equal(result.report.strippedMetadataFields, 0);
     assert.equal(result.report.beforeChars, result.report.afterChars);
@@ -376,6 +378,145 @@ describe('contextFilter.filterContext — aggressive: truncation', () => {
     const result = run(messages, 'aggressive', 8192);
     assert.equal(result.report.truncatedMessages, 0);
     assert.equal(result.messages.length, 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `aggressive` truncation — compaction checkpoint preservation (P3-e,
+// cascade cosmetics 2026-10-02). The checkpoint (a SUMMARY_MARKER system
+// message injected by compactIfNeeded at an EARLY position) used to be
+// among the FIRST messages dropped at aggressive over-budget — silent
+// loss of the compacted memory, symmetric across every endpoint.
+// ---------------------------------------------------------------------------
+
+describe('contextFilter.filterContext — aggressive: checkpoint preservation (P3-e)', () => {
+  /** Builds a checkpoint exactly like compaction.ts assembles it. */
+  function checkpoint(body: string): OpenAICompatibleMessage {
+    return { role: 'system', content: `${SUMMARY_MARKER}\n${body}` };
+  }
+
+  function requestChars(
+    msgs: OpenAICompatibleMessage[],
+  ): number {
+    // countOpenAIRequestChars for plain string content = summed string
+    // lengths (no tool_calls/tool_call_id in these fixtures) — mirror it
+    // locally to keep the budget math assertion independent.
+    return msgs.reduce((sum, m) => sum + String(m.content ?? '').length, 0);
+  }
+
+  it('preserves the checkpoint while dropping newer droppable history (and stays under budget)', () => {
+    // system(3) + checkpoint(56 marker + 1 \n + 15 body = 72) + four
+    // 15-char users + final(5) = 140 chars. maxInputTokens=25 →
+    // budget = floor(25 * 0.9 * 4) = 90. Preserved core (system +
+    // checkpoint + final) = 80 ≤ 90; any one 15-char user would push it
+    // to 95 > 90 — so exactly the four middle users must go.
+    const messages = [
+      system('sys'),
+      checkpoint('checkpoint-body'),
+      user('a'.repeat(15)),
+      user('b'.repeat(15)),
+      user('c'.repeat(15)),
+      user('d'.repeat(15)),
+      user('final'),
+    ];
+    const maxInputTokens = 25;
+    const result = run(messages, 'aggressive', maxInputTokens);
+    const budget = Math.floor(maxInputTokens * 0.9 * 4);
+
+    const systemMessages = result.messages.filter((m) => m.role === 'system');
+    assert.equal(systemMessages.length, 2, 'primary system AND checkpoint both survive');
+    assert.ok(
+      systemMessages.some(
+        (m) => typeof m.content === 'string' && m.content.startsWith(SUMMARY_MARKER),
+      ),
+      'the SUMMARY_MARKER checkpoint survives aggressive truncation',
+    );
+    assert.ok(
+      result.messages.some((m) => m.content === 'final'),
+      'the last user message still survives',
+    );
+    assert.equal(result.report.truncatedMessages, 4, 'the four middle users were dropped');
+    assert.equal(result.report.truncatedCheckpoints, 0, 'no checkpoint was dropped');
+    assert.ok(
+      requestChars(result.messages) <= budget,
+      `budget math honest: ${requestChars(result.messages)} <= ${budget}`,
+    );
+  });
+
+  it('checkpoint counts toward the budget — non-preserved messages keep being dropped while it stays', () => {
+    // The checkpoint is NOT free: the loop keeps dropping droppable
+    // history BECAUSE the preserved checkpoint still occupies budget.
+    // system(3) + checkpoint(72) + two 15-char users + final(5) = 110;
+    // maxInputTokens=25 → budget=90 → both middle users must go
+    // (3+72+5=80 ≤ 90, +15 = 95 > 90).
+    const messages = [
+      system('sys'),
+      checkpoint('checkpoint-body'),
+      user('a'.repeat(15)),
+      user('b'.repeat(15)),
+      user('final'),
+    ];
+    const result = run(messages, 'aggressive', 25);
+    assert.ok(
+      result.messages.some(
+        (m) => typeof m.content === 'string' && m.content.startsWith(SUMMARY_MARKER),
+      ),
+      'checkpoint kept',
+    );
+    assert.equal(
+      result.messages.filter((m) => m.role === 'user').length,
+      1,
+      'only the last user remains — the checkpoint’s chars forced their drop',
+    );
+  });
+
+  it('genuinely impossible budget → drops the OLDEST checkpoint first and counts it separately', () => {
+    // system(3) + cpOld(97) + cpNew(97) + final(5) = 202 chars; every
+    // message is preserved, so the droppable scan finds nothing.
+    // maxInputTokens=30 → budget=108. Fallback drops the OLDEST
+    // checkpoint (cpOld, 97) → 105 ≤ 108 → stop with cpNew alive.
+    const cpOld = checkpoint('old.'.repeat(10)); // 56 marker + 1 \n + 40 body
+    const cpNew = checkpoint('new.'.repeat(10));
+    const messages = [system('sys'), cpOld, cpNew, user('final')];
+    const maxInputTokens = 30;
+    const result = run(messages, 'aggressive', maxInputTokens);
+    const budget = Math.floor(maxInputTokens * 0.9 * 4);
+
+    const surviving = result.messages
+      .filter((m) => m.role === 'system' && typeof m.content === 'string')
+      .map((m) => m.content as string);
+    assert.ok(
+      surviving.some((c) => c.includes('new.')),
+      'the NEWEST checkpoint survives the fallback drop',
+    );
+    assert.ok(
+      !surviving.includes(cpOld.content as string),
+      'the OLDEST checkpoint is dropped first',
+    );
+    assert.equal(result.report.truncatedCheckpoints, 1, 'checkpoint drop counted separately');
+    assert.equal(result.report.truncatedMessages, 1, 'checkpoint drop included in the total');
+    assert.ok(
+      requestChars(result.messages) <= budget,
+      `still under budget after the fallback: ${requestChars(result.messages)} <= ${budget}`,
+    );
+  });
+
+  it('ordinary second system messages are NOT preserved (only SUMMARY_MARKER ones)', () => {
+    // Regression guard for the P3-e predicate: a hand-written second
+    // system message (no marker) stays droppable, exactly as before.
+    const messages = [
+      system('primary instructions'), // 22
+      system('secondary notes'), // 16 — droppable (no marker)
+      user('aaaa'),
+      user('bbbb'),
+      user('final'),
+    ];
+    const result = run(messages, 'aggressive', 7); // budget = floor(7*3.6) = 25
+    const contents = result.messages.map((m) => m.content);
+    assert.ok(!contents.includes('secondary notes'), 'ordinary second system is droppable');
+    assert.ok(contents.includes('primary instructions'), 'primary system preserved');
+    assert.ok(contents.includes('final'), 'last user preserved');
+    assert.equal(result.report.truncatedCheckpoints, 0);
   });
 });
 
@@ -695,6 +836,7 @@ describe('contextFilter.filterContext — report fields', () => {
     const result = run([user('hi')], 'safe');
     assert.equal(result.report.mergedMessages, 0);
     assert.equal(result.report.truncatedMessages, 0);
+    assert.equal(result.report.truncatedCheckpoints, 0);
     assert.equal(result.report.strippedMetadataFields, 0);
   });
 });

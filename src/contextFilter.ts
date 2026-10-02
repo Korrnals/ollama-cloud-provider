@@ -33,6 +33,7 @@
 // The char-based token proxy reuses `countOpenAIRequestChars` from
 // `convert.ts` — no tokenizer.
 import { countOpenAIRequestChars } from './convert.js';
+import { SUMMARY_MARKER } from './compaction.js';
 import type {
   OpenAICompatibleMessage,
   OpenAICompatibleTool,
@@ -79,6 +80,17 @@ export interface ContextFilterReport {
   mergedMessages: number;
   compactedSystemPrompt: boolean;
   truncatedMessages: number;
+  /**
+   * P3-e (cascade cosmetics 2026-10-02) — subset of
+   * {@link truncatedMessages}: how many compaction checkpoints
+   * (`SUMMARY_MARKER` system messages) were dropped by the
+   * aggressive-truncation fallback because the budget could not hold
+   * them even after every non-preserved message was dropped. The
+   * provider surfaces this class as a WARN (compacted-memory loss is
+   * worse than ordinary truncation); the filter itself never logs
+   * (module purity contract).
+   */
+  truncatedCheckpoints: number;
   strippedMetadataFields: number;
 }
 
@@ -123,6 +135,7 @@ export function filterContext(input: ContextFilterInput): ContextFilterResult {
         mergedMessages: 0,
         compactedSystemPrompt: false,
         truncatedMessages: 0,
+        truncatedCheckpoints: 0,
         strippedMetadataFields: 0,
       },
     };
@@ -138,12 +151,14 @@ export function filterContext(input: ContextFilterInput): ContextFilterResult {
 
   let mergedMessages = 0;
   let truncatedMessages = 0;
+  let truncatedCheckpoints = 0;
   let strippedMetadataFields = 0;
 
   if (input.level === 'aggressive') {
     const trunc = applyTruncation(messages, input.maxInputTokens);
     messages = trunc.messages;
     truncatedMessages += trunc.truncated;
+    truncatedCheckpoints += trunc.truncatedCheckpoints;
     messages = enforceToolCallIntegrity(messages);
 
     const merge = applyMerge(messages);
@@ -170,6 +185,7 @@ export function filterContext(input: ContextFilterInput): ContextFilterResult {
       mergedMessages,
       compactedSystemPrompt,
       truncatedMessages,
+      truncatedCheckpoints,
       strippedMetadataFields,
     },
   };
@@ -324,6 +340,29 @@ function applySafe(
 interface TruncationResult {
   messages: OpenAICompatibleMessage[];
   truncated: number;
+  /**
+   * P3-e — how many of `truncated` were compaction checkpoints dropped
+   * by the genuine-impossibility fallback (see {@link applyTruncation}).
+   */
+  truncatedCheckpoints: number;
+}
+
+/**
+ * P3-e (cascade cosmetics 2026-10-02) — recognizes a compaction
+ * checkpoint: the machine-generated `SUMMARY_MARKER` system message
+ * injected by `compactIfNeeded` (compaction.ts) AFTER the primary
+ * system prompt. The checkpoint carries the compacted memory of the
+ * session; aggressive truncation preserves it exactly like the primary
+ * system prompt instead of dropping it among the oldest messages (the
+ * pre-P3-e behavior lost the compacted memory first at aggressive
+ * over-budget — endpoint-symmetric silent loss).
+ */
+function isCheckpointMessage(message: OpenAICompatibleMessage): boolean {
+  return (
+    message.role === 'system' &&
+    typeof message.content === 'string' &&
+    message.content.startsWith(SUMMARY_MARKER)
+  );
 }
 
 function applyTruncation(
@@ -332,30 +371,50 @@ function applyTruncation(
 ): TruncationResult {
   const budget = Math.floor(maxInputTokens * TRUNCATION_SAFETY_MARGIN * CHARS_PER_TOKEN);
   if (budget <= 0) {
-    return { messages: [...messages], truncated: 0 };
+    return { messages: [...messages], truncated: 0, truncatedCheckpoints: 0 };
   }
 
-  // Preserve the system prompt (first `role:system` message) and the
-  // last `role:user` message unconditionally (ADR § aggressive).
-  const systemIndex = messages.findIndex((m) => m.role === 'system');
-  const lastUserIndex = findLastIndex(messages, (m) => m.role === 'user');
-  const preserve = new Set<number>();
-  if (systemIndex !== -1) {
-    preserve.add(systemIndex);
-  }
-  if (lastUserIndex !== -1) {
-    preserve.add(lastUserIndex);
-  }
+  // Preserve the system prompt (first `role:system` message), every
+  // compaction checkpoint, and the last `role:user` message
+  // unconditionally (ADR § aggressive; checkpoints per P3-e). The set
+  // is REBUILT after every drop (indices shift when a message before a
+  // preserved one is removed — the pre-P3-e incremental recompute only
+  // tracked the last user index and would have left checkpoint
+  // indices stale, protecting the wrong messages).
+  const buildPreserve = (
+    list: readonly OpenAICompatibleMessage[],
+  ): Set<number> => {
+    const preserve = new Set<number>();
+    const systemIndex = list.findIndex((m) => m.role === 'system');
+    if (systemIndex !== -1) {
+      preserve.add(systemIndex);
+    }
+    for (let i = 0; i < list.length; i++) {
+      if (isCheckpointMessage(list[i]!)) {
+        preserve.add(i);
+      }
+    }
+    const lastUserIndex = findLastIndex(list, (m) => m.role === 'user');
+    if (lastUserIndex !== -1) {
+      preserve.add(lastUserIndex);
+    }
+    return preserve;
+  };
 
   let current = [...messages];
   let truncated = 0;
+  let truncatedCheckpoints = 0;
 
   // Drop from the front (after the system prompt) until under budget.
   // Candidates are indices >= the position right after the system
   // prompt (or 0 when there is no system prompt), in ascending order,
-  // excluding preserved indices. We drop one at a time, recompute the
-  // char count, and stop when under budget or no candidates remain.
-  const startSearch = systemIndex === -1 ? 0 : systemIndex + 1;
+  // excluding preserved indices. Preserved messages REMAIN in the list
+  // and keep counting toward the budget — the math stays honest (the
+  // loop keeps dropping non-preserved messages instead of pretending
+  // preserved bulk is free).
+  const initialSystemIndex = current.findIndex((m) => m.role === 'system');
+  const startSearch = initialSystemIndex === -1 ? 0 : initialSystemIndex + 1;
+  let preserve = buildPreserve(current);
   while (countOpenAIRequestChars(current) > budget) {
     let dropIndex = -1;
     for (let i = startSearch; i < current.length; i++) {
@@ -366,27 +425,33 @@ function applyTruncation(
       break;
     }
     if (dropIndex === -1) {
-      break; // no droppable message left
+      // No droppable message left, yet still over budget: the only
+      // remaining bulk is preserved checkpoints. Genuinely impossible
+      // within the budget — drop the OLDEST checkpoint first (P3-e
+      // fallback), counted separately so the provider can WARN about
+      // compacted-memory loss. The primary system prompt (the first
+      // system message, checkpoint or not) stays untouchable — same
+      // rule as before P3-e.
+      const oldestCheckpoint = current.findIndex(
+        (m, i) => i >= startSearch && isCheckpointMessage(m),
+      );
+      if (oldestCheckpoint === -1) {
+        break; // nothing left to drop at all
+      }
+      current.splice(oldestCheckpoint, 1);
+      truncated++;
+      truncatedCheckpoints++;
+      preserve = buildPreserve(current);
+      continue;
     }
     current.splice(dropIndex, 1);
     truncated++;
-    // Re-index preserved positions. The system prompt is before
-    // `startSearch`, so its index is unaffected by drops at
-    // `startSearch+`. The last user message is typically near the end;
-    // a drop before it shifts its index down by one. Recompute it.
-    if (lastUserIndex !== -1) {
-      const newLastUser = findLastIndex(current, (m) => m.role === 'user');
-      preserve.clear();
-      if (systemIndex !== -1) {
-        preserve.add(systemIndex);
-      }
-      if (newLastUser !== -1) {
-        preserve.add(newLastUser);
-      }
-    }
+    // Re-index preserved positions (see buildPreserve): a drop before a
+    // checkpoint or the last user message shifts its index down.
+    preserve = buildPreserve(current);
   }
 
-  return { messages: current, truncated };
+  return { messages: current, truncated, truncatedCheckpoints };
 }
 
 // ---------------------------------------------------------------------------

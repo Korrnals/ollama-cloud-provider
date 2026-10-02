@@ -269,6 +269,7 @@
         },
         "ollamaCloud.visionHistory.rawResendCap": {
           "type": "number",
+          "integer": true,
           "default": 3,
           "minimum": 0,
           "description": "How many times an image whose turn failed (stream error, or a cancel before the answer completed) is re-sent as raw base64 before it degrades to a short text marker for the rest of the session. Caps request-size blowups when the same screenshot keeps failing. 0 means unlimited raw re-sends (the previous behavior). Successfully delivered images are never re-sent raw regardless of this setting.",
