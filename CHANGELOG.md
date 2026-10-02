@@ -5,6 +5,31 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-02
+
+MINOR release — cascade QA audit cycle «compaction and proxy truth»: compaction is now effective on the shipped defaults, images survive the compacted native path, proxy support genuinely works, and the compaction summarizer is injection-hardened.
+
+### Fixed
+- **Compaction is now effective on the shipped defaults** (contextFilter 'off'): the compacted history actually shapes requests on native /api/chat and /v1/responses, not just /chat/completions — previously the summarizer was charged and state written while the wire carried the full raw history. Below the compaction threshold: zero change (byte-identical passthrough, test-pinned).
+- **Images are no longer silently dropped on the compacted/filtered native path**: image parts map to /api/chat images[] exactly as the legacy converter did (previously dropped at filter safe/aggressive and — since the dispatch gate — at defaults).
+- **Proxy support actually works**: HTTPS-via-CONNECT now rides the tunnelled socket (previously the TLS leg silently bypassed the proxy and leaked the tunnel); proxy credentials (user:pass@ in http.proxy) now send Proxy-Authorization on both transports; cancel-caused teardowns no longer log spurious proxy failures.
+- **Interleaved same-model windows no longer clobber each other's compaction state** (conversation-keyed state, first-user-message key); vision image commits no longer re-key or drop a live projection (vision-state-independent fingerprint basis).
+- **Aggressive truncation preserves compaction checkpoints** (previously lost first); a genuinely impossible budget drops the oldest checkpoint with a WARN instead of silently degrading memory.
+- **Discard-on-cancel**: buffered-but-unshown stream parts (including tool calls) are dropped on a cancelled turn — no ghost tool calls in dead turns; a quiet cancel still never surfaces as a provider failure.
+- Vision resend-cap WARN now names what actually clears the cap (a modified copy or window reload — a byte-identical re-attach stays capped); MaxDurationError carries a user message naming the ceiling.
+
+### Security
+- **Compaction injection hardening** (CWE-74/LLM01): the summarizer request carries a system-role data-handling contract; the injected checkpoint is wrapped in an explicit DATA frame with de-fanged echoed delimiters.
+
+### Changed
+- Compaction state is conversation-keyed with a bounded LRU (8); new diagnostics: `Compaction check: rawUsedTokens=… conv=…` (INFO), `Compaction re-applied: …` (INFO), `Context filter: truncated N checkpoint(s)` (WARN), `vision resend cap reached` (INFO/WARN).
+
+### Internal
+- Refactor, invisible to users: seven dispatch branches collapse to one attempt chain (endpointDispatch); vision turn bookkeeping moves to TurnLedger with call-local turn handles. No settings, wire-format, or behavior change on single-slice paths.
+
+### Known issues
+- v0.21.0's GPG .asc asset still pending the cluster conveyor coming back (heals via release-trigger re-run; vsix integrity is covered by sha256 + cosign).
+
 ## [0.21.0] - 2026-10-02
 
 MINOR release — field-report P1 cycle «wazuh RCA»: cancelled turns no longer kill agent/subagent work, compaction sticks across requests, and vision re-send cost is capped.
