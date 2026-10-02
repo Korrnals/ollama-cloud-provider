@@ -1223,9 +1223,16 @@ export class OllamaCloudChatProvider
       // v0.13.0 Slice 2 — context compaction (spec:
       // docs/compaction-spec.md). Runs BEFORE the ADR 0007
       // context filter and BEFORE endpoint dispatch, so the filter
-      // operates on the COMPACTED list and the injected summary message
-      // (a `role:'system'` OpenAI message) flows through all three
-      // endpoints unchanged. Fallback contract: compaction never fails
+      // operates on the COMPACTED list. The injected summary message
+      // (a `role:'system'` OpenAI message) reaches every endpoint,
+      // but NOT uniformly: native + compat serve it as a system
+      // message directly, while `/v1/responses` hoists only the FIRST
+      // system message to `instructions` — the converters
+      // (`convertToResponsesInput` /
+      // `convertOpenAIMessagesToResponsesInput`) therefore FOLD the
+      // `SUMMARY_MARKER` system message into `instructions` (extra
+      // ordinary system messages stay dropped — P1-1, cascade review
+      // 2026-10-02). Fallback contract: compaction never fails
       // the chat — every failure inside `maybeCompact` logs a warning
       // and returns the uncompacted history (the filter path may still
       // truncate; that is the accepted degradation).
@@ -1402,7 +1409,9 @@ export class OllamaCloudChatProvider
       //     duplication vector.
       //   - `convertToResponsesInput`: the FIRST system message is
       //     hoisted to top-level `instructions`; subsequent system
-      //     messages are dropped (logged). Tool definitions go only in
+      //     messages are dropped (logged), EXCEPT the compaction
+      //     checkpoint (`SUMMARY_MARKER`), which is folded into
+      //     `instructions` (P1-1). Tool definitions go only in
       //     the top-level `tools` array (via `convertToolsToResponses`).
       // No content is sent twice. The audit verdict is recorded in this
       // comment (review fix Finding 6: the per-request `convert audit:`

@@ -5,6 +5,7 @@ import {
   convertOpenAIMessagesToResponsesInput,
   convertToolsToResponses,
 } from '../../src/convertResponses.js';
+import { SUMMARY_MARKER } from '../../src/compaction.js';
 import type {
   OpenAIChatContent,
   OpenAICompatibleMessage,
@@ -128,6 +129,54 @@ describe('convertResponses.convertToResponsesInput', () => {
       userMsg(new LanguageModelTextPart('hi')),
     ]);
     assert.equal(result.instructions, 'you are a helpful assistant');
+    assert.equal(result.input.length, 1);
+    assert.equal(asMessage(result.input[0]).role, 'user');
+  });
+
+  // P1-1 (cascade review 2026-10-02) — the compaction checkpoint is a
+  // SECOND system message after the real system prompt; before the fix
+  // the hoist dropped it, making the evicted conversation invisible on
+  // /v1/responses while native/compat kept serving it.
+  it('folds a SUMMARY_MARKER system message into instructions after the first system message', () => {
+    const checkpoint = `${SUMMARY_MARKER}\nGOAL: ship the release\n[evicted-block pointer: ptr-1]`;
+    const result = convertToResponsesInput([
+      systemMsg('you are a helpful assistant'),
+      systemMsg(checkpoint),
+      userMsg(new LanguageModelTextPart('hi')),
+    ]);
+    // The real system prompt still leads `instructions`...
+    assert.ok(result.instructions!.startsWith('you are a helpful assistant'));
+    // ...and the checkpoint (marker + summary + pointer, verbatim) is
+    // folded in behind a blank-line separator.
+    assert.ok(result.instructions!.includes(`\n\n${checkpoint}`));
+    // The checkpoint never leaks into `input[]` as a message item.
+    assert.ok(!JSON.stringify(result.input).includes(SUMMARY_MARKER));
+    assert.equal(result.input.length, 1);
+    assert.equal(asMessage(result.input[0]).role, 'user');
+  });
+
+  it('hoists a lone SUMMARY_MARKER system message as instructions unchanged', () => {
+    // History with no real system prompt: the checkpoint IS the first
+    // system message, so plain hoisting already serves it — pin that.
+    const checkpoint = `${SUMMARY_MARKER}\nsummary body`;
+    const result = convertToResponsesInput([
+      systemMsg(checkpoint),
+      userMsg(new LanguageModelTextPart('hi')),
+    ]);
+    assert.equal(result.instructions, checkpoint);
+    assert.equal(result.input.length, 1);
+  });
+
+  it('still drops an ordinary second system message (marker-specificity pin)', () => {
+    // P1-1 constraint: only SUMMARY_MARKER messages are folded. An
+    // ordinary second system message keeps the pre-fix drop behavior.
+    const result = convertToResponsesInput([
+      systemMsg('first-wins'),
+      systemMsg('second-dropped'),
+      userMsg(new LanguageModelTextPart('hi')),
+    ]);
+    assert.equal(result.instructions, 'first-wins');
+    assert.ok(!result.instructions!.includes('second-dropped'));
     assert.equal(result.input.length, 1);
     assert.equal(asMessage(result.input[0]).role, 'user');
   });
@@ -303,6 +352,41 @@ describe('convertResponses.convertOpenAIMessagesToResponsesInput', () => {
     // Both system messages are absent from `input[]`.
     assert.equal(result.input.length, 1);
     assert.equal(asMessage(result.input[0]).role, 'user');
+  });
+
+  // P1-1 — the load-bearing case: the filter-on (`safe`/`aggressive`)
+  // /v1/responses dispatch feeds the COMPACTED OpenAI message list
+  // through this converter, so the checkpoint fold here is what
+  // actually puts the evicted conversation back on the wire.
+  it('folds the compaction checkpoint system message into instructions', () => {
+    const checkpoint = `${SUMMARY_MARKER}\nCHECKPOINT SUMMARY\n[evicted-block pointer: ptr-9]`;
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiSystem('you are a helpful assistant'),
+      oaiSystem(checkpoint),
+      oaiUser('hi'),
+    ]);
+    assert.ok(result.instructions!.startsWith('you are a helpful assistant'));
+    assert.ok(result.instructions!.includes(SUMMARY_MARKER));
+    assert.ok(result.instructions!.includes('CHECKPOINT SUMMARY'));
+    assert.ok(result.instructions!.includes('ptr-9'));
+    assert.ok(!JSON.stringify(result.input).includes(SUMMARY_MARKER));
+    assert.equal(result.input.length, 1);
+    assert.equal(asMessage(result.input[0]).role, 'user');
+  });
+
+  it('folds a whitespace-collapsed checkpoint (survives the safe context filter)', () => {
+    // The `safe` filter collapses whitespace runs inside system
+    // messages; the marker line itself contains no collapsible runs,
+    // so startsWith detection must keep working on the collapsed text.
+    const collapsed = `${SUMMARY_MARKER} CHECKPOINT SUMMARY [evicted-block pointer: ptr-9]`;
+    const result = convertOpenAIMessagesToResponsesInput([
+      oaiSystem('system prompt'),
+      oaiSystem(collapsed),
+      oaiUser('hi'),
+    ]);
+    assert.ok(result.instructions!.includes(SUMMARY_MARKER));
+    assert.ok(result.instructions!.includes('CHECKPOINT SUMMARY'));
+    assert.ok(!JSON.stringify(result.input).includes(SUMMARY_MARKER));
   });
 
   it('preserves tool-call integrity: function_call + matching function_call_output', () => {

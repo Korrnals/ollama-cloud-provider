@@ -24,11 +24,15 @@ import {
   mapRole,
 } from './convertPrimitives.js';
 import { logger } from './logger.js';
+import { SUMMARY_MARKER } from './compaction.js';
 
 /**
  * Result of converting VS Code messages to a `/v1/responses` request
  * body. The first `role:system` message is hoisted to top-level
- * `instructions`; the remaining messages become `input[]`.
+ * `instructions`; the remaining messages become `input[]`. A
+ * compaction checkpoint (`SUMMARY_MARKER` system message) that
+ * follows the first system message is folded into `instructions`
+ * (see `foldCheckpointIntoInstructions`).
  */
 export interface ResponsesConversionResult {
   input: ResponsesInputItem[];
@@ -41,7 +45,10 @@ export interface ResponsesConversionResult {
  *
  * - The FIRST `role:system` message is hoisted to the top-level
  *   `instructions` field. Subsequent `role:system` messages are
- *   dropped (OpenAI ignores extra system messages in `input[]`).
+ *   dropped (OpenAI ignores extra system messages in `input[]`) —
+ *   EXCEPT a compaction checkpoint (`SUMMARY_MARKER` prefix), which
+ *   is folded into `instructions` so the evicted conversation stays
+ *   visible to the model (P1-1, cascade review 2026-10-02).
  * - User messages become `{ type:'message', role:'user', content[] }`
  *   with `input_text` parts and — when image parts are present —
  *   `input_image` parts carrying the data URL. Mirrors the
@@ -71,8 +78,22 @@ export function convertToResponsesInput(
     const role = mapRole(message.role);
 
     if (role === 'system') {
+      const text = extractMessageText(message);
       if (instructions === undefined) {
-        instructions = extractMessageText(message);
+        instructions = text;
+      } else if (text.startsWith(SUMMARY_MARKER)) {
+        // P1-1 (cascade review 2026-10-02): the compaction checkpoint
+        // is injected as a SECOND `role:system` message after the real
+        // system prompt (compaction.ts assembles
+        // `[system..., pinned..., checkpoint, recency...]`). Hoisting
+        // only the first system message silently discarded it, making
+        // the evicted conversation permanently invisible on
+        // `/v1/responses` while native/compat kept serving it. Fold
+        // the checkpoint into `instructions` instead.
+        instructions = foldCheckpointIntoInstructions(instructions, text);
+        logger.info(
+          'convertResponses: folded compaction checkpoint into instructions',
+        );
       } else {
         // Issue #41 — Strand 3.1 audit / Strand 1 diagnostic: a
         // SECOND `role:system` message is dropped because OpenAI's
@@ -253,7 +274,9 @@ export { hasImageParts };
 // The mapping mirrors `convertToResponsesInput`:
 //   - First `role:system` message → top-level `instructions`.
 //   - Subsequent `role:system` messages → dropped (logged, same as
-//     `convertToResponsesInput`).
+//     `convertToResponsesInput`), EXCEPT a compaction checkpoint
+//     (`SUMMARY_MARKER` prefix) which is folded into `instructions`
+//     (P1-1 — same rule as `convertToResponsesInput`).
 //   - User/assistant messages with text → `{ type:'message', role,
 //     content[] }` with `input_text` (user) or `output_text`
 //     (assistant) parts.
@@ -290,8 +313,18 @@ export function convertOpenAIMessagesToResponsesInput(
     const role = message.role;
 
     if (role === 'system') {
+      const text = openAIContentToText(message.content);
       if (instructions === undefined) {
-        instructions = openAIContentToText(message.content);
+        instructions = text;
+      } else if (text.startsWith(SUMMARY_MARKER)) {
+        // P1-1 — same fold as `convertToResponsesInput` above; this is
+        // the converter the filter-on (`safe`/`aggressive`)
+        // `/v1/responses` dispatch path actually feeds the compacted
+        // list through, so this branch is the load-bearing fix.
+        instructions = foldCheckpointIntoInstructions(instructions, text);
+        logger.info(
+          'convertResponses: folded compaction checkpoint into instructions (after context filter)',
+        );
       } else {
         // Same diagnostic as `convertToResponsesInput`: a second
         // `role:system` message is dropped because `/v1/responses`
@@ -348,6 +381,23 @@ export function convertOpenAIMessagesToResponsesInput(
   }
 
   return instructions !== undefined ? { input, instructions } : { input };
+}
+
+/**
+ * P1-1 (cascade review 2026-10-02) — folds a compaction checkpoint
+ * (`SUMMARY_MARKER`-prefixed system message) into the hoisted
+ * `instructions` string. A blank-line separator plus the checkpoint's
+ * own marker line keeps it visually distinct from the real system
+ * prompt; the raw marker+summary+pointer text is kept verbatim (no
+ * re-styling) so the payload stays comparable with the native/compat
+ * system message. Ordinary (non-marker) extra system messages are NOT
+ * folded — their drop behavior is unchanged.
+ */
+function foldCheckpointIntoInstructions(
+  instructions: string,
+  checkpoint: string,
+): string {
+  return `${instructions}\n\n${checkpoint}`;
 }
 
 /**
