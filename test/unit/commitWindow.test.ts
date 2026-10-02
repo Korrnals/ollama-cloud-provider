@@ -1061,6 +1061,144 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
     );
   });
 
+  // -------------------------------------------------------------------------
+  // v0220-s discard-on-cancel (cross-slice finding from v0220-v T-3):
+  // on quiet-cancel with buffered tool_call/text deltas and the window
+  // open, the wrapped onDone used to FLUSH the buffer first — emitting a
+  // LanguageModelToolCallPart into an already-cancelled turn (ghost
+  // tool-call risk). Contract: cancel-caused completions DISCARD;
+  // non-cancel completions keep flush-first semantics.
+  // -------------------------------------------------------------------------
+
+  /** SSE-ish processor: `data: tool` buffers a toolCall, `data: text` buffers text. */
+  function toolAndTextLine(callbacks: StreamCallbacks): StreamLineProcessor {
+    return (line, ctx) => {
+      const trimmed = line.trim();
+      if (trimmed === 'data: tool') {
+        ctx.markParsed();
+        callbacks.onToolCall({ id: 'call_1', name: 'get_weather', input: {} });
+        return false;
+      }
+      if (trimmed === 'data: text') {
+        ctx.markParsed();
+        callbacks.onText('partial');
+        return false;
+      }
+      return false;
+    };
+  }
+
+  it('cancel + untagged close with buffered tool_call + text → discard-on-cancel: NOTHING emitted, quiet done (CIE route)', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // A tool_call delta and a text delta arrive (buffered, window
+      // armed), then 20ms in — window still open — the user cancels and
+      // the teardown surfaces as an UNTAGGED socket-close (CIE route
+      // into the D-2 quiet-completion branch).
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: tool\n\n'));
+          controller.enqueue(encode('data: text\n\n'));
+          setTimeout(() => {
+            source.cancel();
+            controller.error(socketCloseError());
+          }, 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    // The D-2 invariant holds (resolves, never rethrows) AND the buffer
+    // is discarded, not flushed: no part may be emitted after cancel.
+    await readStream(
+      {
+        logTag: 'd2-discard-cie',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: toolAndTextLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'quiet completion via onDone (D-2 invariant unchanged)');
+    assert.equal(recorded.error, undefined, 'no error on the cancelled break');
+    assert.deepStrictEqual(
+      recorded.events,
+      [],
+      'discard-on-cancel: buffered tool_call/text must NOT be emitted after the cancel',
+    );
+    assert.equal(fetchCalls, 1, 'no retry after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+  });
+
+  it('plain cancel (tagged AbortError) with buffered tool_call + text → discard-on-cancel: NOTHING emitted, quiet done', async function () {
+    this.timeout(5000);
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (
+      url: unknown,
+      init?: { signal?: AbortSignal },
+    ) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      // Same buffered deltas, but the teardown surfaces as the TAGGED
+      // AbortError (the transport honors the abort signal) — the plain
+      // cancel branch inside readStreamOnce.
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encode('data: tool\n\n'));
+          controller.enqueue(encode('data: text\n\n'));
+          init?.signal?.addEventListener('abort', () => {
+            const err = new Error('The operation was aborted');
+            err.name = 'AbortError';
+            controller.error(err);
+          });
+          setTimeout(() => source.cancel(), 20);
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+
+    await readStream(
+      {
+        logTag: 'd2-discard-plain',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: toolAndTextLine(wrapped),
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'quiet completion via onDone');
+    assert.equal(recorded.error, undefined, 'no error on a plain cancel');
+    assert.deepStrictEqual(
+      recorded.events,
+      [],
+      'discard-on-cancel: buffered tool_call/text must NOT be emitted after the cancel',
+    );
+    assert.equal(fetchCalls, 1, 'no retry after cancellation');
+  });
+
   it('cancel before stream start → quiet onDone, no error, no retry (unchanged)', async function () {
     this.timeout(5000);
     const source = new vscode.CancellationTokenSource();

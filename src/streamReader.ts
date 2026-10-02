@@ -414,6 +414,11 @@ export async function readStream(
           logger.warn(
             'Mid-stream interrupt while cancelled, window open — quiet completion (nothing user-visible from the attempt; no retry, no rethrow)',
           );
+          // v0220-s discard-on-cancel — the buffer holds this
+          // attempt's unflushed deltas; emitting them after the user
+          // cancelled would push parts into a dead turn (ghost tool
+          // call). Discard, then the quiet onDone flush is a no-op.
+          commitWindow?.discard();
           callbacks.onDone();
           return;
         }
@@ -482,9 +487,12 @@ export async function readStream(
           // chunks ⇒ nothing was shown, so the quiet-completion branch
           // of the D-2 hard invariant applies here too: onDone, no
           // error, no extra visible attempt for a cancelled request.
+          // v0220-s discard-on-cancel: same rule as the CIE branch —
+          // never emit buffered parts into a cancelled turn.
           logger.warn(
             'Zero-byte close while cancelled — quiet completion (0 chunks, nothing user-visible; no extra attempt, no error)',
           );
+          commitWindow?.discard();
           callbacks.onDone();
           return;
         }
@@ -988,6 +996,12 @@ async function readStreamOnce(
     // no retry). MaxDuration → onError (terminal). Cancel → onDone.
     if (error instanceof Error && error.name === 'AbortError') {
       if (abortReason === 'cancel') {
+        // v0220-s discard-on-cancel — the quiet completion must not
+        // FLUSH the window's buffer into the dead turn: a buffered
+        // tool_call part emitted after the user cancelled is a ghost
+        // tool call. Only KNOWN-cancel completions discard; the
+        // ambiguous-default branch below keeps flush-first semantics.
+        getAttachedCommitWindow(callbacks)?.discard();
         callbacks.onDone();
         return;
       }
