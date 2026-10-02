@@ -43,8 +43,25 @@ import { wireRequestLifecycle } from '../../src/httpClient.js';
  */
 class FakeClientRequest extends events.EventEmitter {
   public destroyed = false;
-  destroy(): void {
+  public destroyError: Error | undefined;
+  destroy(err?: Error): void {
     this.destroyed = true;
+    this.destroyError = err;
+  }
+}
+
+/**
+ * Minimal fake of an `IncomingMessage` for `markResponseReceived(res)`:
+ * an EventEmitter plus a recorded `destroy(err)` — the abort path calls
+ * it with the tagged AbortError BEFORE `req.destroy` (task v0210-d2:
+ * tag the abort reason before the socket is destroyed).
+ */
+class FakeIncomingMessage extends events.EventEmitter {
+  public destroyed = false;
+  public destroyError: Error | undefined;
+  destroy(err?: Error): void {
+    this.destroyed = true;
+    this.destroyError = err;
   }
 }
 
@@ -134,7 +151,7 @@ describe('httpClient.wireRequestLifecycle — post-response error gate', () => {
     );
 
     // Success path: the transport calls the marker before resolving.
-    markResponseReceived();
+    markResponseReceived(new FakeIncomingMessage() as unknown as http.IncomingMessage);
 
     // Teardown artifact arrives AFTER the settled response.
     const warnsBefore = recentErrorCount();
@@ -172,7 +189,7 @@ describe('httpClient.wireRequestLifecycle — post-response error gate', () => {
         rejectCalled = true;
       },
     );
-    markResponseReceived();
+    markResponseReceived(new FakeIncomingMessage() as unknown as http.IncomingMessage);
 
     const warnsBefore = recentErrorCount();
     req.emit('error', new Error('some late teardown hiccup'));
@@ -258,7 +275,23 @@ describe('httpClient.wireRequestLifecycle — post-response error gate', () => {
         rejectCalled = true;
       },
     );
-    markResponseReceived();
+    // Record the teardown ORDER: task v0210-d2 requires the abort
+    // reason to be tagged onto the RESPONSE before the socket
+    // (req.destroy) is destroyed, so the body stream rejects with the
+    // tagged AbortError instead of Node's internal ECONNRESET.
+    const order: string[] = [];
+    const res = new FakeIncomingMessage();
+    const origReqDestroy = req.destroy.bind(req);
+    const origResDestroy = res.destroy.bind(res);
+    req.destroy = (err?: Error): void => {
+      order.push('req.destroy');
+      origReqDestroy(err);
+    };
+    res.destroy = (err?: Error): void => {
+      order.push('res.destroy');
+      origResDestroy(err);
+    };
+    markResponseReceived(res as unknown as http.IncomingMessage);
 
     // Consumer aborts mid-stream AFTER the response arrived: the abort
     // listener must still destroy the socket (streaming cancel relies
@@ -275,5 +308,20 @@ describe('httpClient.wireRequestLifecycle — post-response error gate', () => {
       'no WARN after response received',
     );
     assert.equal(rejectCalled, false, 'no reject after response received');
+    // v0210-d2 invariants: the response is destroyed FIRST, with the
+    // tagged AbortError (name, not just message) — the body reader then
+    // rejects with an AbortError the stream reader can route by
+    // abortReason, never as an untagged network socket-close.
+    assert.deepEqual(
+      order,
+      ['res.destroy', 'req.destroy'],
+      'the abort tag must land on the response BEFORE the socket is destroyed',
+    );
+    assert.equal(
+      res.destroyError?.name,
+      'AbortError',
+      'response teardown must carry the tagged AbortError',
+    );
+    assert.equal(req.destroyError?.name, 'AbortError');
   });
 });

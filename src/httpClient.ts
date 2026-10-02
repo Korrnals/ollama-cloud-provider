@@ -201,7 +201,7 @@ function requestDirect(
     // Assigned by `wireRequestLifecycle` below (the req must exist
     // first). The response callback marks the lifecycle BEFORE
     // resolving — see `wireRequestLifecycle` for why.
-    let markResponseReceived: () => void = () => undefined;
+    let markResponseReceived: (res: http.IncomingMessage) => void = () => undefined;
     const req = transport.request(
       url,
       {
@@ -209,7 +209,7 @@ function requestDirect(
         headers: options.headers,
       },
       (res) => {
-        markResponseReceived();
+        markResponseReceived(res);
         resolve(buildResponse(res, parsed));
       },
     );
@@ -240,7 +240,7 @@ function requestViaHttpProxy(
     // Assigned by `wireRequestLifecycle` below (the req must exist
     // first). The response callback marks the lifecycle BEFORE
     // resolving — see `wireRequestLifecycle` for why.
-    let markResponseReceived: () => void = () => undefined;
+    let markResponseReceived: (res: http.IncomingMessage) => void = () => undefined;
     // Absolute-URI form: the proxy forwards to the target.
     const req = http.request(
       {
@@ -251,7 +251,7 @@ function requestViaHttpProxy(
         headers: options.headers,
       },
       (res) => {
-        markResponseReceived();
+        markResponseReceived(res);
         resolve(buildResponse(res, parsedTarget));
       },
     );
@@ -288,7 +288,7 @@ function requestViaTlsConnectTunnel(
   };
 
   return new Promise<HttpResponse>((resolve, reject) => {
-    let markResponseReceived: () => void = () => undefined;
+    let markResponseReceived: (res: http.IncomingMessage) => void = () => undefined;
     const connectReq = http.request(
       {
         host: proxyHost,
@@ -324,7 +324,7 @@ function requestViaTlsConnectTunnel(
             createConnection: () => socket,
           },
           (res) => {
-            markResponseReceived();
+            markResponseReceived(res);
             resolve(buildResponse(res, parsedTarget));
           },
         );
@@ -347,7 +347,8 @@ function requestViaTlsConnectTunnel(
  * implementation.
  *
  * Returns a `markResponseReceived` callback the transport path MUST
- * invoke from its response callback, BEFORE `resolve(buildResponse(...))`.
+ * invoke from its response callback with the received `IncomingMessage`,
+ * BEFORE `resolve(buildResponse(...))`.
  *
  * RCA 2026-09-24 (TLS BAD_DECRYPT log noise): Node's `ClientRequest`
  * can emit a late `error` AFTER the response has fully resolved — e.g.
@@ -366,13 +367,18 @@ export function wireRequestLifecycle(
   options: HttpRequestOptions,
   url: string,
   reject: (error: Error) => void,
-): () => void {
+): (res: http.IncomingMessage) => void {
   let settled = false;
   // Set by `markResponseReceived` from the transport's response
   // callback. Distinct from `settled` (which fail() sets on the
   // pre-response path) so post-response errors can be classified as
   // teardown artifacts instead of request failures.
   let responseReceived = false;
+  // The received response, captured by `markResponseReceived` so the
+  // abort path below can tag the BODY stream teardown (see the abort
+  // listener for why this ordering is a correctness invariant, not a
+  // style choice).
+  let response: http.IncomingMessage | undefined;
 
   const fail = (error: Error): void => {
     // Post-response error (RCA 2026-09-24): the promise is already
@@ -445,6 +451,23 @@ export function wireRequestLifecycle(
         // a WARN + rejects — never whether cleanup happens.
         const err = new Error('The operation was aborted');
         err.name = 'AbortError';
+        // RCA 2026-10-02 (mid-stream cancel race, task v0210-d2): the
+        // abort reason must be tagged BEFORE the socket is destroyed.
+        // Destroying only the REQUEST leaves the BODY stream to surface
+        // Node's own teardown error (code ECONNRESET, message "aborted")
+        // — an UNTAGGED socket-close that escapes the AbortError routing
+        // in `streamReader.ts` and gets reclassified to
+        // `ConnectionInterruptedError` while the caller merely cancelled.
+        // Destroying the RESPONSE with the tagged error first makes the
+        // pending/future `body.getReader().read()` reject with the
+        // AbortError itself (verified empirically on Node v22: without
+        // `response.destroy(err)` the reader rejects with
+        // `code=ECONNRESET message=aborted`; with it the rejection is
+        // `name=AbortError`). On an already-ended stream destroy() is a
+        // no-op, so a post-completion abort changes nothing.
+        if (response) {
+          response.destroy(err);
+        }
         req.destroy(err);
         fail(err);
       },
@@ -452,7 +475,8 @@ export function wireRequestLifecycle(
     );
   }
 
-  return () => {
+  return (res: http.IncomingMessage) => {
+    response = res;
     responseReceived = true;
   };
 }
