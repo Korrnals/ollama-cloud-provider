@@ -73,4 +73,5 @@ Makefile
 
 # Misc
 .gitignore
-.gitattributes.remember/**
+.gitattributes
+.remember/**
