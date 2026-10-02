@@ -1280,6 +1280,85 @@ describe('vision raw-resend cap (v0.21.0 D-3)', () => {
       logger.setDebugMode(false);
     }
   });
+
+  it('(f) cap=0 + quiet-completed cancel — hashes COMMIT (P3-g pin, byte-identical legacy semantics)', async () => {
+    // The cap=0 legacy path (commitPendingImageHashes skips the
+    // cancelled-token check when resolveRawResendCap() === 0) is what
+    // v0.20.1 did for EVERY quiet-completed cancel: the onDone that
+    // resolves the pipeline also commits the pending hashes. This test
+    // pins that a cancel under cap=0 COMMITS — the next turn gets the
+    // plain repeat marker, never a raw re-send, never a never-sent note.
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionHistory.rawResendCap': 0,
+    });
+    // Hanging SSE body (same shape as (d)): only the caller's
+    // cancellation ends it.
+    global.fetch = (async (url: unknown, init?: { body?: unknown; signal?: AbortSignal }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        return new Response(JSON.stringify({ message: { content: 'unused' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      chatCalls.push({ url: urlStr, body: parsed ?? {} });
+      const signal = init?.signal;
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            signal?.addEventListener('abort', () => {
+              const err = new Error('The operation was aborted');
+              err.name = 'AbortError';
+              controller.error(err);
+            });
+          },
+        }),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+
+    // Turn 1: cancel mid-stream → quiet resolve; with cap=0 the commit
+    // path runs anyway → the hash is COMMITTED despite the cancel.
+    const cts1 = new vscode.CancellationTokenSource();
+    const turn1 = provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      [imageMsg(IMG_A)],
+      {
+        modelOptions: {},
+        justification: 'test',
+      } as unknown as vscode.ProvideLanguageModelChatResponseOptions,
+      makeProgress(),
+      cts1.token,
+    );
+    await waitFor(() => chatCalls.length === 1);
+    cts1.cancel();
+    await turn1; // resolves quietly — the D-2 invariant holds under cap=0 too
+    assert.ok(
+      JSON.stringify(chatCalls[0]!.body).includes('image_url'),
+      'turn 1 had sent the image RAW',
+    );
+
+    // Turn 2 (healthy stream): the committed hash → the plain repeat
+    // marker — NOT a raw re-send, and WITHOUT the never-sent note (no
+    // failure counting happens at cap=0). Byte-identical v0.20.1.
+    installPrimaryFetch('ok');
+    const call2 = makeCall(provider, new vscode.CancellationTokenSource().token);
+    await call2([imageMsg(IMG_A), assistantMsg('partial'), userMsg('again?')]);
+    const turn2 = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(!turn2.includes('image_url'), 'cap=0 cancel COMMITTED — repeat is a marker, not raw');
+    assert.ok(turn2.includes('[Image'), 'plain repeat marker present');
+    assert.ok(
+      !turn2.includes('never successfully sent'),
+      'no never-sent note — cap=0 does not count failed sends',
+    );
+  });
 });
 
 /** Polls `cond` until it holds; rejects after `ms` (test pacing for async fetch stubs). */
