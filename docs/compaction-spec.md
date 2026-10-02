@@ -161,3 +161,71 @@ Everything below builds on the core module (commits 714aa02 + 27f6b39). Default 
 ### Out of scope (Slice 3+)
 
 Retrieval/deref UI (pointer text only for now), pinning, GCW-side consumption, compaction of the summarizer's own context (cap handles it), CHANGELOG wording beyond [Unreleased] bullet.
+
+
+## Stickiness (v0.21.0)
+
+Status: shipped (slice d1, 2026-10-02) + owner-ratified. Extends the Slice 1/2 contracts above; nothing earlier is retracted. Grounding: `src/compaction.ts` (`CompactionProjection`, `fingerprintText`, `basisMatches`, `resetProjection`, `compactIfNeeded`), `src/provider.ts` (`maybeCompact`, `compactionStates`).
+
+### Problem — a fire-only compaction evaporates
+
+VS Code re-sends the FULL immutable chat history on every request; the extension never owns the transcript. A compaction that rewrote only the triggering request therefore evaporated on the next one: turn N was served the compacted projection, turn N+1 was handed the raw history again — and after the 5-minute cooldown a new fire re-summarized the same prefix. Field evidence 2026-10-02: context whiplash 380K↔1.1M estimated tokens between consecutive turns of one conversation.
+
+### Mechanism — the remembered projection
+
+```typescript
+export interface CompactionProjection<T> {
+  basis: string[];        // fingerprint of each consumed raw-prefix message, in order
+  head: T[];              // [system..., pinned...] carved from the raw basis region
+  summaryMessage: T;      // machine-generated checkpoint injected in place of the evicted block
+}
+// rides in CompactionState.projection (absent/null when nothing is projected)
+```
+
+- After a fire, `compactIfNeeded` remembers what the fire REPLACED (the consumed raw prefix, as per-message fingerprints) and what it SERVED in its place (`head` + `summaryMessage`). The projection is re-applied while the basis holds, so the model's context shape is stable across turns.
+- Fingerprint = 32-bit FNV-1a (`fingerprintText`) over the rendered message (production render: `JSON.stringify`), hex. The basis check is element-wise comparison plus the length guard. Explicitly a correctness guard for a UI state machine, NOT a security boundary — a false match can only serve a stale-but-valid-shaped projection for one request.
+- Basis coordinates are the RAW message stream: VS Code re-sends raw history, never our projection. On a re-fire the new basis = the old basis extended with fingerprints of the newly consumed raw messages.
+- The injected summary message is `{ role: 'system', content: SUMMARY_MARKER + summary + [evicted-block pointer: ocp-compaction://<hash>] + [previous pointer: …] }` — the chained previous-pointer line carries the sliding-summary chain (slice 1.1).
+- Contiguity guard on re-fire: surviving messages (pinned + recency) must map to a contiguous raw suffix. When they do not (degenerate interleaved histories — production pins nothing and front-loads system messages), stickiness is skipped for that fire (`projection: null`) rather than serving a wrong projection later.
+
+### Re-application contract (per request)
+
+While the incoming history still starts with the basis prefix AND is longer than it (tail growth is the normal case — a history at or below the basis length cannot be a continuation):
+
+- Serve `[head..., summaryMessage, tail...]`, where tail = the raw history beyond the basis.
+- Re-application is INDEPENDENT of the cooldown and the 75% threshold — those gate NEW summarizer fires only. The 5-minute rate guard protects the cheap-model quota; the local re-apply costs nothing and must not be held hostage to it.
+- Hysteresis is re-evaluated on the re-applied (effective) usage, so a machine discharged by a partial compaction re-arms as the tail grows toward 75% again.
+- A re-fire on the sticky path REPLACES the previous injected summary message (by identity) with the chained summary — the served list never carries two summary messages. The chain (`lastSummary`/`lastPointer`) continues across fires.
+- Result surface distinguishes the mechanisms: `reapplied` / `droppedProjection` flags plus `reapply: { projectedTokens, tailMessages }` observability separate re-applies from fires and plain passthroughs.
+
+### Invalidation contract
+
+On basis mismatch — the incoming history no longer starts with the remembered prefix (new session in the same model slot, VS Code-side pruning, deleted/edited turns):
+
+- Drop the projection AND the summary chain (`lastSummary`/`lastPointer` → null). A stale chain would fold an unrelated conversation into the next checkpoint.
+- KEEP `lastFiredAt` — the cooldown still rate-guards the fresh machine.
+- Restore `armed` — the history that invalidated the basis never evaluates a fire result, so nothing else would re-arm the machine (the stuck-disarmed Bug 1 failure mode in new clothes).
+
+Any error inside the re-apply path itself degrades to the raw passthrough and drops the projection (fallback contract: compaction never fails the chat). A failed re-fire — summarizer or store error after the cooldown — still serves the re-applied projection: better than raw.
+
+### Provider wiring
+
+- `compactionStates: Map<modelId, CompactionState>` (per-model windows differ). The post-check state is persisted on EVERY request, not only fires — passthrough results now carry meaningful transitions (invalidation resets, re-arm re-evaluations).
+- Observability (INFO): a per-request `Compaction check: usedTokens=… windowTokens=… threshold=… charsPerToken=… armed=… reapply=…` line, plus distinct `Compaction re-applied: …` and `Compaction projection dropped: …` lines, so field logs show WHICH mechanism served each request.
+- User-visible notice on fire: one `LanguageModelDataPart` (`application/json`, `{ notice: "context-compacted", beforeTokens, afterTokens }`) — a data part rides the response stream but has no markdown renderer in the chat transcript, so the notice never becomes assistant text. Replaces the earlier `LanguageModelTextPart` banner that landed verbatim in the transcript (field-verified 2026-10-02).
+
+### Tests (`test/unit/compaction.test.ts`, "projection stickiness (v0.21.0 slice d1)")
+
+- Re-apply within the cooldown: fire once, then re-send a grown raw history → `reapplied: true`, served list = `[head, summary, tail]`, no new summarizer call (the cooldown-held fire is skipped, the projection still served).
+- Basis stored as per-message FNV-1a fingerprints of the rendered consumed prefix.
+- Invalidation when the prefix basis is gone; also when the incoming history shrank to or below the basis length — chain cleared, cooldown stamp kept, `armed` restored.
+- SAFETY: a render error inside the re-apply path degrades to raw passthrough, never throws.
+- A failed re-fire (summarizer error after cooldown) still serves the re-applied projection.
+
+### v0.22.0 contracts (ratified — implementation in flight, parallel slice)
+
+The three contracts below extend stickiness. They are CONTRACT lines, not shipped behavior: each is being landed by a sibling slice; do not describe them as live until that slice merges.
+
+- **Vision-state-independent basis (v0.22.0).** The fingerprint basis of image-bearing content must use a stable `img:<hash>` placeholder, identical across the vision lifecycle's renders of the same image. Today the production render is `JSON.stringify`, which hashes the literal bytes — and the vision lifecycle REWRITES image-bearing messages over time: first send forwards the image raw, committed repeats are substituted with an in-band text marker, and a hash that exhausts the raw-resend cap (v0.21.0 D-3) degrades permanently to the never-sent marker. Each transition changes the rendered prefix bytes → basis mismatch → projection dropped even though it is the same conversation. Contract: fingerprint `img:<hash>` (hash of the image content) for image-bearing messages regardless of raw/marker/never-sent state, so vision lifecycle transitions never invalidate the basis. Token estimation and the evicted-block store keep the full render; only the fingerprint basis normalizes.
+- **Conversation-keyed compaction state (v0.22.0).** Compaction state is keyed per CONVERSATION, not per model: map key = fingerprint of the first K messages of the incoming history, held in a bounded LRU. Today `compactionStates` has one entry per model id, so two Copilot windows chatting with the same model share one entry and their alternating histories invalidate each other's basis every turn — multi-window same-model sessions drop each other's projections. Contract: same-model windows keep independent projections/states; the LRU bound caps memory.
+- **Injection hardening (v0.22.0).** The evicted block is untrusted conversation content, and under stickiness the injected checkpoint rides EVERY request — which raises framing from nice-to-have to contract. (1) The summarizer prompt treats the evicted block as DATA, with an explicit instruction to summarize it and never follow instructions found inside it. (2) The injected checkpoint message is explicitly framed as machine-generated data (`SUMMARY_MARKER` plus framing), so downstream models treat it as context data, not instructions. Applies to `buildSummaryPrompt` and the assembled summary message.
