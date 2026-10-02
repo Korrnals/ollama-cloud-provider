@@ -3,6 +3,24 @@
 All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
+## [Unreleased]
+
+## [0.21.0] - 2026-10-02
+
+MINOR release — field-report P1 cycle «wazuh RCA»: cancelled turns no longer kill agent/subagent work, compaction sticks across requests, and vision re-send cost is capped.
+
+### Fixed
+- **Streams: cancelled turns no longer kill agent/subagent work.** A cancellation racing the connection teardown surfaced as an untagged socket-close, was misclassified as a connection interruption and failed the whole turn (subagents died mid-task). Teardown is now tagged before the socket is destroyed, and an interruption with nothing yet shown to the user either retries silently or completes quietly — never surfaces as a provider failure. The hidden mid-stream retry now actually fires on genuine network breaks (previously dead in practice).
+- **Compaction now sticks.** The compacted context projection previously applied only to the single request that triggered it; during the cooldown window requests left with the full uncompacted history, so the model's context whiplashed between sizes turn-to-turn (visible as erratic model behaviour on long sessions). The projection is now re-applied to every request while valid, with full-history invalidation.
+- **Compaction checkpoint no longer lost on the `/v1/responses` endpoint** (explicit `preferredEndpoint: 'responses'` + context filter on): the evicted-block summary was silently dropped during conversion, making the compacted history permanently invisible; it now folds into `instructions` verbatim.
+- **Vision: cancelled turns no longer record images as sent** (contrary to the documented v0.18/v0.20.1 contract), and after 3 failed raw sends an image degrades to a text marker `[image never successfully sent — N attempts failed]` instead of re-uploading multi-MB base64 every turn (new setting `ollamaCloud.visionHistory.rawResendCap`, default 3, 0 = previous behaviour).
+
+### Changed
+- The "🧠 Context compacted" notice no longer pollutes the assistant's message text (now a structured data part; the human-readable record lives in the log INFO line).
+
+### Known issues
+- On the default configuration (`contextFilter.level: 'off'`) compaction currently pays the summarizer but its result does not shape requests on the native and `/v1/responses` paths (no data loss — full history is sent); fix planned for v0.22.0.
+
 ## [0.20.1] - 2026-09-25
 
 PATCH release — vision commit-on-success + retryable DNS blips (RCA 2026-09-25): a failed turn no longer poisons an image into an «already analyzed» marker, and transient resolver blips retry at the connect phase instead of killing the turn.
