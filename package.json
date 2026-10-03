@@ -348,7 +348,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src test",
-    "test": "mocha --config .mocharc.json",
+    "test": "env -u OLLAMA_API_KEY mocha --config .mocharc.json",
     "test:unit": "mocha --config .mocharc.json out/test/unit/**/*.test.js",
     "test:integration": "mocha --config .mocharc.json out/test/integration/**/*.test.js",
     "package": "vsce package --out releases/",

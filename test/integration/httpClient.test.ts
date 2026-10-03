@@ -723,6 +723,9 @@ describe('httpClient — proxy port defaults by PROXY URL protocol (Sec F2, v022
  * must now WARN, naming both env vars so the operator knows what to
  * unset.
  *
+ * v0.22.1: the WARN fires once per activation streak (module-level
+ * guard in httpClient), not once per CONNECT attempt — pinned below.
+ *
  * Topology: a minimal CONNECT proxy that answers 200 and immediately
  * destroys the socket — the TLS leg fails fast. The WARN fires before
  * `tls.connect`, so the assertion does not depend on the TLS outcome.
@@ -751,6 +754,17 @@ describe('httpClient — insecure test transport activation warns (Sec F4, v0221
     proxyPort = (proxy.address() as AddressInfo).port;
   });
 
+  beforeEach(() => {
+    // P2-1 (QA final cascade, v0.22.1): count from a CLEAN ring. The
+    // warn/error ring is capped at 100 entries (RECENT_ERRORS_CAP,
+    // push → shift); when it wraps between the baseline capture and
+    // the post-read, the slice(before) deltas below silently drop the
+    // lines under test. QA's literal `getRecentErrors().splice(0)` was
+    // a no-op — that accessor returns a defensive copy — so the ring
+    // is cleared through the explicit `clearRecentErrors()` seam.
+    logger.clearRecentErrors();
+  });
+
   after(() => {
     // Synchronous env restore first — same rule as the tunnel suite.
     if (savedDelegate !== undefined) {
@@ -773,7 +787,19 @@ describe('httpClient — insecure test transport activation warns (Sec F4, v0221
 
   it('activation with both test env vars logs a WARN naming both', async function () {
     this.timeout(4000);
+    // Re-arm the once-per-activation WARN first: the tunnel suite
+    // earlier in this mocha process exercises the seam with the
+    // insecure transport ACTIVE, consuming the activation WARN. A
+    // CONNECT with the opt-in unset observes verification restored and
+    // re-arms the guard, making the activation transition below
+    // deterministic (Sec F4 dedup, v0.22.1).
     process.env.OLLAMA_HTTP_TEST_DELEGATE = '0';
+    delete process.env.OLLAMA_HTTP_TEST_TLS_INSECURE;
+    await assert.rejects(
+      requestThroughSinkProxy(),
+      (err: unknown) => err instanceof Error,
+    );
+
     process.env.OLLAMA_HTTP_TEST_TLS_INSECURE = '1';
 
     const before = logger.getRecentErrors().length;
@@ -791,6 +817,22 @@ describe('httpClient — insecure test transport activation warns (Sec F4, v0221
       recent.includes('[WARN]'),
       'the line must be a WARN (visible in the default output channel), ' +
         `recent:\n${recent}`,
+    );
+    // Sec F4 dedup pin (v0.22.1): a second request in the SAME
+    // activation streak must not add a second insecure-transport WARN
+    // line — the module-level guard makes the warning
+    // once-per-activation, not once-per-CONNECT.
+    const beforeSecond = logger.getRecentErrors().length;
+    await assert.rejects(
+      requestThroughSinkProxy(),
+      (err: unknown) => err instanceof Error,
+    );
+    const secondDelta = logger.getRecentErrors()
+      .slice(beforeSecond)
+      .join('\n');
+    assert.ok(
+      !secondDelta.includes('insecure TEST transport'),
+      `a second CONNECT in the same activation must NOT re-warn (once-per-activation guard); recent:\n${secondDelta}`,
     );
   });
 
