@@ -16,7 +16,10 @@ if ! npm run compile >/tmp/local-ci-test-compile.log 2>&1; then
   exit 1
 fi
 
-if npm test >/tmp/local-ci-test.log 2>&1; then
+# Env parity: every documented suite invocation runs without ambient
+# OLLAMA_API_KEY (tests self-set it where needed; #51 hit env-dependence).
+# scripts.test unsets it too — this keeps the gate explicit on its own.
+if env -u OLLAMA_API_KEY npm test >/tmp/local-ci-test.log 2>&1; then
   echo "[PASS] test (npm test)"
   # Surface the pass/fail counts for the summary table.
   grep -E "[0-9]+ passing|[0-9]+ failing" /tmp/local-ci-test.log | tail -n 2
