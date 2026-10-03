@@ -754,6 +754,17 @@ describe('httpClient — insecure test transport activation warns (Sec F4, v0221
     proxyPort = (proxy.address() as AddressInfo).port;
   });
 
+  beforeEach(() => {
+    // P2-1 (QA final cascade, v0.22.1): count from a CLEAN ring. The
+    // warn/error ring is capped at 100 entries (RECENT_ERRORS_CAP,
+    // push → shift); when it wraps between the baseline capture and
+    // the post-read, the slice(before) deltas below silently drop the
+    // lines under test. QA's literal `getRecentErrors().splice(0)` was
+    // a no-op — that accessor returns a defensive copy — so the ring
+    // is cleared through the explicit `clearRecentErrors()` seam.
+    logger.clearRecentErrors();
+  });
+
   after(() => {
     // Synchronous env restore first — same rule as the tunnel suite.
     if (savedDelegate !== undefined) {

@@ -164,6 +164,17 @@ class Logger {
     return [...this.recentErrors];
   }
 
+  /**
+   * Clears the recent warn/error ring. Test seam (QA P2-1, v0.22.1):
+   * tests that count log lines via a before/slice(before) delta need a
+   * clean baseline — under load the capped ring (RECENT_ERRORS_CAP,
+   * push → shift) wraps between the two reads and index-based slices
+   * silently drop the lines under test.
+   */
+  clearRecentErrors(): void {
+    this.recentErrors.splice(0);
+  }
+
   private pushRecentError(formatted: string): void {
     this.recentErrors.push(formatted);
     if (this.recentErrors.length > Logger.RECENT_ERRORS_CAP) {
