@@ -5,6 +5,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-10-03
+
+PATCH release — v0.22.0 cascade fast-follow: pipeline-unblocking flake fix, proxy port security fix, fingerprint injectivity.
+
+### Fixed
+- **Tunnel-abort test no longer flakes on pipeline-shaped runs (#51)** — the byte-exact proxy-counter pin (4933 !== 1759 class) is replaced by a poll-to-freeze quiescence check; deterministic on loaded runners, unblocks the release pipeline.
+- **Proxy port defaults by the PROXY URL's own protocol, on both transports (Sec F2)** — a port-less `http://` proxy previously sent its CONNECT (including Proxy-Authorization) to :443 instead of the proxy's :80 listener; a port-less `https://` proxy on the plain path went to :80 instead of :443. Changes behavior only for port-less proxy URLs; explicit ports always honored. Scope note: an `https://` proxy scheme changes only the default port — TLS-to-the-proxy is not implemented.
+- **Compaction basis fingerprint is injective (QA P3-1)** — the sorted image-identity set in the conversation-key fingerprint is JSON-array encoded; a comma inside one image identity could previously collide with the two-identity form, merging distinct conversations onto one compaction slot. Internal in-memory format (LRU, reset on reload); no migration.
+
+### Security
+- **Insecure test transport warns on activation (Sec F4)** — leftover dev env vars (OLLAMA_HTTP_TEST_TLS_INSECURE=1 + OLLAMA_HTTP_TEST_DELEGATE) no longer disable certificate verification silently; a WARN naming both vars fires once per activation.
+
+### Internal (test-only, user-invisible)
+- Composition pins for the v0.22.0 cascade gaps: responses+compaction image wire with checkpoint fold; discard-on-cancel under the 404-fallback chain; hidden-retry backoff-cancel; plain-proxy port-default pin. Repaired a vacuous T-3 assertion (property filter → instanceof); hardened F4 test baseline (clear logger ring); widened first-run pacing margins.
+
+### Docs
+- New docs/security-advisories.md (accepted residuals A-1..A-5); compaction-spec basis wording aligned (sorted hash set, JSON-array encoded).
+
+### Known issues
+- (carry) v0.21.0/v0.22.0 GPG .asc assets pending the cluster conveyor (heal via release-trigger re-run on return).
+
 ## [0.22.0] - 2026-10-02
 
 MINOR release — cascade QA audit cycle «compaction and proxy truth»: compaction is now effective on the shipped defaults, images survive the compacted native path, proxy support genuinely works, and the compaction summarizer is injection-hardened.
