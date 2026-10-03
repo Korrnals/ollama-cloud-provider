@@ -307,6 +307,20 @@ function requestViaHttpProxy(
 }
 
 /**
+ * Sec F4 dedup (v0.22.1): the insecure-test-transport WARN is emitted
+ * once per ACTIVATION streak, not on every CONNECT attempt. The flag is
+ * set on first emission and re-armed only when a later CONNECT observes
+ * verification restored (both test vars no longer active). In production
+ * the env vars are static for the process lifetime, so this is
+ * once-per-process in practice; the re-arm keeps the signal honest
+ * across activate → restore → re-activate transitions (a pure
+ * once-per-process flag would silently swallow a re-activation WARN,
+ * and would make the F4 test pins order-dependent on whichever suite
+ * in the same mocha process consumed the process's only emission).
+ */
+let insecureTransportWarned = false;
+
+/**
  * HTTPS target via HTTP proxy — CONNECT tunnel. The client opens a TCP
  * connection to the proxy, sends `CONNECT host:port`, and once the
  * proxy responds `200 Connection Established`, upgrades the socket to
@@ -409,11 +423,18 @@ function requestViaTlsConnectTunnel(
       const insecureTestTransport =
         process.env.OLLAMA_HTTP_TEST_TLS_INSECURE === '1' &&
         process.env.OLLAMA_HTTP_TEST_DELEGATE !== undefined;
-      if (insecureTestTransport) {
+      if (!insecureTestTransport) {
+        // Verification observed restored — re-arm the once-per-activation
+        // WARN (see the `insecureTransportWarned` guard's comment).
+        insecureTransportWarned = false;
+      } else if (!insecureTransportWarned) {
         // Sec F4 (task v0221-p3): dev leftovers in a user's shell env
         // used to disable certificate verification SILENTLY. One WARN
-        // per CONNECT names both env vars so the operator knows exactly
-        // what to unset.
+        // names both env vars so the operator knows exactly what to
+        // unset. v0.22.1: emitted once per activation streak (guard
+        // above), not per CONNECT attempt — a leaked pair of test vars
+        // used to print one line per request.
+        insecureTransportWarned = true;
         logger.warn(
           'httpClient: insecure TEST transport active — TLS certificate verification disabled for this tunnel. Test-only env vars detected: unset OLLAMA_HTTP_TEST_TLS_INSECURE and OLLAMA_HTTP_TEST_DELEGATE to restore verification.',
         );
