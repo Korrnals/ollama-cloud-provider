@@ -5,6 +5,25 @@ Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [Sem
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-10-04
+
+PATCH release — first conveyor-complete cycle since the conveyor returned: the between-iterations cancel-ghost fix, a deterministic composition suite (#51 class), and the post-rotation GPG key actualization.
+
+### Fixed
+- **Cancel caught by the between-iterations stream check no longer delivers buffered parts into the dead turn (ghost tool call/text)**: that exit is now classified cancel-caused — armed window discarded before onDone, finalize skipped, quiet completion (same discard-on-cancel contract as the abort/error routes, disclosed via a distinct WARN).
+
+### Internal (test-only)
+- **Composition suite deterministic on pipeline-shaped runners (#51 class)**: wall-clock waitFor replaced by ArrivalGate dispatch signals + pull-based (HWM:0) hanging body + one DNS warmup; new unit pin for the between-iterations route. Closes the class that stalled the conveyor at v0.22.1.
+
+### Security
+- **gpg-public-key.asc actualized to the post-rotation key** (primary 7382EC25 3AF1 2383 F96B D368 77C8 2486 69A1 5145); the previously committed key verified none of the published .asc assets — users can now verify release VSIXs since v0.21.0. Pre-rotation .asc layers (v0.18.0–v0.20.1) are not verifiable (intermediate key never published; rely on cosign + SHA-256 for those).
+
+### Docs
+- **README/SECURITY actualized to v0.21.0–v0.22.1 reality**: GPG verify steps, visionHistory rows, proxy port-default/TLS-to-proxy limit, compaction checkpoint survival.
+
+### Known issues
+- (resolving with this release) v0.22.1's .asc remains pending — its tag tree predates the P2-2 fix; heal options documented on the release (bypass/attach-mode).
+
 ## [0.22.1] - 2026-10-03
 
 PATCH release — v0.22.0 cascade fast-follow: pipeline-unblocking flake fix, proxy port security fix, fingerprint injectivity.
