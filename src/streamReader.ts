@@ -657,6 +657,15 @@ async function readStreamOnce(
 
   let done = false;
 
+  // v0222-p3-cancel-race-ghost-window — set when the read loop exits
+  // through the between-iterations cancel-check below. That break does
+  // NOT throw, so the flow continues into the clean-end section, whose
+  // finalize/onDone would FLUSH an armed commit window's buffered
+  // parts into the already-cancelled turn (ghost tool call / text).
+  // The flag routes the completion through the same discard-on-cancel
+  // semantics as the other cancel-caused completions.
+  let exitViaLoopCancelCheck = false;
+
   // ADR 0005 — per-attempt abort wiring. Declared in the function
   // scope (not inside `try`) so the outer `finally` can detach the
   // main→attempt listener once the stream is done.
@@ -892,6 +901,11 @@ async function readStreamOnce(
       }
       if (cancellationToken?.isCancellationRequested) {
         controller.abort();
+        // v0222-p3-cancel-race-ghost-window — this break exits the
+        // loop WITHOUT throwing (no pending read() to reject), so the
+        // flow reaches the clean-end completion below; the flag tells
+        // that completion the exit was cancel-caused.
+        exitViaLoopCancelCheck = true;
         break;
       }
 
@@ -968,6 +982,29 @@ async function readStreamOnce(
           `${logTag}: idle kill at clean stream end — quiet=${idleEnd.quietMs}ms chunks=${chunksReceived} (ollama/ollama#16108 signature)`,
         );
         callbacks.onError(idleEnd);
+        return;
+      }
+      // v0222-p3-cancel-race-ghost-window — the loop exited through
+      // the between-iterations cancel-check: a CANCEL-caused
+      // completion, not a genuine clean end. Same discard-on-cancel
+      // contract as the other cancel-caused completions (the
+      // AbortError 'cancel' branch in the catch above; the CIE and
+      // ZeroByte cancelled branches in `readStream`): the window may
+      // still be ARMED with this attempt's buffered deltas, and the
+      // clean-end completion below (finalize / wrapped onDone) FLUSHES
+      // the buffer — emitting ghost tool-call/text parts into the dead
+      // turn. Discard BEFORE onDone (the wrapped onDone flush is then
+      // a no-op) and SKIP finalize: the compat finalizer's own
+      // onDone would flush before any discard could run, and after a
+      // discard its tool-call parts would deliver directly (window
+      // state 'flushed'). Quiet completion (no error surfaced) is
+      // unchanged.
+      if (exitViaLoopCancelCheck) {
+        logger.warn(
+          `${logTag}: cancel caught by the between-iterations cancel check — quiet completion (buffered parts discarded, nothing emitted into the dead turn)`,
+        );
+        getAttachedCommitWindow(callbacks)?.discard();
+        callbacks.onDone();
         return;
       }
       // Clean stream end without a terminal line from the callback.
