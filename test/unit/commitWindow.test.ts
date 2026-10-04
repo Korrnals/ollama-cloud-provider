@@ -1199,6 +1199,102 @@ describe('cancel × untagged socket-close classification race (task v0210-d2, co
     assert.equal(fetchCalls, 1, 'no retry after cancellation');
   });
 
+  it('cancel caught by the BETWEEN-ITERATIONS loop check with buffered tool_call + text → discard-on-cancel: NOTHING emitted, quiet done, finalize skipped (ghost window)', async function () {
+    this.timeout(5000);
+    // v0222-p3-cancel-race-ghost-window — the third cancel-caused
+    // completion route. The two pins above drive the cancel through a
+    // stream ERROR (tagged AbortError / untagged CIE) thrown out of a
+    // PENDING reader.read(). This pin drives the cancel into the
+    // loop's between-iterations token check instead: the token flips
+    // while the reader is inside its synchronous line-processing, so
+    // no read() is pending and no AbortError can race — the next loop
+    // iteration sees isCancellationRequested, breaks WITHOUT throwing,
+    // and the flow continues into the clean-end section. Pre-fix that
+    // path ran finalize + wrapped onDone, whose flush() delivered the
+    // armed window's buffered parts into the already-dead turn (ghost
+    // tool call / text) — bypassing every discard() call site (they
+    // all live on the abort/error routes).
+    //
+    // Deterministic landing (no pacing): the cancel fires INSIDE the
+    // processLine callback for the second chunk's last data line — the
+    // reader is provably between iterations at its next check. The
+    // body is fully enqueued + closed (a real server would end
+    // cleanly), but the trailing {done:true} read is never issued
+    // because the check breaks first — exactly the production
+    // interleaving.
+    const source = new vscode.CancellationTokenSource();
+    let fetchCalls = 0;
+    globalThis.fetch = (async (url: unknown) => {
+      if (url !== TARGET_URL) {
+        return new Response('busy', { status: 400 });
+      }
+      fetchCalls += 1;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // Chunk 1: consumed by the withRetry probe, seed-parsed →
+          // window ARMED with a buffered tool_call part.
+          controller.enqueue(encode('data: tool\n\n'));
+          // Chunk 2: read by the main loop; its line-processing is
+          // where the cancel lands (window still open, text buffered).
+          controller.enqueue(encode('data: text\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as typeof fetch;
+
+    const { recorded, callbacks } = recordCallbacks();
+    const win = createCommitWindow(WINDOW_MS);
+    const wrapped = win.wrap(callbacks);
+    // Mirrors the compat client's finalize shape (flushToolCalls +
+    // cb.onDone()): on the cancel path it must NOT run at all — its
+    // onDone would flush the armed window into the dead turn, and
+    // after a discard its tool-call parts would deliver directly
+    // (window state 'flushed').
+    let finalizeRan = false;
+
+    await readStream(
+      {
+        logTag: 'v0222-loop-cancel',
+        url: TARGET_URL,
+        headers: {},
+        body: '{}',
+        cancellationToken: source.token,
+        processLine: (line, ctx) => {
+          const stop = toolAndTextLine(wrapped)(line, ctx);
+          if (line.trim() === 'data: text') {
+            source.cancel();
+          }
+          return stop;
+        },
+        finalize: (cb) => {
+          finalizeRan = true;
+          cb.onDone();
+        },
+      },
+      wrapped,
+    );
+
+    assert.equal(recorded.done, true, 'quiet completion via onDone (cancel-caused, not an error)');
+    assert.equal(recorded.error, undefined, 'no error on the cancelled break');
+    assert.deepStrictEqual(
+      recorded.events,
+      [],
+      'discard-on-cancel: buffered tool_call/text must NOT be emitted after the cancel',
+    );
+    assert.equal(finalizeRan, false, 'finalize skipped on a cancel-caused completion (its onDone/flush would emit into the dead turn)');
+    assert.equal(fetchCalls, 1, 'no retry after cancellation');
+    assert.equal(win.controller.hiddenRetryCount(), 0);
+    // Diagnostics honesty — the quiet completion is disclosed via a
+    // distinct WARN line naming the route (same contract as the
+    // CIE / Zero-byte quiet-cancel branches).
+    const recent = logger.getRecentErrors().join('\n');
+    assert.ok(
+      recent.includes('between-iterations cancel check'),
+      'the between-iterations quiet completion must be disclosed via a distinct WARN line',
+    );
+  });
+
   it('cancel before stream start → quiet onDone, no error, no retry (unchanged)', async function () {
     this.timeout(5000);
     const source = new vscode.CancellationTokenSource();
