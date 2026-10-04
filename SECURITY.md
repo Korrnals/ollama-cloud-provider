@@ -72,4 +72,18 @@ The private key (`cosign.key`) stays gitignored (via `*.key`) and never
 leaves the maintainer's machine. `cosign.pub` is safe to redistribute —
 it can only verify signatures, not create them.
 
+### GPG verification (`gpg-public-key.asc`)
+
+The repo root also ships `gpg-public-key.asc` — the public release-signing
+keyblock for the GPG detached signatures (`.asc` assets) on releases. The
+key was rotated 2026-09-30 (two generations after the original F49BE957
+key); the committed file is the current key, and it verifies `.asc`
+signatures on releases since v0.21.0. Pre-rotation releases verify against
+the old key, which remains available in git history.
+
+```bash
+gpg --import gpg-public-key.asc
+gpg --verify ollama-cloud-provider-*.vsix.asc ollama-cloud-provider-*.vsix
+```
+
 > **Note (2026-07-22):** GitHub Actions release workflow is disabled due to billing lock. Signing is performed locally via `scripts/local-ci/run-release-local.sh` until billing is resolved. The three-layer strategy is unchanged; only the execution environment moved from GitHub Actions to local.
