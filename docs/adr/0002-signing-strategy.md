@@ -79,6 +79,25 @@ long-lived signing keys in CI" positive consequence is amended: there is
 now one long-lived signing keypair (`cosign.key`), protected by gitignore
 + maintainer-only access; the GPG key remains the identity layer.
 
+## Revision — 2026-10-04: signing keys actualized (three published keys)
+
+An empirical audit of every published signature artifact (v0.9.0–v0.22.2)
+showed the Layer 2 keypair axis is in fact signed by **three different
+keypairs** across release history: the original local keypair (v0.9.0–
+v0.13.0), the local-pipeline key (v0.14.0–v0.20.1, and v0.22.1 after the
+conveyor stalled on the #51-class composition flake), and the
+cluster-conveyor key (v0.21.0, v0.22.0, v0.22.2 — the current signing
+path). The `cosign.pub` committed in the 2026-08-04 revision was the
+first of these and matched none of the keys signing recent releases, so
+the cosign layer of v0.14.0–v0.22.2 was unverifiable from the repo.
+
+It is renamed `cosign-legacy.pub` (content unchanged) and the two actual
+signing keys are published as `cosign-local.pub` and
+`cosign-conveyor.pub`. The Layer 2 verification command must use the key
+matching the release; the key-to-release mapping, per-bundle
+`publicKey.hint` values, and commands live in [SECURITY.md](../../SECURITY.md).
+The keypair-mode decision itself is unchanged.
+
 ## Rejected alternatives
 
 - **L4: Paid code-signing certificate (Authenticode)** — VS Code does not use Authenticode verification for extension trust. The cost ($200-400/year) buys a marketing badge, not a security guarantee VS Code enforces. Overkill for a community extension.

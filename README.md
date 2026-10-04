@@ -93,7 +93,7 @@ gpg --verify ollama-cloud-provider-*.vsix.asc ollama-cloud-provider-*.vsix
 code --install-extension ollama-cloud-provider-*.vsix
 ```
 
-The repo root ships the release GPG public key (`gpg-public-key.asc` — rotated 2026-09-30; it verifies the `.asc` detached signatures on releases since v0.21.0) and `cosign.pub` for cosign verification. See [SECURITY.md](SECURITY.md) for the full signing story and the release notes for per-release signature details.
+The repo root ships the release GPG public key (`gpg-public-key.asc` — rotated 2026-09-30; it verifies the `.asc` detached signatures on releases since v0.21.0) and the cosign verification keys: `cosign-conveyor.pub` (cluster-conveyor-signed releases: v0.21.0, v0.22.0, v0.22.2+), `cosign-local.pub` (local-pipeline-signed: v0.14.0–v0.20.1, v0.22.1) and `cosign-legacy.pub` (v0.9.0–v0.13.0 keypair era). See [SECURITY.md](SECURITY.md) for the key-to-release mapping and verify commands, and the release notes for per-release signature details.
 
 ### From source
 

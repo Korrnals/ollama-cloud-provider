@@ -4,6 +4,8 @@ All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
 ## [Unreleased]
+### Security
+- **Cosign verification keys actualized**: an audit of all published signature bundles showed the committed `cosign.pub` matched none of the keys actually signing releases — the cosign layer of v0.14.0–v0.22.2 could not be verified from the repo. Published the two actual public keys: `cosign-conveyor.pub` (cluster release conveyor; signs v0.21.0, v0.22.0, v0.22.2) and `cosign-local.pub` (local pipeline; signs v0.14.0–v0.20.1 and v0.22.1); the legacy file renamed `cosign-legacy.pub` (byte-identical; verifies the v0.9.0–v0.13.0 `.sigstore.bundle` era). Every published signed asset v0.9.0–v0.22.2 re-verified against the key its bundle names. SECURITY.md carries the key→release mapping with verify commands; README and ADR-0002 actualized.
 
 ## [0.22.2] - 2026-10-04
 
