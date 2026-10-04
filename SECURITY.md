@@ -78,8 +78,10 @@ The repo root also ships `gpg-public-key.asc` — the public release-signing
 keyblock for the GPG detached signatures (`.asc` assets) on releases. The
 key was rotated 2026-09-30 (two generations after the original F49BE957
 key); the committed file is the current key, and it verifies `.asc`
-signatures on releases since v0.21.0. Pre-rotation releases verify against
-the old key, which remains available in git history.
+signatures on releases since v0.21.0. Pre-rotation releases (v0.18.0–
+v0.20.1) were signed by an intermediate key that was never published in
+this repo — their `.asc` layers cannot be verified today; rely on the
+cosign signature and SHA-256 checksums for those releases.
 
 ```bash
 gpg --import gpg-public-key.asc
