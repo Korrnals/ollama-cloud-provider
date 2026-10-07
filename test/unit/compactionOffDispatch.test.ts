@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { OllamaCloudChatProvider } from '../../src/provider.js';
 import { clearCapabilityCache } from '../../src/capabilityCache.js';
+import { drainVisionWarmDescribes } from '../../src/visionTwoPhase.js';
 import { logger } from '../../src/logger.js';
 import {
   convertMessagesToOpenAI,
@@ -247,11 +248,22 @@ let summarizerCalls: RecordedCall[] = [];
 let nativeCalls: RecordedCall[] = [];
 let responsesCalls: RecordedCall[] = [];
 let logged: string[] = [];
+/**
+ * v0.22.3 (task v0223-vision-cache-warm) — the vision DESCRIBE calls
+ * the D1 background cache-warm now fires on `/api/chat stream:false`
+ * after a vision-primary RAW commit (body shape: an `images` array on
+ * a user message — the same classifier the unifiedVision G2 stub
+ * uses). Bucketed SEPARATELY from the summarizer: the summarizer-count
+ * pins below are untouched (a warm describe is neither a summarizer
+ * charge nor a native dispatch).
+ */
+let describeWarmCalls: RecordedCall[] = [];
 
 function installFetch(): void {
   summarizerCalls = [];
   nativeCalls = [];
   responsesCalls = [];
+  describeWarmCalls = [];
   global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
     const urlStr = String(url);
     const parsed = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
@@ -279,6 +291,18 @@ function installFetch(): void {
       );
     }
     if (urlStr.includes('/api/chat')) {
+      const messages = (parsed.messages as Array<Record<string, unknown>>) ?? [];
+      const isDescribe = (messages as Array<Record<string, unknown>>).some(
+        (m) => 'images' in m,
+      );
+      if (isDescribe) {
+        // v0.22.3 — the D1 warm describe (hardcoded prompt + images).
+        describeWarmCalls.push({ url: urlStr, body: parsed });
+        return new Response(
+          JSON.stringify({ message: { content: 'a compact describe' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
       // Summarizer (`nativeChatOnce`, `stream:false`).
       summarizerCalls.push({ url: urlStr, body: parsed });
       return new Response(
@@ -336,7 +360,10 @@ describe('compaction reaches the wire at filter=off — v0220-a P1 pins', functi
     installFetch();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight warm describes against this stub
+    // before the fetch restore (no cross-test leak / real-network hit).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.info = originalInfo;
     for (const dir of storageDirs.splice(0)) {

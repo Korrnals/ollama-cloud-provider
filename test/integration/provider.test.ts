@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import { OllamaCloudChatProvider, classifyStreamError } from '../../src/provider.js';
+import { drainVisionWarmDescribes } from '../../src/visionTwoPhase.js';
 import {
   ConnectionInterruptedError,
   HttpError,
@@ -142,7 +143,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — happy pat
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
   });
 
@@ -280,7 +285,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — vision ga
     fetchCalls = [];
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
   });
 
@@ -832,7 +841,11 @@ describe('OllamaCloudChatProvider.provideLanguageModelChatResponse — fallback 
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     setConfig({});
   });
@@ -946,7 +959,11 @@ describe('OllamaCloudChatProvider — structured reasoning (ADR 0006 Phase 3)', 
     fetchCalls = [];
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     setConfig({});
   });
@@ -1154,7 +1171,11 @@ describe('OllamaCloudChatProvider — vision fallback endpoint dispatch (ADR 000
     fetchCalls = [];
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     setConfig({});
   });
@@ -1372,7 +1393,11 @@ describe('OllamaCloudChatProvider — endpoint fallback policy (Issue #40)', () 
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.info = originalInfo;
     // Reset config + inspection metadata so no test leaks explicitness
@@ -1968,7 +1993,11 @@ describe('OllamaCloudChatProvider — stream lifecycle logs (Issue #41)', () => 
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.info = originalInfo;
     logger.error = originalError;
@@ -2236,7 +2265,11 @@ describe('OllamaCloudChatProvider — endpoint indicator tooltip (Issue #41)', (
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     setConfig({});
   });
@@ -2507,7 +2540,11 @@ describe('OllamaCloudChatProvider — contextFilter integration (Issue #39 Findi
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.info = originalInfo;
     setConfig({});
@@ -2858,7 +2895,11 @@ describe('OllamaCloudChatProvider — switchEndpoint command (v0.9.0 Fix 4)', ()
     };
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     // Restore the stub's no-op showQuickPick so the monkey-patch does
     // not leak past this suite.
     writableWindow.showQuickPick = originalQuickPick;
@@ -3057,7 +3098,11 @@ describe('OllamaCloudChatProvider — retire path accepts HTTP 410 (OCP-2)', () 
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight cache-warm describes against this
+    // test's stub (before the fetch restore): no cross-test leak, no
+    // real-network hit.
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     clearCapabilityCache();
     setConfig({});

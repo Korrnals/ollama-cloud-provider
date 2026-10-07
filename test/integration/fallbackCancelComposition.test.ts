@@ -6,7 +6,10 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { OllamaCloudChatProvider } from '../../src/provider.js';
 import { clearCapabilityCache } from '../../src/capabilityCache.js';
-import { clearImageDescriptionCache } from '../../src/visionTwoPhase.js';
+import {
+  clearImageDescriptionCache,
+  drainVisionWarmDescribes,
+} from '../../src/visionTwoPhase.js';
 import { logger } from '../../src/logger.js';
 
 /**
@@ -357,7 +360,10 @@ describe('P2-2 — discard-on-cancel under a 404 fallback chain (cascade QA audi
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight warm describes (insurance: a success
+    // commit here would otherwise leak past the fetch restore).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.getRecentErrors().splice(0);
     clearImageDescriptionCache();
@@ -524,7 +530,10 @@ describe('P3 rider — hidden-retry backoff-cancel: quiet onDone, no double-flus
     Math.random = () => 0.5;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce in-flight warm describes (insurance: a success
+    // commit here would otherwise leak past the fetch restore).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     Math.random = originalRandom;
     logger.getRecentErrors().splice(0);

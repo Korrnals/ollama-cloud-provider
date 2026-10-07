@@ -4,7 +4,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { OllamaCloudChatProvider } from '../../src/provider.js';
-import { clearImageDescriptionCache } from '../../src/visionTwoPhase.js';
+import {
+  clearImageDescriptionCache,
+  drainVisionWarmDescribes,
+} from '../../src/visionTwoPhase.js';
 import { clearCapabilityCache } from '../../src/capabilityCache.js';
 import { logger } from '../../src/logger.js';
 
@@ -228,7 +231,11 @@ describe('vision-primary image lifecycle (variant (v) — field fix 2026-09-15) 
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce the fire-and-forget warm describes BEFORE the
+    // fetch stub is restored (they must resolve against THIS test's stub,
+    // not the next one — or the real network).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.getRecentErrors().splice(0);
     clearImageDescriptionCache();
@@ -636,7 +643,11 @@ describe('unified vision + compaction (ArchCom 2026-09-15) — G2 gate', () => {
     }) as typeof fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce the fire-and-forget warm describes BEFORE the
+    // fetch stub is restored (they must resolve against THIS test's stub,
+    // not the next one — or the real network).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     clearImageDescriptionCache();
     vscode.workspace.getConfiguration('ollamaCloud')._replace({});
@@ -734,7 +745,11 @@ describe('vision hash commit-on-success (v0.20.1 RCA) — G3 gates', () => {
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce the fire-and-forget warm describes BEFORE the
+    // fetch stub is restored (they must resolve against THIS test's stub,
+    // not the next one — or the real network).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.getRecentErrors().splice(0);
     clearImageDescriptionCache();
@@ -965,7 +980,11 @@ describe('vision raw-resend cap (v0.21.0 D-3)', () => {
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce the fire-and-forget warm describes BEFORE the
+    // fetch stub is restored (they must resolve against THIS test's stub,
+    // not the next one — or the real network).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.getRecentErrors().splice(0);
     clearImageDescriptionCache();
@@ -1393,7 +1412,11 @@ describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)',
     originalFetch = global.fetch;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    // v0223 D1 — quiesce the fire-and-forget warm describes BEFORE the
+    // fetch stub is restored (they must resolve against THIS test's stub,
+    // not the next one — or the real network).
+    await drainVisionWarmDescribes();
     global.fetch = originalFetch;
     logger.getRecentErrors().splice(0);
     clearImageDescriptionCache();
@@ -1529,6 +1552,214 @@ describe('vision T-3 — quiet-cancel in a tool-call-shaped request (QA audit)',
       turn4.includes('never successfully sent') && turn4.includes('3 attempts failed'),
       'the cancelled tool-call turns counted as failed sends',
     );
+  });
+});
+
+/**
+ * v0.22.3 (task v0223-vision-cache-warm) — mid-session switch from a
+ * vision-capable primary to a TEXT-ONLY primary (the owner field
+ * report 2026-10-06: «картинок не передавал, при выборе glm-5.3
+ * срабатывает fallback на MiniMax-M3 — явный баг»).
+ *
+ * The RCA: variant (v) serves the image RAW on a vision-capable primary
+ * (commit-on-success lands the hash in sentImageHashes) but fills NO
+ * persistent description cache entry. A later turn against a text-only
+ * primary re-sends the same immutable history; the two-phase gate
+ * fires on the still-present image part; the cache MISS forced a FRESH
+ * describe call EVERY turn (with the "🖼️ Describing image" annotation)
+ * and a describe failure (429/abort observed) THREW and killed the
+ * whole turn.
+ *
+ * Fix contract:
+ *   - turn 1 (vision primary kimi-k3): RAW send, success commits the
+ *     hash, and a NON-BLOCKING warm describe fills the persistent
+ *     cache (best-effort, silent — a failed warm-up never poisons).
+ *   - turn 2 (text-only gpt-oss:120b, fallback enabled): the image
+ *     part resolves WITHOUT a describe call — the warmed cache
+ *     description when the warm-up won the race, else the
+ *     ledger-aware repeat marker (sentImageHashes knows the image was
+ *     already sent RAW). Zero /api/chat calls, no annotation, no
+ *     throw. The warm-up's own describe DOES hit /api/chat on turn 1
+ *     — asserted here to be exactly one, asynchronous, and the ONLY
+ *     describe traffic in the whole scenario.
+ */
+describe('vision cache warm + led switch: text-only fallback on a no-new-image turn (v0.22.3)', () => {
+  let originalFetch: typeof fetch;
+
+  beforeEach(() => {
+    clearCapabilityCache();
+    clearImageDescriptionCache();
+    apiChatCalls = [];
+    chatCalls = [];
+    logger.getRecentErrors().splice(0);
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+    });
+    originalFetch = global.fetch;
+  });
+
+  afterEach(async () => {
+    // v0223 D1 — quiesce the fire-and-forget warm describes BEFORE the
+    // fetch stub is restored (they must resolve against THIS test's stub,
+    // not the next one — or the real network).
+    await drainVisionWarmDescribes();
+    global.fetch = originalFetch;
+    logger.getRecentErrors().splice(0);
+    clearImageDescriptionCache();
+    setConfig({});
+    for (const dir of storageDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('switch scenario: turn 1 vision primary RAW (warm-up behind it), turn 2 text-only primary completes with NO describe and NO throw', async function () {
+    this.timeout(10000);
+    // Deferred describe gate — the warm-up fetch resolves only when the
+    // test releases it, so both orderings are deterministic:
+    // released BEFORE turn 2 → cached description; released AFTER
+    // turn 2 fired → marker path. Never a describe call ON turn 2.
+    const describeBodies: Array<Record<string, unknown>> = [];
+    let releaseDescribe: () => void = () => undefined;
+    const describeGate = new Promise<void>((resolve) => {
+      releaseDescribe = resolve;
+    });
+
+    const install = (): void => {
+      global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+        const urlStr = String(url);
+        const parsed = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        if (urlStr.includes('/api/chat')) {
+          // The vision describe endpoint — ONLY the D1 warm-up may
+          // reach it (a vision primary never describes on its own
+          // turn; a sent-hash turn 2 must never describe).
+          describeBodies.push(parsed);
+          await describeGate;
+          return new Response(
+            JSON.stringify({ message: { content: 'a red square with text' } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        chatCalls.push({ url: urlStr, body: parsed });
+        return new Response(
+          streamFromChunks([
+            encode('data: {"choices":[{"delta":{"content":"answer from primary"}}]}' +String.fromCharCode(10)),
+            encode('data: [DONE]' + String.fromCharCode(10)),
+          ]),
+          { status: 200 },
+        );
+      }) as typeof fetch;
+    };
+    install();
+
+    const ctx = makeMockContext();
+    const provider = new OllamaCloudChatProvider(ctx);
+    const token = new vscode.CancellationTokenSource().token;
+    const base = {
+      modelOptions: {},
+      justification: 'test',
+    } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+
+    // --- Turn 1: the vision-capable primary serves IMG_A raw ---
+    const progress1 = makeProgress();
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('kimi-k3'),
+      [imageMsg(IMG_A)],
+      base,
+      progress1,
+      token,
+    );
+    assert.equal(chatCalls.length, 1, 'turn 1: one primary dispatch');
+    assert.ok(
+      JSON.stringify(chatCalls[0]!.body).includes('image_url'),
+      'turn 1: the image went RAW to the vision-capable primary',
+    );
+    assert.equal(
+      progress1.parts.filter(
+        (p) =>
+          p instanceof vscode.LanguageModelTextPart &&
+          (p as vscode.LanguageModelTextPart).value.includes('Describing image'),
+      ).length,
+      0,
+      'turn 1: no describe annotation on the vision primary',
+    );
+
+    // --- Turn 2 BEFORE the warm-up resolves: the marker path ---
+    install(); // fresh call records; the gate is still closed
+    const turn2 = provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg(IMG_A), assistantMsg('answer from primary'), userMsg('what else?')],
+      base,
+      makeProgress(),
+      token,
+    );
+    // VS Code-side fallback config for the text-only primary.
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
+    await turn2;
+    const turn2Body = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(
+      !turn2Body.includes('image_url'),
+      'turn 2: ZERO image bytes reached the text-only primary',
+    );
+    assert.ok(turn2Body.includes('[Image '), 'turn 2: a marker text part substituted the image');
+    assert.ok(turn2Body.includes('what else?'), 'turn 2: the new user text survived');
+    // The describe count right after turn 2 is EITHER 0 (the warm
+    // fetch has not been issued yet — it lives behind microtasks + a
+    // real DNS lookup) or 1 (the turn-1 warm describe, still gated).
+    // It is NEVER per-turn: turn 2 itself issued no describe.
+    assert.ok(
+      describeBodies.length <= 1,
+      'at most the turn-1 WARM describe so far (never one per turn)',
+    );
+
+    // --- Release the warm-up; wait for it (the drain seam) ---
+    releaseDescribe();
+    await drainVisionWarmDescribes();
+
+    // --- Turn 3: same history to the text-only primary again — now
+    // the warm cache holds the description and substitutes it
+    // SILENTLY (the v0.13.0 silent-substitution pin, switch edition).
+    const progress3 = makeProgress();
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg(IMG_A), assistantMsg('answer from primary'), userMsg('once more?')],
+      base,
+      progress3,
+      token,
+    );
+    const turn3Body = JSON.stringify(chatCalls[2]!.body);
+    assert.ok(!turn3Body.includes('image_url'), 'turn 3: zero image bytes');
+    assert.ok(
+      turn3Body.includes('a red square with text'),
+      'turn 3: the warmed cached description substituted silently',
+    );
+    assert.ok(
+      !turn3Body.includes('duplicate of an image already sent'),
+      'turn 3: the real description beat the marker (cache wins)',
+    );
+    assert.equal(
+      describeBodies.length,
+      1,
+      'exactly ONE describe across the whole scenario (the turn-1 warm-up; turns 2–3 never describe)',
+    );
+    assert.equal(
+      (describeBodies[0] as { model?: string }).model,
+      'minimax-m3',
+      'the one describe is the turn-1 warm-up, targeting the vision model',
+    );
+    const turn3Annotations = progress3.parts.filter(
+      (p) =>
+        p instanceof vscode.LanguageModelTextPart &&
+        (p as vscode.LanguageModelTextPart).value.includes('Describing image'),
+    );
+    assert.equal(turn3Annotations.length, 0, 'turn 3: NO describe annotation');
   });
 });
 
