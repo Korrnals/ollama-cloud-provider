@@ -104,6 +104,53 @@ The vision gate dispatches by the primary's image capability:
   the ADR 0013 fallback/debug path — with the repeat-marker lifecycle
   applied to its history in `marker` mode.
 
+#### Variant-(v) consequence: the RAW channel now warms the describe cache (v0.22.3 fix)
+
+**Amended again 2026-10-07 (v0.22.3 fix, owner field report 2026-10-06).**
+Variant (v) removed the only writer of the persistent description cache
+from the vision-capable channel: the raw first send never describes, so
+`vision-description-cache.json` stayed EMPTY for images the primary had
+already seen. When the user then switched mid-session to a TEXT-ONLY
+primary, VS Code re-sent the immutable history, the two-phase gate
+fired on the still-present image part, the cache MISSED — and every
+turn fired a FRESH describe call to the vision model (with the
+"Describing image" annotation on turns the user sent text only), and a
+describe failure (429/abort observed with minimax-m3) **threw and
+killed the whole turn** (field case: glm-5.3-flash → glm-5.3 switch,
+hash `f7b1277d…` re-described on every turn).
+
+The fix closes the loop without changing the master invariant:
+
+- **Cache warming (D1):** after the vision-primary (or pass-through)
+  RAW turn's stream genuinely completes — the same success path that
+  commits the hash into the turn ledger — ONE best-effort background
+  describe runs per newly committed image through the SAME phase-1
+  machinery (`describeImageOnce`: hardcoded prompt, 90 s timeout,
+  retry, `wrapDescription`) and fills the persistent cache. It is
+  fire-and-forget (never delays the turn, never reports progress
+  parts, NEVER surfaces an error — a failed warm-up only logs a line
+  with the hash and writes nothing: throw-and-never-cache, review
+  P1-2 semantics), deduplicated by the cache itself (one describe per
+  new committed image per session), and skipped entirely in
+  `visionHistory.mode='raw'`.
+- **Ledger-aware text-only gate (D2):** for a hash the turn ledger
+  already committed as sent RAW this session, a text-only primary's
+  two-phase path NEVER describes: the warmed cache wins when present
+  (a real description beats a marker); absent, the image part is
+  substituted with the standard repeat marker (the exact
+  `MARKER_TEMPLATE` shape the lifecycle produces for a committed
+  repeat). No describe call, no annotation, no throw on no-new-image
+  turns after a switch.
+- The EXISTING describe contract stays byte-identical for hashes that
+  were never committed (a genuinely new image on a text-only primary:
+  describe → cache → substitute, throw on failure, budget 4/turn,
+  P1-2 no-poison).
+
+**Master invariant (6) unchanged** — the warm-up adds no new payload
+surface (it is a vision-model request, like any describe) and the
+text-only channel still never receives image bytes; the ledger-aware
+marker substitution reuses the cycle the invariant already admits.
+
 ```mermaid
 flowchart TD
     IMG["image part in the request<br/>(text-only primary — first send or history repeat)"] --> H["SHA-256 short hash"]
@@ -267,6 +314,10 @@ The pass-through vision fallback (`visionFallback.mode='pass-through'`) is an EX
   (`fix/vision-primary-raw-first`, v0.19.1) — variant (v) supersedes
   variant (b) for vision-capable primaries; test doc-head updated in
   e1ef9bf (`test/integration/unifiedVision.test.ts`).
+- v0.22.3 fix release note: owner field report 2026-10-06 («картинок не
+  передавал, при выборе glm-5.3 срабатывает fallback на MiniMax-M3 —
+  явный баг»), branch `fix/vision-cache-warm-text-only` — the D1 cache
+  warming + the D2 ledger-aware gate above (this section).
 - Committee protocol (2026-09-15): `~/.gcw/architectural-committee/2026-09-15-ocp-unified-vision-compaction.md`
 - Mnemos decision id: `573d565c-3b41-4c79-8353-75e6607c0392` (tags: `project:ollama-cloud-provider`, `committee`)
 - ADR 0004 — vision fallback pass-through (constraint 7: hardcoded describe prompt)

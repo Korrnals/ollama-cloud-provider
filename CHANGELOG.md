@@ -4,6 +4,9 @@ All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- **Text-only fallback on a no-new-image turn no longer re-describes an image a vision-capable model already saw (and no longer dies when the describe service is busy)** — mid-session switch from a vision-capable primary to a text-only one used to fire a fresh "Describing image" vision call on EVERY turn (the persistent description cache was never written on the vision-primary RAW channel), and a describe failure (HTTP 429/abort observed with MiniMax M3) killed the whole turn. Now the description is quietly cached in the background right after the vision-primary turn completes; a switch turn is a silent cache hit or, when that has not landed, a short "image already sent" marker — never a fresh describe, never a throw. Images never shown to a model keep the exact prior describe behavior. Nothing to configure (v0.22.3; ADR 0015 amended).
+
 ### Security
 - **Cosign verification keys actualized**: an audit of all published signature bundles showed the committed `cosign.pub` matched none of the keys actually signing releases — the cosign layer of v0.14.0–v0.22.2 could not be verified from the repo. Published the two actual public keys: `cosign-conveyor.pub` (cluster release conveyor; signs v0.21.0, v0.22.0, v0.22.2) and `cosign-local.pub` (local pipeline; signs v0.14.0–v0.20.1 and v0.22.1); the legacy file renamed `cosign-legacy.pub` (byte-identical; verifies the v0.9.0–v0.13.0 `.sigstore.bundle` era). Every published signed asset v0.9.0–v0.22.2 re-verified against the key its bundle names. SECURITY.md carries the key→release mapping with verify commands; README and ADR-0002 actualized.
 

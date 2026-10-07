@@ -349,6 +349,8 @@ Starting from **v0.13.0**, the vision fallback has two modes, selected by `ollam
 
 Two-phase is the default because it preserves the primary model's reasoning style — the vision model only converts the image to a text description, then the primary model produces the final answer using that description. Pass-through remains available for users who want the vision model to answer directly.
 
+**Switching models mid-session (v0.22.3):** nothing to configure. When a vision-capable model has already served an image's turn, the image's description is quietly filed into the extension's description cache right after that turn completes — so switching to a text-only model afterwards is either a silent cache substitution or, if the background describe has not landed yet, a short "image already sent" text marker. A switch never re-describes an image the session has already shown to a model, and a fallback turn can no longer fail because the describe service was busy (HTTP 429) — the next turn simply retries.
+
 See [ADR 0013](docs/adr/0013-two-phase-vision-fallback.md) for the full rationale.
 
 ## 🤖 VS Code Agents window
