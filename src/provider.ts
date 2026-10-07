@@ -8,6 +8,7 @@ import {
   convertToolsToOpenAI,
   getMessageText,
   hasImageParts,
+  isImageDataPart,
 } from './convert.js';
 import { validateConfiguration } from './configValidator.js';
 import { runHealthCheckCommand } from './healthCheck.js';
@@ -50,7 +51,7 @@ import {
   openAiBaseUrl,
 } from './connections.js';
 import type { ConnectionConfig } from './connections.js';
-import { executePassThrough, shouldFallback } from './visionFallback.js';
+import { executePassThrough, shouldFallback, resolveVisionModel } from './visionFallback.js';
 import { resolveVisionHistoryMode } from './visionHistory.js';
 import { TurnLedger } from './turnLedger.js';
 import {
@@ -59,7 +60,12 @@ import {
   runStreamAttempt,
   type EndpointDispatchInputs,
 } from './endpointDispatch.js';
-import { executeTwoPhaseVision, sha256ShortHex } from './visionTwoPhase.js';
+import {
+  executeTwoPhaseVision,
+  warmImageDescriptionCache,
+  noteWarmScheduled,
+  sha256ShortHex,
+} from './visionTwoPhase.js';
 import type {
   OpenAICompatibleMessage,
   UsageInfo,
@@ -433,6 +439,26 @@ export class OllamaCloudChatProvider
    * turnLedger.ts.
    */
   private readonly turnLedger = new TurnLedger();
+  /**
+   * v0223 (task v0223-vision-cache-warm, D1) — hash → base64 bytes of
+   * the images THIS provider instance RAW-sent on vision-primary
+   * turns, captured at `applyLifecycle` time (first sends) and kept in
+   * a bounded LRU-ish map per session. The background warmer (fired at
+   * the commit points) needs the bytes to describe the image it
+   * ALREADY served raw — by commit time the message array may have
+   * been rewritten downstream, so the capture must happen at
+   * lifecycle time, not at commit time. Bounded at 32 entries (a
+   * screenshot's base64 ≈ 2 MB; a stale capture is only a warm-cache
+   * optimization — dropping the oldest capture costs nothing: the
+   * D2 marker path still covers a text-only re-send). A capture is
+   * CONSUMED after its warm attempt (success or failure — the hash is
+   * then either in the cache or covered by the D2 marker path; both
+   * make the raw bytes worthless); captures for images that were
+   * never committed (failed turn) die with the instance.
+   */
+  private readonly warmBase64ByHash = new Map<string, string>();
+  /** Cap for {@link warmBase64ByHash} (insertion order = age). */
+  private static readonly WARM_BASE64_MAX = 32;
   /**
    * v0.13.0 Slice 2 — root of the evicted-block store. Captured in the
    * constructor; the `CompactionStore` itself is created lazily because
@@ -893,11 +919,32 @@ export class OllamaCloudChatProvider
               catalog: this.modelCatalog.list(),
               connections,
             });
-            this.turnLedger.commitTurn(turn, token);
+            // v0223 (D1, review P2 fix 2026-10-07) — capture the RAW
+            // first-send bytes HERE, in the marker-mode branch: the
+            // lifecycle-rewritten `passThroughMessages` still carries
+            // the first-sends as raw image parts, and pass-through
+            // RETURNS EARLY — the primary-dispatch capture (below) is
+            // never reached on this path. Without this the pass-through
+            // warm-up (right after the commit) found no captured bytes
+            // and silently described nothing. In 'raw' mode the capture
+            // is skipped on purpose: the warm scheduler's mode check
+            // already skips warming for 'raw' sessions entirely.
+            if (resolveVisionHistoryMode() === 'marker') {
+              this.captureWarmBase64(passThroughMessages);
+            }
+            const committedPassThrough = this.turnLedger.commitTurn(turn, token);
+            // v0223 (D1) — same background warm-up as the primary
+            // dispatch success path: the pass-through vision stream may
+            // have seen committed RAW hashes this turn.
+            this.warmVisionCacheAfterCommit(model, connection ?? cloudConnection, connections, token, committedPassThrough);
             return passThroughResult;
           }
           // two-phase — phase 1: vision describes the image, rewrite
           // history, then fall through to the primary dispatch below.
+          // v0223 (D2) — the ledger-aware probe: hashes the TurnLedger
+          // committed as sent RAW this session (a vision-primary first
+          // send) never re-describe on a text-only primary — warm cache
+          // or repeat marker (never a throw). See visionTwoPhase.ts.
           const twoPhaseResult = await executeTwoPhaseVision({
             primaryModel: model,
             primaryConnection: connection ?? cloudConnection,
@@ -908,6 +955,7 @@ export class OllamaCloudChatProvider
             authManager: this.authManager,
             catalog: this.modelCatalog.list(),
             connections,
+            sentHashProbe: (hash) => this.turnLedger.hasBeenSent(hash),
           });
           // Shadow the original messages with the rewritten history.
           // All downstream usages (`convertMessagesToOpenAI`,
@@ -966,6 +1014,14 @@ export class OllamaCloudChatProvider
       // shipped with `'raw'` already in effect).
       if (requestHasImages && !twoPhaseRewroteHistory) {
         messages = this.turnLedger.applyLifecycle(messages, turn);
+        // v0223 (D1) — capture the RAW first-send bytes for the
+        // background cache warmer. The lifecycle left image parts in
+        // `messages` exactly for the first sends of this turn; by
+        // commit time the array may have been rewritten downstream, so
+        // the base64 must be captured HERE. Bounded map (see the field
+        // docblock); a hash whose warm-up succeeds is dropped by the
+        // warmer, a never-committed capture dies with the instance.
+        this.captureWarmBase64(messages);
       }
 
       const clientBaseUrl = connection
@@ -1353,7 +1409,13 @@ export class OllamaCloudChatProvider
         if (outcome.kind === 'success') {
           // v0.20.1 — the stream resolved (= onDone fired): commit the
           // vision hashes this turn's lifecycle recorded as pending.
-          this.turnLedger.commitTurn(turn, token);
+          const committed = this.turnLedger.commitTurn(turn, token);
+          // v0223 (D1) — the committed hashes' images went RAW to a
+          // model this turn; warm the persistent description cache for
+          // them in the background (fire-and-forget — the primary turn
+          // returns right after this). Silent, best-effort, never
+          // blocks, never user-visible.
+          this.warmVisionCacheAfterCommit(model, connection ?? cloudConnection, connections, token, committed);
           return; // success — no fallback needed
         }
         if (outcome.kind === 'terminal') {
@@ -1378,6 +1440,213 @@ export class OllamaCloudChatProvider
       this.turnLedger.recordFailedTurn(turn);
       logger.error('provideLanguageModelChatResponse failed.', error);
       throw classifyStreamError(error);
+    }
+  }
+
+  /**
+   * v0223 (D1) — records the base64 of every image part still present
+   * in `messages` after the ADR 0013 lifecycle ran (the RAW first
+   * sends of THIS turn) into {@link warmBase64ByHash}, bounded. Hashes
+   * are the same SHA-256 shorts the warmer keys on. No logging of the
+   * bytes (security — hashes only).
+   */
+  private captureWarmBase64(
+    messages: readonly vscode.LanguageModelChatRequestMessage[],
+  ): void {
+    for (const message of messages) {
+      if (!message || message.role !== vscode.LanguageModelChatMessageRole.User) {
+        continue;
+      }
+      for (const part of message.content) {
+        if (!isImageDataPart(part)) {
+          continue;
+        }
+        const data = (part as vscode.LanguageModelDataPart).data;
+        if (!data || data.length === 0) {
+          continue;
+        }
+        const buffer = Buffer.from(data);
+        const hash = sha256ShortHex(buffer);
+        this.warmBase64ByHash.set(hash, buffer.toString('base64'));
+      }
+    }
+    // Evict oldest captures when over the cap (insertion order = age).
+    while (this.warmBase64ByHash.size > OllamaCloudChatProvider.WARM_BASE64_MAX) {
+      const oldest = this.warmBase64ByHash.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.warmBase64ByHash.delete(oldest);
+    }
+  }
+
+  /**
+   * v0223 (task v0223-vision-cache-warm, D1) — the background
+   * description-cache warmer, fired at BOTH stream-success commit
+   * points (the endpoint-dispatch success outcome and the
+   * pass-through early return) AFTER `turnLedger.commitTurn` returned
+   * the hashes it actually committed.
+   *
+   * WHY: variant (v) removed the only writer of the persistent
+   * `imageDescriptionCache` from the vision-primary channel — the raw
+   * first send never describes, so nothing was cached; when the user
+   * later switched to a TEXT-ONLY primary, the re-sent immutable
+   * history hit the two-phase gate, the cache MISSED, and EVERY turn
+   * fired a fresh describe call (with the "Describing image"
+   * annotation, and a THROW on describe failure killing the turn —
+   * owner field report 2026-10-06, minimax-m3 429s on glm-5.3 turns).
+   * This warmer closes the loop: each hash committed THIS turn gets
+   * ONE best-effort background describe through the same machinery as
+   * the two-phase phase-1 (`warmImageDescriptionCache` — hardcoded
+   * prompt, 90 s timeout, retry, throw-and-never-cache), so a later
+   * text-only turn is a silent cache hit (or, when the warm-up failed,
+   * the D2 ledger-aware marker — never a fresh describe, never a
+   * throw).
+   *
+   * Fire-and-forget contract (D1):
+   *   - schedules the warm-up and returns WITHOUT awaiting it — the
+   *     primary turn's result flows to VS Code immediately (the
+   *     describe's own await lives on the detached promise; its
+   *     rejection is logged, never rethrown);
+   *   - SILENT: no progress parts, no annotation, no user-visible
+   *     surface; a failure logs (hash + reason) and writes NOTHING
+   *     into the cache;
+   *   - dedupe: hashes already in the cache are skipped inside
+   *     `warmImageDescriptionCache` (one describe per new committed
+   *     image per session);
+   *   - skipped entirely when `visionHistory.mode === 'raw'` (the raw
+   *     mode's explicit opt-out of the describe channel — checked at
+   *     SCHEDULING per D1) or when no vision model resolves (log
+   *     only — best-effort), or when the committed list is empty (a
+   *     text-only turn with no images, the common case — zero cost).
+   *
+   * Cancellation: the primary turn's token aborts the in-flight
+   * describe attempt (same pattern as the phase-1 loop). A turn
+   * cancel that reached the commit site as a D-2 quiet completion
+   * routed the hashes to the FAILED counter (never committed) —
+   * `committed` is then empty and nothing warms.
+   */
+  private warmVisionCacheAfterCommit(
+    primaryModel: ModelDefinition,
+    primaryConnection: ConnectionConfig | undefined,
+    connections: readonly ConnectionConfig[],
+    token: vscode.CancellationToken,
+    committedHashes: readonly string[],
+  ): void {
+    try {
+      if (committedHashes.length === 0) {
+        return;
+      }
+      // 'raw' mode opts out of the describe channel entirely — no
+      // warm-up (checked at SCHEDULING, per D1).
+      if (resolveVisionHistoryMode() !== 'marker') {
+        return;
+      }
+      // Mark the SCHEDULE before launch (the drain's registration-lag
+      // window: the promise itself registers several awaits later).
+      noteWarmScheduled();
+      void this.launchWarmDescribe(
+        primaryModel,
+        primaryConnection,
+        connections,
+        token,
+        committedHashes,
+      ).catch((error: unknown) => {
+        // Unhandled-rejection guard on top of launchWarmDescribe's own
+        // catch — belt and braces (D1: log-only, never user-visible).
+        logger.info(
+          `vision cache warm: skipped (${error instanceof Error ? error.message : String(error)})`,
+        );
+      });
+    } catch (error) {
+      // Scheduling itself must never break the just-committed turn.
+      logger.info(
+        `vision cache warm: scheduling skipped (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+  }
+
+  /**
+   * v0223 (D1) — resolves the vision model with the SAME resolution
+   * the two-phase path uses (`resolveVisionModel` — catalog +
+   * connections + the primary's connection; `visionFallback.model`
+   * wins, else auto-search) and runs `warmImageDescriptionCache` for
+   * the given hashes. Every failure inside is logged (hash + reason)
+   * and rethrown only to the `.catch` above — never across a turn
+   * boundary, never into the cache (throw-and-never-cache inside
+   * `describeImageOnce`).
+   */
+  private async launchWarmDescribe(
+    primaryModel: ModelDefinition,
+    primaryConnection: ConnectionConfig | undefined,
+    connections: readonly ConnectionConfig[],
+    token: vscode.CancellationToken,
+    committedHashes: readonly string[],
+  ): Promise<void> {
+    const target = resolveVisionModel(
+      primaryModel,
+      primaryConnection,
+      this.modelCatalog.list(),
+      connections,
+    );
+    if (!target) {
+      logger.info(
+        'vision cache warm: no vision-capable model resolvable — skipping (best-effort)',
+      );
+      return;
+    }
+    const { model: visionModel, connection: visionConnection } = target;
+    // Per-connection key isolation (same as the two-phase path).
+    const apiKey = visionConnection
+      ? await this.authManager.getApiKeyForConnection(visionConnection)
+      : await this.authManager.getApiKey();
+    if (!apiKey && (!visionConnection || visionConnection.requiresApiKey)) {
+      logger.info(
+        'vision cache warm: no API key for the vision connection — skipping (best-effort)',
+      );
+      return;
+    }
+    const baseUrl = visionConnection
+      ? openAiBaseUrl(visionConnection)
+      : this.authManager.getBaseUrl();
+    const images = new Map<string, string>();
+    for (const hash of committedHashes) {
+      const base64 = this.warmBase64ByHash.get(hash);
+      if (base64 !== undefined) {
+        // warmImageDescriptionCache re-filters hashes already in the
+        // persistent cache — the dedupe lives there, single source.
+        images.set(hash, base64);
+      }
+    }
+    // (Captures absent → nothing to describe with; the D2 marker path
+    // still covers a later text-only re-send — no warm attempt.)
+    if (images.size === 0) {
+      return;
+    }
+    try {
+      await warmImageDescriptionCache({
+        visionModel,
+        visionConnection,
+        apiKey: apiKey ?? '',
+        baseUrl,
+        images,
+        token,
+      });
+    } catch (error) {
+      // D1 — the describe's throw (via `describeImageOnce`) surfaces
+      // here as a log line: the warm-up failure NEVER poisons the
+      // cache; the next text-only turn resolves the hash via the D2
+      // ledger-aware marker path.
+      logger.info(
+        `vision cache warm: describe failed — hash(es)=${committedHashes.map((h) => h.slice(0, 8)).join(',')} reason=${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      // The capture is consumed after exactly ONE warm attempt (success
+      // or failure): the hash is then either in the cache or covered by
+      // the D2 marker path — the raw bytes are worthless either way.
+      for (const hash of images.keys()) {
+        this.warmBase64ByHash.delete(hash);
+      }
     }
   }
 

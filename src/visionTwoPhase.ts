@@ -24,7 +24,7 @@ import {
   type SsrfGuard,
 } from './ssrfGuard.js';
 import { isSocketCloseError } from './retry.js';
-import { degradedImageMarker } from './visionHistory.js';
+import { degradedImageMarker, sentImageRepeatMarker } from './visionHistory.js';
 
 /**
  * Vision Fallback Two-Phase (supersedes ADR 0004 pass-through as the
@@ -97,6 +97,13 @@ export function wrapDescription(
  * count.
  */
 export const DESCRIBE_BUDGET_PER_TURN = 4;
+
+/** Non-streaming describe call timeout (90 s — vision latency varies widely). */
+const DESCRIBE_TIMEOUT_MS = 90_000;
+/** Per-call retry attempts for socket-close / timeout aborts. */
+const DESCRIBE_MAX_ATTEMPTS = 3;
+/** Exponential backoff base between describe attempts. */
+const DESCRIBE_BASE_DELAY_MS = 1_000;
 
 /**
  * Session-level description cache: image hash → wrapped description.
@@ -190,6 +197,71 @@ export function clearImageDescriptionCache(): void {
   imageDescriptionCache.clear();
 }
 
+/**
+ * v0223 (D1) — in-flight registry for the background cache-warm
+ * describes. The provider schedules them fire-and-forget (`void`),
+ * so an in-flight describe OUTLIVES the chat turn that scheduled it;
+ * test teardowns must be able to quiesce them (otherwise the describe
+ * fires against the NEXT test's fetch stub — or the restored original
+ * fetch, i.e. the real network). Production never calls the drain.
+ */
+const inFlightWarms = new Set<Promise<void>>();
+
+/**
+ * v0223 (review follow-up) — count of warm SCHEDULES handed to the
+ * provider's `launchWarmDescribe`. Between `commitTurn` (which starts
+ * `launchWarmDescribe`) and the `warmImageDescriptionCache` call that
+ * registers the promise into {@link inFlightWarms}, the chain crosses
+ * several awaits (vision-model resolution, API-key read, SSRF DNS) —
+ * a drain that reads the EMPTY registry inside that window returns
+ * before the warm has even registered (the "immediate drain" race).
+ * {@link drainVisionWarmDescribes} compares this counter against its
+ * drained snapshot and keeps yielding until every SCHEDULE that
+ * existed when the drain began has produced a settled registry entry.
+ */
+let warmSchedulesIssued = 0;
+
+/** Marks a scheduled (not yet registered) warm — provider-side, synchronous. */
+export function noteWarmScheduled(): void {
+  warmSchedulesIssued += 1;
+}
+
+/**
+ * v0223 (D1, test seam) — resolves when EVERY in-flight cache-warm
+ * describe has settled (resolved or rejected; `launchWarmDescribe`
+ * turns rejections into log lines, so rejections are already handled
+ * — allSettled is belt and braces). Registration-lag-proof: schedules
+ * that predate the drain are all guaranteed to REGISTER eventually
+ * (each schedule's launch chain settles its warms then exits), so the
+ * loop must wait until (a) every promise registered so far has
+ * settled AND (b) the schedule counter has reached the snapshot taken
+ * at drain start — a settled round past the snapshot counter means
+ * every pre-existing schedule has produced and completed its registry
+ * entry. Yields with setImmediate between empty rounds so a launch
+ * still inside its pre-registration awaits can register.
+ */
+export async function drainVisionWarmDescribes(): Promise<void> {
+  const schedulesAtStart = warmSchedulesIssued;
+  for (;;) {
+    if (inFlightWarms.size > 0) {
+      await Promise.allSettled([...inFlightWarms]);
+    } else if (warmRegisteredEver < schedulesAtStart) {
+      // A pre-drain schedule has not registered yet (the launch chain
+      // is inside its pre-registration awaits) — yield so it can reach
+      // `warmImageDescriptionCache`.
+      await new Promise((resolve) => setImmediate(resolve));
+    } else {
+      // Registry empty AND every pre-drain schedule registered — and
+      // the allSettled rounds above settled everything registered.
+      // Schedules issued after this drain started belong to the next.
+      return;
+    }
+  }
+}
+
+/** Warms ever REGISTERED (monotonic; incremented at `add` time). */
+let warmRegisteredEver = 0;
+
 /** Parameters for `executeTwoPhaseVision`. */
 export interface TwoPhaseParams {
   readonly primaryModel: ModelDefinition;
@@ -201,6 +273,32 @@ export interface TwoPhaseParams {
   readonly authManager: AuthManager;
   readonly catalog: readonly ModelDefinition[];
   readonly connections: readonly ConnectionConfig[];
+  /**
+   * v0223 (task v0223-vision-cache-warm, D2) — ledger-aware probe over
+   * the provider's TurnLedger committed set (`sentImageHashes`):
+   * returns `true` when this image hash was ALREADY sent RAW to some
+   * model this session (a vision-capable primary served it and the
+   * stream genuinely completed). When the probe is wired and returns
+   * `true` for an UNCACHED hash, the two-phase path SKIPS the describe
+   * call for it entirely: the marker lifecycle takes over — the image
+   * part is substituted with the standard repeat marker (the
+   * markerOverlay below). This is the mid-session-switch contract: a
+   * switch from a vision-capable primary to a text-only one re-sends
+   * the immutable history with the image part; the image was already
+   * SEEN (RAW channel) but never described — re-describing it on every
+   * turn (with the "Describing image" annotation, and a THROW when the
+   * describe fails) is the field-reported bug this closes. The
+   * persistent cache still wins first (a real description beats a
+   * marker when the D1 warm-up landed): the probe is consulted only
+   * for hashes MISSING from the cache, and the markerOverlay is
+   * consulted AFTER the persistent cache in the rewrite.
+   *
+   * Never-sent hashes keep the EXISTING describe contract
+   * byte-identical (describe → cache → substitute; failure throws;
+   * budget 4/turn; P1-2 no-poison). The provider owns the TurnLedger
+   * instance and passes `(hash) => this.turnLedger.hasBeenSent(hash)`.
+   */
+  readonly sentHashProbe?: (hash: string) => boolean;
   /**
    * ArchCom 2026-09-15 variant (b) — degradation mode for
    * VISION-CAPABLE primaries. When `true` (unified describe path for
@@ -317,14 +415,39 @@ export async function executeTwoPhaseVision(
   );
   const cacheHits = uniqueImages.size - uncachedHashes.length;
 
+  // v0223 (D2) — hashes the ledger already committed as sent RAW this
+  // session (a vision-primary first send) resolve from the warm cache
+  // (checked above) or degrade to the repeat marker — NEVER a fresh
+  // describe. They are filtered out of the describe set BEFORE the
+  // budget (a no-new-image turn must not spend it) and routed into the
+  // markerOverlay below. Truly new hashes (probe absent or `false`)
+  // keep the byte-identical describe-or-throw contract.
+  const sentUnscribedHashes: string[] = [];
+  const describeCandidates: string[] = [];
+  for (const hash of uncachedHashes) {
+    if (params.sentHashProbe?.(hash)) {
+      sentUnscribedHashes.push(hash);
+    } else {
+      describeCandidates.push(hash);
+    }
+  }
+  if (sentUnscribedHashes.length > 0) {
+    logger.info(
+      'vision two-phase: sent-but-unscribed image(s) resolved via the marker lifecycle — no describe call (v0223 mid-session switch)',
+      {
+        imageHashes: sentUnscribedHashes,
+      },
+    );
+  }
+
   // ArchCom 2026-09-15 (variant (b), invariant 3) — per-turn describe
   // budget. Fresh describe calls are capped at DESCRIBE_BUDGET_PER_TURN
   // (4); cached hits are free. Hashes past the budget degrade to the
   // ADR 0013 marker cycle (logged below) — the primary never receives
   // image bytes, and a pasted 10-image collage cannot cost 10 vision
   // calls on one turn.
-  const budgetHashes = uncachedHashes.slice(0, DESCRIBE_BUDGET_PER_TURN);
-  const overBudgetHashes = uncachedHashes.slice(DESCRIBE_BUDGET_PER_TURN);
+  const budgetHashes = describeCandidates.slice(0, DESCRIBE_BUDGET_PER_TURN);
+  const overBudgetHashes = describeCandidates.slice(DESCRIBE_BUDGET_PER_TURN);
   if (overBudgetHashes.length > 0) {
     logger.warn(
       `vision two-phase: describe budget (${DESCRIBE_BUDGET_PER_TURN} per turn) exceeded — ${overBudgetHashes.length} image(s) degraded to markers this turn (hashes=${overBudgetHashes.join(',')})`,
@@ -354,29 +477,10 @@ export async function executeTwoPhaseVision(
     imageHashes: [...uniqueImages.keys()],
     cacheHits,
     cacheMisses: uncachedHashes.length,
+    describeCandidates: budgetHashes.length,
+    markerLifecycle: sentUnscribedHashes.length,
     degraded: overBudgetHashes.length,
   });
-
-  // --- Phase 1: non-streaming vision call ---
-  // Build the vision connection's OllamaClient (SEC-03 whitelist
-  // enforced at the fetch boundary via assertBaseUrlAllowedOrThrow).
-  const clientBaseUrl = visionConnection
-    ? openAiBaseUrl(visionConnection)
-    : params.authManager.getBaseUrl();
-  const isLocalConnection = visionConnection?.type === 'local';
-  const ssrfGuard: SsrfGuard = isLocalConnection
-    ? createProductionSsrfGuard({ allowLoopback: true, allowPrivateRanges: true })
-    : createProductionSsrfGuard({
-        allowLoopback: false,
-        advice: 'Check the URL or your ollamaCloud.allowedBaseUrls whitelist.',
-      });
-  const client = new OllamaClient(
-    clientBaseUrl,
-    apiKey ?? '',
-    visionConnection,
-    'compat',
-    ssrfGuard,
-  );
 
   // --- Phase 1: describe each UNCACHED image (non-streaming) ---
   // One `nativeChatOnce` call per unique uncached image: the describe
@@ -385,11 +489,13 @@ export async function executeTwoPhaseVision(
   // Per-call retry on socket-close errors — the Ollama Cloud server
   // regularly ECONNRESETs mid-flight; without local retry a flaky
   // vision call killed the whole chat turn (recovered only by VS
-  // Code retrying the ENTIRE request).
-  const TIMEOUT_MS = 90_000;
-  const MAX_ATTEMPTS = 3;
-  const BASE_DELAY_MS = 1_000;
-
+  // Code retrying the ENTIRE request). The machinery lives in
+  // `describeImageOnce` (v0.22.3 extraction — shared with the D1
+  // cache-warm background describe; no duplicated retry loop).
+  const clientBaseUrl = visionConnection
+    ? openAiBaseUrl(visionConnection)
+    : params.authManager.getBaseUrl();
+  const isLocalConnection = visionConnection?.type === 'local';
   let currentController: AbortController | undefined;
   if (params.token) {
     // CancellationToken has no `offCancellationRequested` — the
@@ -405,74 +511,17 @@ export async function executeTwoPhaseVision(
     if (!base64) {
       continue;
     }
-    const requestBody = {
-      model: visionModel.apiModel,
-      messages: [
-        { role: 'user', content: VISION_DESCRIBE_PROMPT, images: [base64] },
-      ],
-      stream: false,
-      think: false,
-    };
-    let description = '';
-    let failure: unknown;
-    let abortedByTimeout = false;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      currentController = new AbortController();
-      const timer = setTimeout(() => {
-        abortedByTimeout = true;
-        currentController?.abort();
-      }, TIMEOUT_MS);
-      try {
-        description = await client.nativeChatOnce(
-          requestBody,
-          currentController.signal,
-        );
-        failure = undefined;
-        abortedByTimeout = false;
-        break;
-      } catch (error) {
-        failure = error;
-        const message = error instanceof Error ? error.message : String(error);
-        // Timeout aborts ARE retryable: the vision model latency
-        // varies widely (observed: the same image timed out at 90s,
-        // then described in 35s on the next attempt). User
-        // cancellation is NOT retryable — it aborts the controller
-        // without setting `abortedByTimeout`.
-        const retryable =
-          abortedByTimeout ||
-          isSocketCloseError(error) ||
-          /ECONNRESET|socket hang up/i.test(message);
-        if (!retryable || attempt === MAX_ATTEMPTS) {
-          break;
-        }
-        await new Promise((resolve) =>
-          setTimeout(resolve, BASE_DELAY_MS * 2 ** (attempt - 1)),
-        );
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-    const emptyDescription = !failure && !description.trim();
-    if (failure || emptyDescription) {
-      const detail =
-        failure === undefined || failure === null
-          ? 'vision model returned an empty description'
-          : abortedByTimeout
-            ? `vision model call timed out after ${TIMEOUT_MS}ms`
-            : failure instanceof Error
-              ? failure.message
-              : String(failure);
-      // Variant-(b) degradation (degradeOnFailure) was REMOVED with
-      // variant (v) (2026-09-15): a vision-capable primary now keeps
-      // direct sight (no describe at all), and the text-only primary
-      // keeps the legacy describe-all-or-throw contract.
-      if (failure) {
-        throw new Error(`Vision two-phase: vision model call failed — ${detail}`);
-      }
-      throw new Error(
-        'Vision two-phase: vision model returned an empty description. Cannot substitute image.',
-      );
-    }
+    const description = await describeImageOnce(
+      visionModel,
+      apiKey ?? '',
+      visionConnection,
+      clientBaseUrl,
+      isLocalConnection,
+      base64,
+      (controller) => {
+        currentController = controller;
+      },
+    );
     logger.info('vision two-phase description received', {
       visionModel: visionModel.id,
       imageHash: hash,
@@ -500,6 +549,18 @@ export async function executeTwoPhaseVision(
     degradedOverlay.set(hash, degradedImageMarker(hash));
   }
 
+  // v0223 (D2) — markerOverlay: sent-but-unscribed hashes (already
+  // seen RAW by a vision primary this session, no cache entry) substitute
+  // the standard repeat marker — the same shape the ADR 0013 lifecycle
+  // produces for a committed hash on a vision-primary turn. This is a
+  // LOCAL overlay, never persisted: a later warm-up success (D1) or a
+  // genuine describe still fills the cache, and the persistent cache
+  // then wins over the marker on the next turn (checked first below).
+  const markerOverlay = new Map<string, string>();
+  for (const hash of sentUnscribedHashes) {
+    markerOverlay.set(hash, sentImageRepeatMarker(hash));
+  }
+
   // Evict oldest entries when over the cap (insertion order = age),
   // then persist so the cache survives the next extension restart.
   while (imageDescriptionCache.size > IMAGE_DESCRIPTION_CACHE_MAX) {
@@ -515,10 +576,14 @@ export async function executeTwoPhaseVision(
   // After this, control returns IMMEDIATELY to the primary model via
   // the provider's normal dispatch — the vision fallback's job is
   // done (owner directive 2026-08-20: describe → hand back, no more).
+  // v0223 (D2): the markerOverlay is the LOWEST-priority source —
+  // the persistent cache (a warmed description) wins over it, the
+  // degraded overlay (this-turn failures) wins over both.
   const rewrittenMessages = replaceImagesWithCachedDescriptions(
     params.messages,
     imageDescriptionCache,
     degradedOverlay,
+    markerOverlay,
   );
 
   return {
@@ -549,6 +614,7 @@ function replaceImagesWithCachedDescriptions(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
   cache: ReadonlyMap<string, string>,
   degradedOverlay: ReadonlyMap<string, string> = new Map(),
+  markerOverlay: ReadonlyMap<string, string> = new Map(),
 ): vscode.LanguageModelChatRequestMessage[] {
   const result: vscode.LanguageModelChatRequestMessage[] = [];
 
@@ -579,7 +645,11 @@ function replaceImagesWithCachedDescriptions(
         // Review P1-2: degraded markers live in a per-turn overlay —
         // checked BEFORE the persistent cache (a poisoned entry must
         // not exist there anymore, but the order is defensive).
-        const cached = degradedOverlay.get(hash) ?? cache.get(hash);
+        // v0223 (D2): the markerOverlay (sent-but-unscribed hashes) is
+        // checked AFTER the persistent cache — a warmed description is
+        // strictly better than a repeat marker, so the cache wins.
+        const cached =
+          degradedOverlay.get(hash) ?? cache.get(hash) ?? markerOverlay.get(hash);
         if (cached) {
           // Substitute the cached (or just-fresh) description.
           newContent.push(new vscode.LanguageModelTextPart(`\n\n${cached}`));
@@ -613,4 +683,246 @@ function replaceImagesWithCachedDescriptions(
 export function sha256ShortHex(data: Uint8Array): string {
   // Use node:crypto static import (ESM-safe). Correlation-only — not a security primitive.
   return createHash('sha256').update(data).digest('hex').slice(0, 16);
+}
+
+/**
+ * v0223 (task v0223-vision-cache-warm, D1) — the ONE describe engine:
+ * a non-streaming `nativeChatOnce` call with the hardcoded
+ * `VISION_DESCRIBE_PROMPT`, the 90 s timeout, and the 3-attempt retry
+ * on socket-close / timeout-abort errors. EXTRACTED VERBATIM from
+ * `executeTwoPhaseVision`'s phase-1 loop (which now calls this helper)
+ * so the D1 background cache-warm describe reuses the exact same
+ * machinery instead of duplicating the retry loop.
+ *
+ * Throws on failure (failure OR an empty description) — the caller
+ * decides the policy: the turn path throws (describe-all-or-throw),
+ * the D1 warm-up catches and logs (throw-and-never-cache).
+ *
+ * `onController` receives each attempt's AbortController so the
+ * caller's CancellationToken can abort the in-flight call (the
+ * phase-1 loop wires it through its `currentController` latch; the
+ * warm-up passes its own). Optional — nothing to abort without it.
+ */
+export async function describeImageOnce(
+  visionModel: ModelDefinition,
+  apiKey: string,
+  visionConnection: ConnectionConfig | undefined,
+  clientBaseUrl: string,
+  isLocalConnection: boolean,
+  base64: string,
+  onController?: (controller: AbortController) => void,
+): Promise<string> {
+  // Build the vision connection's OllamaClient (SEC-03 whitelist
+  // enforced at the fetch boundary via assertBaseUrlAllowedOrThrow) —
+  // same construction as the pre-extraction phase-1 block.
+  const ssrfGuard: SsrfGuard = isLocalConnection
+    ? createProductionSsrfGuard({ allowLoopback: true, allowPrivateRanges: true })
+    : createProductionSsrfGuard({
+        allowLoopback: false,
+        advice: 'Check the URL or your ollamaCloud.allowedBaseUrls whitelist.',
+      });
+  const client = new OllamaClient(
+    clientBaseUrl,
+    apiKey,
+    visionConnection,
+    'compat',
+    ssrfGuard,
+  );
+
+  const requestBody = {
+    model: visionModel.apiModel,
+    messages: [
+      { role: 'user', content: VISION_DESCRIBE_PROMPT, images: [base64] },
+    ],
+    stream: false,
+    think: false,
+  };
+  let description = '';
+  let failure: unknown;
+  let abortedByTimeout = false;
+  for (let attempt = 1; attempt <= DESCRIBE_MAX_ATTEMPTS; attempt++) {
+    const currentController = new AbortController();
+    onController?.(currentController);
+    const timer = setTimeout(() => {
+      abortedByTimeout = true;
+      currentController.abort();
+    }, DESCRIBE_TIMEOUT_MS);
+    try {
+      description = await client.nativeChatOnce(
+        requestBody,
+        currentController.signal,
+      );
+      failure = undefined;
+      abortedByTimeout = false;
+      break;
+    } catch (error) {
+      failure = error;
+      const message = error instanceof Error ? error.message : String(error);
+      // Timeout aborts ARE retryable: the vision model latency
+      // varies widely (observed: the same image timed out at 90s,
+      // then described in 35s on the next attempt). User
+      // cancellation is NOT retryable — it aborts the controller
+      // without setting `abortedByTimeout`.
+      const retryable =
+        abortedByTimeout ||
+        isSocketCloseError(error) ||
+        /ECONNRESET|socket hang up/i.test(message);
+      if (!retryable || attempt === DESCRIBE_MAX_ATTEMPTS) {
+        break;
+      }
+      await new Promise((resolve) =>
+        setTimeout(resolve, DESCRIBE_BASE_DELAY_MS * 2 ** (attempt - 1)),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  const emptyDescription = !failure && !description.trim();
+  if (failure || emptyDescription) {
+    const detail =
+      failure === undefined || failure === null
+        ? 'vision model returned an empty description'
+        : abortedByTimeout
+          ? `vision model call timed out after ${DESCRIBE_TIMEOUT_MS}ms`
+          : failure instanceof Error
+            ? failure.message
+            : String(failure);
+    // Variant-(b) degradation (degradeOnFailure) was REMOVED with
+    // variant (v) (2026-09-15): a vision-capable primary now keeps
+    // direct sight (no describe at all), and the text-only primary
+    // keeps the legacy describe-all-or-throw contract.
+    if (failure) {
+      throw new Error(`Vision two-phase: vision model call failed — ${detail}`);
+    }
+    throw new Error(
+      'Vision two-phase: vision model returned an empty description. Cannot substitute image.',
+    );
+  }
+  return description;
+}
+
+/**
+ * Signature of `executeTwoPhaseVision` result — re-declared narrowly for the warm-up seam.
+ */
+export interface WarmImageDescriptionParams {
+  /** The vision model resolved on the vision-primary turn (same resolution the two-phase path uses). */
+  readonly visionModel: ModelDefinition;
+  /** The vision model's connection (undefined = legacy cloud path). */
+  readonly visionConnection: ConnectionConfig | undefined;
+  /** Resolved vision-connection API key (the caller computes it auth-manager style). */
+  readonly apiKey: string;
+  /** The vision connection's base URL (caller resolves — same expression as the two-phase path). */
+  readonly baseUrl: string;
+  /** Hash → base64 for the images committed THIS turn (deduplicated upstream). */
+  readonly images: ReadonlyMap<string, string>;
+  /** The primary turn's CancellationToken — cancellation aborts the describe too. */
+  readonly token: CancellationToken;
+}
+
+/**
+ * v0223 (task v0223-vision-cache-warm, D1) — the background cache
+ * warmer. Describes committed RAW-sent images through the SAME
+ * machinery as the phase-1 describe (`describeImageOnce` — hardcoded
+ * prompt, 90 s timeout, 3-attempt retry) and writes the WRAPPED
+ * description into the persistent `imageDescriptionCache`, so a
+ * mid-session switch to a text-only primary finds the cache populated
+ * instead of re-describing the image every turn.
+ *
+ * Contract (D1 verbatim):
+ *   - the caller fires this NON-BLOCKING after `commitTurn` (the
+ *     primary turn has already returned — `void ... .catch(...)`); it
+ *     never reports progress parts and never throws across a turn
+ *     boundary: failures log (hash + reason) and the cache stays
+ *     untouched (throw-and-never-cache, review P1-2 semantics);
+ *   - hashes already in the cache are SKIPPED (one describe per new
+ *     committed image per session; the cache presence check is the
+ *     dedupe);
+ *   - on success the cache gets `wrapDescription(visionModel.name,
+ *     description)` — the injection delimiter survives across turns;
+ *   - cancellation: the primary token aborts the in-flight attempt
+ *     (same pattern as the phase-1 loop).
+ */
+export function warmImageDescriptionCache(
+  params: WarmImageDescriptionParams,
+): Promise<void> {
+  // `run` carries the real semantics (including rejections) and is
+  // returned to the caller (the provider's `launchWarmDescribe` awaits
+  // it inside its try/catch). `tracked` is the registry entry: the
+  // permanent `.catch` guarantees it never becomes an unhandled
+  // rejection while it waits, possibly long, for a test drain.
+  const run = warmImageDescriptionCacheInner(params);
+  const tracked = run
+    .catch(() => undefined)
+    .finally(() => {
+      inFlightWarms.delete(tracked);
+    });
+  warmRegisteredEver += 1;
+  inFlightWarms.add(tracked);
+  return run;
+}
+
+async function warmImageDescriptionCacheInner(
+  params: WarmImageDescriptionParams,
+): Promise<void> {
+  const { visionModel, visionConnection, apiKey, baseUrl, images, token } =
+    params;
+  // Dedupe: only hashes the persistent cache does NOT hold yet.
+  const pending = [...images.entries()].filter(
+    ([hash]) => !imageDescriptionCache.has(hash),
+  );
+  if (pending.length === 0) {
+    return;
+  }
+  const isLocalConnection = visionConnection?.type === 'local';
+  let currentController: AbortController | undefined;
+  if (token) {
+    // Same listener-lifetime comment as the phase-1 loop: the listener
+    // dies with the token; per-call controllers are short-lived.
+    token.onCancellationRequested(() => currentController?.abort());
+  }
+  for (let index = 0; index < pending.length; index++) {
+    const [hash, base64] = pending[index]!;
+    // v0223 review P2-#2 — a cancelled turn must not keep launching
+    // fresh describes (up to 3×90 s per REMAINING image). The
+    // in-flight attempt aborts via the listener above; this check
+    // stops the LOOP itself before the next image. One quiet line, no
+    // cache write for the skipped hashes (they stay coverable by the
+    // D2 marker path).
+    if (token.isCancellationRequested) {
+      logger.info(
+        `vision cache warm: cancelled — ${pending.length - index} describe(s) not started (hash(es)=${pending.slice(index).map(([h]) => h.slice(0, 8)).join(',')})`,
+      );
+      return;
+    }
+    const description = await describeImageOnce(
+      visionModel,
+      apiKey,
+      visionConnection,
+      baseUrl,
+      isLocalConnection,
+      base64,
+      (controller) => {
+        currentController = controller;
+      },
+    );
+    logger.info('vision cache warm: description cached', {
+      visionModel: visionModel.id,
+      imageHash: hash,
+      descriptionLength: description.length,
+      // Do NOT log the description itself — injection-surface policy
+      // (same as the phase-1 log below/above); length only.
+    });
+    const wrapped = wrapDescription(visionModel.name, description);
+    imageDescriptionCache.set(hash, wrapped);
+    // Evict oldest entries when over the cap (insertion order = age),
+    // then persist — same housekeeping as the phase-1 path.
+    while (imageDescriptionCache.size > IMAGE_DESCRIPTION_CACHE_MAX) {
+      const oldest = imageDescriptionCache.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      imageDescriptionCache.delete(oldest);
+    }
+    persistCache();
+  }
 }

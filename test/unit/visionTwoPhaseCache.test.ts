@@ -7,6 +7,7 @@ import {
   executeTwoPhaseVision,
   clearImageDescriptionCache,
   setVisionCachePath,
+  sha256ShortHex,
 } from '../../src/visionTwoPhase.js';
 import type { ModelDefinition } from '../../src/modelCatalog.js';
 import type { ConnectionConfig } from '../../src/connections.js';
@@ -432,6 +433,353 @@ describe('visionTwoPhase description cache', () => {
         v.includes('[Image description from'),
       ).length;
       assert.equal(descriptionCount, 2, 'both images replaced with descriptions');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+/**
+ * v0.22.3 (task v0223-vision-cache-warm, D2) — the ledger-aware
+ * text-only gate. When the describe WOULD fire for a hash the
+ * TurnLedger already committed as sent this session (a vision-capable
+ * primary served it RAW on an earlier turn, then the user switched to
+ * a text-only primary and VS Code re-sends the immutable history), the
+ * two-phase path must NOT describe: the persistent cache wins when the
+ * D1 warm-up already filled it; otherwise the hash substitutes the
+ * standard repeat marker. Never a fresh describe, never a throw.
+ * Truly NEW hashes (never committed) keep the byte-identical
+ * describe-or-throw contract — asserted by the pin that a probe that
+ * says "not sent" still describes.
+ */
+describe('visionTwoPhase ledger-aware marker (v0.22.3 D2)', () => {
+  beforeEach(() => {
+    clearImageDescriptionCache();
+    setVisionCachePath(null);
+    setConfig({});
+  });
+
+  afterEach(() => {
+    clearImageDescriptionCache();
+    setVisionCachePath(null);
+    setConfig({});
+  });
+
+  it('sent hash + warm cache present → cached description substitutes SILENTLY (no vision call)', async () => {
+    const primary = makeModel('cloud/gpt-oss:120b', 'cloud', false);
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    let visionCallCount = 0;
+    const annotations: string[] = [];
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      visionCallCount += 1;
+      return new Response(
+        JSON.stringify({ message: { content: 'x' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      // Pre-warm the cache (the D1 warm-up completed fast).
+      const { warmImageDescriptionCache } = await import('../../src/visionTwoPhase.js');
+      await warmImageDescriptionCache({
+        visionModel: vision,
+        visionConnection: connection,
+        apiKey: 'sk-test',
+        baseUrl: 'https://ollama.com/v1',
+        images: new Map([[sha256ShortHex(new Uint8Array(IMG_A)), Buffer.from(IMG_A).toString('base64')]]),
+        token: new vscode.CancellationTokenSource().token,
+      });
+      assert.equal(visionCallCount, 1, 'warm-up performed one describe');
+      const result = await executeTwoPhaseVision({
+        primaryModel: primary,
+        primaryConnection: connection,
+        messages: [imageMsg(IMG_A), textMsg('and the layout?')],
+        options: {} as vscode.ProvideLanguageModelChatResponseOptions,
+        progress: {
+          report: (part: vscode.LanguageModelResponsePart) => {
+            if (part instanceof vscode.LanguageModelTextPart) {
+              annotations.push(part.value);
+            }
+          },
+        },
+        token: new vscode.CancellationTokenSource().token,
+        authManager: {
+          getApiKeyForConnection: async () => 'sk-test',
+          getApiKey: async () => 'sk-test',
+          getBaseUrl: () => 'https://ollama.com/v1',
+        } as never,
+        catalog: [primary, vision],
+        connections: [connection],
+        sentHashProbe: (hash) => hash === sha256ShortHex(new Uint8Array(IMG_A)),
+      });
+      assert.equal(visionCallCount, 1, 'sent hash resolved from the warm cache — no describe call');
+      assert.equal(annotations.length, 0, 'no Describing-image annotation (silent)');
+      const flat = result.messages
+        .filter((m) => m.role === vscode.LanguageModelChatMessageRole.User)
+        .flatMap((m) => m.content)
+        .filter((p): p is vscode.LanguageModelTextPart => p instanceof vscode.LanguageModelTextPart)
+        .map((p) => p.value);
+      assert.ok(
+        flat.some((v) => v.includes('[Image description from')),
+        'the real description beat the marker (cache wins)',
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('sent hash + NO warm cache → repeat marker substituted, ZERO describe calls, no throw', async () => {
+    const primary = makeModel('cloud/gpt-oss:120b', 'cloud', false);
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    let visionCallCount = 0;
+    const annotations: string[] = [];
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      visionCallCount += 1;
+      throw new Error('vision endpoint must not be called for a sent hash');
+    }) as typeof fetch;
+    try {
+      const result = await executeTwoPhaseVision({
+        primaryModel: primary,
+        primaryConnection: connection,
+        messages: [imageMsg(IMG_A), textMsg('and the layout?')],
+        options: {} as vscode.ProvideLanguageModelChatResponseOptions,
+        progress: {
+          report: (part: vscode.LanguageModelResponsePart) => {
+            if (part instanceof vscode.LanguageModelTextPart) {
+              annotations.push(part.value);
+            }
+          },
+        },
+        token: new vscode.CancellationTokenSource().token,
+        authManager: {
+          getApiKeyForConnection: async () => 'sk-test',
+          getApiKey: async () => 'sk-test',
+          getBaseUrl: () => 'https://ollama.com/v1',
+        } as never,
+        catalog: [primary, vision],
+        connections: [connection],
+        sentHashProbe: (hash) => hash === sha256ShortHex(new Uint8Array(IMG_A)),
+      });
+      assert.equal(visionCallCount, 0, 'NO describe call for a sent hash (marker path)');
+      assert.equal(annotations.length, 0, 'no Describing-image annotation');
+      const flat = result.messages
+        .filter((m) => m.role === vscode.LanguageModelChatMessageRole.User)
+        .flatMap((m) => m.content)
+        .filter((p): p is vscode.LanguageModelTextPart => p instanceof vscode.LanguageModelTextPart)
+        .map((p) => p.value);
+      const marker = flat.find((v) => v.includes('[Image '));
+      assert.ok(marker, 'a marker text part replaced the image');
+      assert.ok(marker.includes('duplicate of an image already sent'), 'standard MARKER_TEMPLATE shape');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('never-sent hash with sentHashProbe wired → the describe contract is UNCHANGED (still describes)', async () => {
+    const primary = makeModel('cloud/gpt-oss:120b', 'cloud', false);
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    let visionCallCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      visionCallCount += 1;
+      return new Response(
+        JSON.stringify({ message: { content: 'a fresh image' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      await executeTwoPhaseVision({
+        primaryModel: primary,
+        primaryConnection: connection,
+        messages: [imageMsg(IMG_A)],
+        options: {} as vscode.ProvideLanguageModelChatResponseOptions,
+        progress: { report: () => undefined },
+        token: new vscode.CancellationTokenSource().token,
+        authManager: {
+          getApiKeyForConnection: async () => 'sk-test',
+          getApiKey: async () => 'sk-test',
+          getBaseUrl: () => 'https://ollama.com/v1',
+        } as never,
+        catalog: [primary, vision],
+        connections: [connection],
+        // A real provider probe — but IMG_A was never committed anywhere.
+        sentHashProbe: () => false,
+      });
+      assert.equal(visionCallCount, 1, 'a never-sent hash keeps the describe contract');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('warmImageDescriptionCache: skips hashes already in the cache and an empty image map (no fetch)', async () => {
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    let visionCallCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      visionCallCount += 1;
+      return new Response(
+        JSON.stringify({ message: { content: 'a test screenshot' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      const { warmImageDescriptionCache } = await import('../../src/visionTwoPhase.js');
+      await warmImageDescriptionCache({
+        visionModel: vision,
+        visionConnection: connection,
+        apiKey: 'sk-test',
+        baseUrl: 'https://ollama.com/v1',
+        images: new Map([[sha256ShortHex(new Uint8Array(IMG_A)), Buffer.from(IMG_A).toString('base64')]]),
+        token: new vscode.CancellationTokenSource().token,
+      });
+      assert.equal(visionCallCount, 1);
+      // Repeat: the hash is already in the cache — skip entirely.
+      await warmImageDescriptionCache({
+        visionModel: vision,
+        visionConnection: connection,
+        apiKey: 'sk-test',
+        baseUrl: 'https://ollama.com/v1',
+        images: new Map([[sha256ShortHex(new Uint8Array(IMG_A)), Buffer.from(IMG_A).toString('base64')]]),
+        token: new vscode.CancellationTokenSource().token,
+      });
+      assert.equal(visionCallCount, 1, 'already-cached hash did not re-fetch');
+      // Empty map → no call at all.
+      await warmImageDescriptionCache({
+        visionModel: vision,
+        visionConnection: connection,
+        apiKey: 'sk-test',
+        baseUrl: 'https://ollama.com/v1',
+        images: new Map(),
+        token: new vscode.CancellationTokenSource().token,
+      });
+      assert.equal(visionCallCount, 1, 'empty image map → no call');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('warmImageDescriptionCache: describe failure → cache NOT poisoned (throw-and-never-cache)', async () => {
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      return new Response('vision upstream overloaded', { status: 500 });
+    }) as typeof fetch;
+    try {
+      const { warmImageDescriptionCache } = await import('../../src/visionTwoPhase.js');
+      await assert.rejects(
+        () =>
+          warmImageDescriptionCache({
+            visionModel: vision,
+            visionConnection: connection,
+            apiKey: 'sk-test',
+            baseUrl: 'https://ollama.com/v1',
+            images: new Map([[sha256ShortHex(new Uint8Array(IMG_A)), Buffer.from(IMG_A).toString('base64')]]),
+            token: new vscode.CancellationTokenSource().token,
+          }),
+        /vision model call failed/,
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+/**
+ * v0223 review P2-#2 — a cancelled turn must not keep launching fresh
+ * warm describes (up to 3x90s per REMAINING image). The loop checks the
+ * token BEFORE each image; the in-flight attempt aborts via the
+ * token→controller listener. Pin: two uncached images, cancel after the
+ * first describe starts → exactly 1 fetch, second never launched, no
+ * cache write for the skipped hash, no throw.
+ */
+describe('visionTwoPhase warm cancellation (review P2-#2)', () => {
+  beforeEach(() => {
+    clearImageDescriptionCache();
+    setVisionCachePath(null);
+    setConfig({});
+  });
+
+  afterEach(() => {
+    clearImageDescriptionCache();
+    setVisionCachePath(null);
+    setConfig({});
+  });
+
+  it('cancel mid-warm → the next image never fetches; cache holds only completed describes', async () => {
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    let visionCallCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      visionCallCount += 1;
+      return new Response(
+        JSON.stringify({ message: { content: `describe #${visionCallCount}` } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      const { warmImageDescriptionCache } = await import('../../src/visionTwoPhase.js');
+      const cts = new vscode.CancellationTokenSource();
+      const images = new Map<string, string>([
+        [sha256ShortHex(new Uint8Array(IMG_A)), Buffer.from(IMG_A).toString('base64')],
+        [sha256ShortHex(new Uint8Array(IMG_B)), Buffer.from(IMG_B).toString('base64')],
+      ]);
+      // Cancel AFTER the first describe completed: the fire-and-forget
+      // chain awaits the first image; we cancel as soon as the first
+      // fetch ARRIVES (before its response resolves — the attempt
+      // itself aborts, the loop then must not launch image B).
+      const firstArrived = new Promise<void>((resolve) => {
+        const original = global.fetch as (i: string | URL | Request) => Promise<Response>;
+        global.fetch = (async (input: string | URL | Request) => {
+          const url = typeof input === 'string' ? input : input.toString();
+          if (url.includes('/api/chat')) {
+            resolve();
+          }
+          return original(input);
+        }) as typeof fetch;
+      });
+      const warm = warmImageDescriptionCache({
+        visionModel: vision,
+        visionConnection: connection,
+        apiKey: 'sk-test',
+        baseUrl: 'https://ollama.com/v1',
+        images,
+        token: cts.token,
+      });
+      await firstArrived;
+      cts.cancel();
+      await warm; // must settle (skipped/cancelled) — never unhandled
+      assert.equal(visionCallCount, 1, 'exactly ONE fetch — the second image never launched');
     } finally {
       global.fetch = originalFetch;
     }

@@ -104,9 +104,23 @@ export function resolveRawResendCap(): number {
   return Math.max(0, Math.floor(value));
 }
 
-const MARKER_TEMPLATE =
+/**
+ * v0.22.3 (task v0223-vision-cache-warm, D2) — the repeat-marker text
+ * for a hash the TurnLedger committed as sent RAW this session but the
+ * persistent description cache does not hold (the D1 warm-up failed or
+ * has not resolved yet). Exported for the two-phase path's
+ * markerOverlay: the mid-session switch (vision-capable primary →
+ * text-only primary) resolves such hashes through this marker instead
+ * of re-describing them every turn. BYTE-IDENTICAL to what
+ * `applyVisionHistoryLifecycle` substitutes for a committed repeat —
+ * it must stay the exact MARKER_TEMPLATE shape, and the plain-template
+ * export replaces the previous duplicated literal.
+ */
+export const sentImageRepeatMarker =
   (hash: string) =>
   `[Image ${hash} — duplicate of an image already sent in this session; if you cannot find its analysis in the history above, ask the user to re-attach it]`;
+
+const MARKER_TEMPLATE = sentImageRepeatMarker;
 
 /**
  * ArchCom 2026-09-15 variant (b) — DEGRADED-image marker. Used when the
