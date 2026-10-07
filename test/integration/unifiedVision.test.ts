@@ -946,6 +946,129 @@ describe('vision hash commit-on-success (v0.20.1 RCA) — G3 gates', () => {
     assert.ok(!turn3.includes('image_url'), 'turn 3 history repeat is a marker');
     assert.ok(turn3.includes('[Image'), 'marker text present');
   });
+
+  it('(d) pass-through commit → the D1 warm describe fires and a later text-only turn describes NOTHING (cache or marker, never fresh)', async function () {
+    // Review P2 fix (2026-10-07): the pass-through path RETURNS EARLY —
+    // the primary-dispatch captureWarmBase64 was never reached there,
+    // so a committed pass-through turn warmed nothing (silent no-op).
+    // The fix captures the RAW first-send bytes in the marker-mode
+    // branch right before the early return. This pin proves the full
+    // chain: pass-through commits IMG_A → warm-up describes it (exactly
+    // one /api/chat body carrying images) → the SAME provider's later
+    // turn against a text-only primary resolves the image with ZERO
+    // describes (from the warmed cache — a real description beats a
+    // marker; if the warm-up had not landed, the D2 marker path would
+    // hold — either way NO fresh describe and NO throw).
+    this.timeout(10000);
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'pass-through',
+    });
+    const describeBodies: Array<Record<string, unknown>> = [];
+    global.fetch = (async (url: unknown, init?: { body?: unknown }) => {
+      const urlStr = String(url);
+      const parsed = init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
+      if (urlStr.includes('/api/chat')) {
+        const messages = (parsed.messages as Array<Record<string, unknown>>) ?? [];
+        if (messages.some((m) => 'images' in m)) {
+          // Vision describe — ONLY the warm-up may reach it.
+          describeBodies.push(parsed);
+          return new Response(
+            JSON.stringify({ message: { content: 'a warm pass-through description' } }),
+            { status: 200, headers: { 'content-type': 'application/json' } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ message: { content: 'CHECKPOINT SUMMARY' } }),
+          { status: 200 },
+        );
+      }
+      chatCalls.push({ url: urlStr, body: parsed });
+      return new Response(
+        streamFromChunks([
+          encode('data: {"choices":[{"delta":{"content":"vision ok"}}]}\n'),
+          encode('data: [DONE]\n'),
+        ]),
+        { status: 200 },
+      );
+    }) as typeof fetch;
+
+    const provider = new OllamaCloudChatProvider(makeMockContext());
+    const token = new vscode.CancellationTokenSource().token;
+    const base = {
+      modelOptions: {},
+      justification: 'test',
+    } as unknown as vscode.ProvideLanguageModelChatResponseOptions;
+
+    // Turn 1: pass-through — the vision model answers directly, the
+    // hash commits; the warm describe is scheduled fire-and-forget.
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg(IMG_A)],
+      base,
+      makeProgress(),
+      token,
+    );
+    assert.equal(chatCalls.length, 1, 'turn 1: one pass-through dispatch');
+    assert.ok(
+      JSON.stringify(chatCalls[0]!.body).includes('image_url'),
+      'turn 1: the image reached the pass-through vision model RAW',
+    );
+
+    // The warm-up settles before assertions (the fire-and-forget
+    // describe must have RUN — exactly one, targeting minimax-m3 with
+    // the image bytes).
+    await drainVisionWarmDescribes();
+    assert.equal(describeBodies.length, 1, 'exactly ONE warm describe');
+    assert.equal(
+      (describeBodies[0] as { model?: string }).model,
+      'minimax-m3',
+      'the warm describe targeted the configured vision model',
+    );
+    assert.ok(
+      JSON.stringify(describeBodies[0]).includes('images'),
+      'the warm describe carried the image bytes',
+    );
+
+    // Turn 2: SAME history re-sent to a TEXT-ONLY primary (VS Code's
+    // immutable re-send after the switch to two-phase routing). The
+    // warmed cache substitutes silently — ZERO describes, zero
+    // annotations, no throw.
+    configure({
+      'visionHistory.mode': 'marker',
+      'visionFallback.enabled': true,
+      'visionFallback.model': 'ollama-cloud/minimax-m3',
+      'visionFallback.mode': 'two-phase',
+    });
+    const progress2 = makeProgress();
+    await provider.provideLanguageModelChatResponse(
+      chatInfoFor('gpt-oss:120b'),
+      [imageMsg(IMG_A), assistantMsg('vision ok'), userMsg('what else?')],
+      base,
+      progress2,
+      token,
+    );
+    assert.equal(describeBodies.length, 1, 'turn 2: NO fresh describe');
+    const turn2 = JSON.stringify(chatCalls[1]!.body);
+    assert.ok(!turn2.includes('image_url'), 'turn 2: zero image bytes');
+    assert.ok(
+      turn2.includes('a warm pass-through description'),
+      'turn 2: the warmed cached description substituted',
+    );
+    assert.equal(
+      progress2.parts.filter(
+        (p) =>
+          p instanceof vscode.LanguageModelTextPart &&
+          (p as vscode.LanguageModelTextPart).value.includes('Describing image'),
+      ).length,
+      0,
+      'turn 2: no describe annotation (silent substitution)',
+    );
+  });
 });
 
 /**

@@ -709,3 +709,79 @@ describe('visionTwoPhase ledger-aware marker (v0.22.3 D2)', () => {
     }
   });
 });
+
+/**
+ * v0223 review P2-#2 — a cancelled turn must not keep launching fresh
+ * warm describes (up to 3x90s per REMAINING image). The loop checks the
+ * token BEFORE each image; the in-flight attempt aborts via the
+ * token→controller listener. Pin: two uncached images, cancel after the
+ * first describe starts → exactly 1 fetch, second never launched, no
+ * cache write for the skipped hash, no throw.
+ */
+describe('visionTwoPhase warm cancellation (review P2-#2)', () => {
+  beforeEach(() => {
+    clearImageDescriptionCache();
+    setVisionCachePath(null);
+    setConfig({});
+  });
+
+  afterEach(() => {
+    clearImageDescriptionCache();
+    setVisionCachePath(null);
+    setConfig({});
+  });
+
+  it('cancel mid-warm → the next image never fetches; cache holds only completed describes', async () => {
+    const vision = makeModel('cloud/minimax-m3', 'cloud', true);
+    const connection = makeConnection('cloud');
+    let visionCallCount = 0;
+    const originalFetch = global.fetch;
+    global.fetch = (async (input: string | URL | Request) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (!url.includes('/api/chat')) {
+        return new Response('[]', { status: 200 });
+      }
+      visionCallCount += 1;
+      return new Response(
+        JSON.stringify({ message: { content: `describe #${visionCallCount}` } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      const { warmImageDescriptionCache } = await import('../../src/visionTwoPhase.js');
+      const cts = new vscode.CancellationTokenSource();
+      const images = new Map<string, string>([
+        [sha256ShortHex(new Uint8Array(IMG_A)), Buffer.from(IMG_A).toString('base64')],
+        [sha256ShortHex(new Uint8Array(IMG_B)), Buffer.from(IMG_B).toString('base64')],
+      ]);
+      // Cancel AFTER the first describe completed: the fire-and-forget
+      // chain awaits the first image; we cancel as soon as the first
+      // fetch ARRIVES (before its response resolves — the attempt
+      // itself aborts, the loop then must not launch image B).
+      const firstArrived = new Promise<void>((resolve) => {
+        const original = global.fetch as (i: string | URL | Request) => Promise<Response>;
+        global.fetch = (async (input: string | URL | Request) => {
+          const url = typeof input === 'string' ? input : input.toString();
+          if (url.includes('/api/chat')) {
+            resolve();
+          }
+          return original(input);
+        }) as typeof fetch;
+      });
+      const warm = warmImageDescriptionCache({
+        visionModel: vision,
+        visionConnection: connection,
+        apiKey: 'sk-test',
+        baseUrl: 'https://ollama.com/v1',
+        images,
+        token: cts.token,
+      });
+      await firstArrived;
+      cts.cancel();
+      await warm; // must settle (skipped/cancelled) — never unhandled
+      assert.equal(visionCallCount, 1, 'exactly ONE fetch — the second image never launched');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});

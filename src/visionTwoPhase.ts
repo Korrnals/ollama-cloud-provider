@@ -208,17 +208,59 @@ export function clearImageDescriptionCache(): void {
 const inFlightWarms = new Set<Promise<void>>();
 
 /**
+ * v0223 (review follow-up) — count of warm SCHEDULES handed to the
+ * provider's `launchWarmDescribe`. Between `commitTurn` (which starts
+ * `launchWarmDescribe`) and the `warmImageDescriptionCache` call that
+ * registers the promise into {@link inFlightWarms}, the chain crosses
+ * several awaits (vision-model resolution, API-key read, SSRF DNS) —
+ * a drain that reads the EMPTY registry inside that window returns
+ * before the warm has even registered (the "immediate drain" race).
+ * {@link drainVisionWarmDescribes} compares this counter against its
+ * drained snapshot and keeps yielding until every SCHEDULE that
+ * existed when the drain began has produced a settled registry entry.
+ */
+let warmSchedulesIssued = 0;
+
+/** Marks a scheduled (not yet registered) warm — provider-side, synchronous. */
+export function noteWarmScheduled(): void {
+  warmSchedulesIssued += 1;
+}
+
+/**
  * v0223 (D1, test seam) — resolves when EVERY in-flight cache-warm
  * describe has settled (resolved or rejected; `launchWarmDescribe`
  * turns rejections into log lines, so rejections are already handled
- * — allSettled is belt and braces). Re-checks the registry in a loop:
- * a settle callback may release another queued warm.
+ * — allSettled is belt and braces). Registration-lag-proof: schedules
+ * that predate the drain are all guaranteed to REGISTER eventually
+ * (each schedule's launch chain settles its warms then exits), so the
+ * loop must wait until (a) every promise registered so far has
+ * settled AND (b) the schedule counter has reached the snapshot taken
+ * at drain start — a settled round past the snapshot counter means
+ * every pre-existing schedule has produced and completed its registry
+ * entry. Yields with setImmediate between empty rounds so a launch
+ * still inside its pre-registration awaits can register.
  */
 export async function drainVisionWarmDescribes(): Promise<void> {
-  while (inFlightWarms.size > 0) {
-    await Promise.allSettled([...inFlightWarms]);
+  const schedulesAtStart = warmSchedulesIssued;
+  for (;;) {
+    if (inFlightWarms.size > 0) {
+      await Promise.allSettled([...inFlightWarms]);
+    } else if (warmRegisteredEver < schedulesAtStart) {
+      // A pre-drain schedule has not registered yet (the launch chain
+      // is inside its pre-registration awaits) — yield so it can reach
+      // `warmImageDescriptionCache`.
+      await new Promise((resolve) => setImmediate(resolve));
+    } else {
+      // Registry empty AND every pre-drain schedule registered — and
+      // the allSettled rounds above settled everything registered.
+      // Schedules issued after this drain started belong to the next.
+      return;
+    }
   }
 }
+
+/** Warms ever REGISTERED (monotonic; incremented at `add` time). */
+let warmRegisteredEver = 0;
 
 /** Parameters for `executeTwoPhaseVision`. */
 export interface TwoPhaseParams {
@@ -814,6 +856,7 @@ export function warmImageDescriptionCache(
     .finally(() => {
       inFlightWarms.delete(tracked);
     });
+  warmRegisteredEver += 1;
   inFlightWarms.add(tracked);
   return run;
 }
@@ -837,7 +880,20 @@ async function warmImageDescriptionCacheInner(
     // dies with the token; per-call controllers are short-lived.
     token.onCancellationRequested(() => currentController?.abort());
   }
-  for (const [hash, base64] of pending) {
+  for (let index = 0; index < pending.length; index++) {
+    const [hash, base64] = pending[index]!;
+    // v0223 review P2-#2 — a cancelled turn must not keep launching
+    // fresh describes (up to 3×90 s per REMAINING image). The
+    // in-flight attempt aborts via the listener above; this check
+    // stops the LOOP itself before the next image. One quiet line, no
+    // cache write for the skipped hashes (they stay coverable by the
+    // D2 marker path).
+    if (token.isCancellationRequested) {
+      logger.info(
+        `vision cache warm: cancelled — ${pending.length - index} describe(s) not started (hash(es)=${pending.slice(index).map(([h]) => h.slice(0, 8)).join(',')})`,
+      );
+      return;
+    }
     const description = await describeImageOnce(
       visionModel,
       apiKey,

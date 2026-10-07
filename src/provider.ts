@@ -60,7 +60,12 @@ import {
   runStreamAttempt,
   type EndpointDispatchInputs,
 } from './endpointDispatch.js';
-import { executeTwoPhaseVision, warmImageDescriptionCache, sha256ShortHex } from './visionTwoPhase.js';
+import {
+  executeTwoPhaseVision,
+  warmImageDescriptionCache,
+  noteWarmScheduled,
+  sha256ShortHex,
+} from './visionTwoPhase.js';
 import type {
   OpenAICompatibleMessage,
   UsageInfo,
@@ -914,6 +919,19 @@ export class OllamaCloudChatProvider
               catalog: this.modelCatalog.list(),
               connections,
             });
+            // v0223 (D1, review P2 fix 2026-10-07) — capture the RAW
+            // first-send bytes HERE, in the marker-mode branch: the
+            // lifecycle-rewritten `passThroughMessages` still carries
+            // the first-sends as raw image parts, and pass-through
+            // RETURNS EARLY — the primary-dispatch capture (below) is
+            // never reached on this path. Without this the pass-through
+            // warm-up (right after the commit) found no captured bytes
+            // and silently described nothing. In 'raw' mode the capture
+            // is skipped on purpose: the warm scheduler's mode check
+            // already skips warming for 'raw' sessions entirely.
+            if (resolveVisionHistoryMode() === 'marker') {
+              this.captureWarmBase64(passThroughMessages);
+            }
             const committedPassThrough = this.turnLedger.commitTurn(turn, token);
             // v0223 (D1) — same background warm-up as the primary
             // dispatch success path: the pass-through vision stream may
@@ -1524,6 +1542,9 @@ export class OllamaCloudChatProvider
       if (resolveVisionHistoryMode() !== 'marker') {
         return;
       }
+      // Mark the SCHEDULE before launch (the drain's registration-lag
+      // window: the promise itself registers several awaits later).
+      noteWarmScheduled();
       void this.launchWarmDescribe(
         primaryModel,
         primaryConnection,

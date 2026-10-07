@@ -126,12 +126,21 @@ The fix closes the loop without changing the master invariant:
   commits the hash into the turn ledger — ONE best-effort background
   describe runs per newly committed image through the SAME phase-1
   machinery (`describeImageOnce`: hardcoded prompt, 90 s timeout,
-  retry, `wrapDescription`) and fills the persistent cache. It is
+  retry, `wrapDescription`) and fills the persistent cache. The RAW
+  bytes the warmer describes are captured at LIFECYCLE time (the
+  marker-mode lifecycle rewrite still carries the first-sends as raw
+  image parts) — captured on the vision-primary dispatch path AND, for
+  pass-through turns that are committed, in the pass-through branch
+  right before its early return (pass-through never reaches the
+  primary-dispatch capture; without the branch capture its commits
+  would warm nothing). It is
   fire-and-forget (never delays the turn, never reports progress
   parts, NEVER surfaces an error — a failed warm-up only logs a line
   with the hash and writes nothing: throw-and-never-cache, review
   P1-2 semantics), deduplicated by the cache itself (one describe per
-  new committed image per session), and skipped entirely in
+  new committed image per session), stops launching fresh describes
+  the moment the turn's token is cancelled (the in-flight attempt
+  aborts too), and skipped entirely in
   `visionHistory.mode='raw'`.
 - **Ledger-aware text-only gate (D2):** for a hash the turn ledger
   already committed as sent RAW this session, a text-only primary's
