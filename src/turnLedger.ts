@@ -129,6 +129,30 @@ export class TurnLedger {
   }
 
   /**
+   * v0.22.3 (task v0223-vision-cache-warm, D3) — read-only membership
+   * probe over {@link sentImageHashes}: "was this image ALREADY sent
+   * RAW to some model this session (and its turn genuinely completed)?"
+   *
+   * Consumer: the provider's two-phase vision gate. When the user
+   * switches mid-session from a vision-capable primary (which served
+   * the image RAW and committed the hash, but wrote NO description
+   * into the persistent cache) to a text-only primary, VS Code re-sends
+   * the same immutable history; the gate must know the image was
+   * already SEEN so it can substitute the repeat marker (or the D1
+   * warm cache) instead of describing a fresh vision call — or
+   * throwing. (D1 warm-the-cache; field report 2026-10-06.)
+   *
+   * Deliberately narrow: the set itself is NOT exposed (the ledger
+   * stays the ONE owner of the sent/failed/capped state); callers ask
+   * per hash. Committed hashes only — a PENDING (in-flight) or FAILED
+   * send is still invisible to the model, and the next turn must keep
+   * re-sending it RAW (commit-on-success, v0.20.1).
+   */
+  hasBeenSent(hash: string): boolean {
+    return this.sentImageHashes.has(hash);
+  }
+
+  /**
    * ADR 0013 lifecycle application — first send of a hash goes RAW,
    * repeats become in-band markers, capped hashes degrade to the
    * never-sent marker. Operates on the given turn's pending container
@@ -166,26 +190,38 @@ export class TurnLedger {
    * "a failed/cancelled turn must NOT record hashes" for the D-2
    * path). With `rawResendCap = 0` the check is skipped entirely:
    * the legacy commit-on-resolve behavior applies unchanged.
+   *
+   * v0223 (task v0223-vision-cache-warm, D1) — returns the hashes this
+   * call actually COMMITTED (empty when there was nothing pending or
+   * the cancelled-token routing sent them to the failed counter). The
+   * provider's success paths hand exactly this list to the background
+   * cache warmer — the hashes whose images went RAW to a model this
+   * turn are the ones whose description the persistent cache should
+   * hold before a text-only primary re-sends them. The set itself is
+   * never exposed (D3): this is a one-shot, already-committed snapshot.
    */
   commitTurn(
     turn: TurnHandle,
     token?: vscode.CancellationToken,
-  ): void {
+  ): readonly string[] {
     const pending = turn.pendingImageHashes;
     if (pending.size === 0) {
-      return;
+      return [];
     }
     if (token?.isCancellationRequested && resolveRawResendCap() > 0) {
       this.recordFailedImageSends(pending);
-      return;
+      return [];
     }
+    const committed: string[] = [];
     for (const hash of pending) {
       this.sentImageHashes.add(hash);
       // Success exempts the hash forever (never raw again) — drop any
       // stale failure count so the map does not grow unbounded.
       this.failedImageSendCounts.delete(hash);
+      committed.push(hash);
     }
     pending.clear();
+    return committed;
   }
 
   /**

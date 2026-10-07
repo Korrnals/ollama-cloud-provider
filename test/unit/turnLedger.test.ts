@@ -23,6 +23,7 @@
 import { strict as assert } from 'node:assert';
 import * as vscode from 'vscode';
 import { TurnLedger } from '../../src/turnLedger.js';
+import { sha256ShortHex } from '../../src/visionTwoPhase.js';
 
 function imagePart(bytes: Uint8Array): vscode.LanguageModelDataPart {
   return new vscode.LanguageModelDataPart(bytes, 'image/png');
@@ -103,5 +104,72 @@ describe('TurnLedger — per-turn pending isolation (rework P2-1)', () => {
     // (a capped hash would have degraded to the never-sent marker).
     const markerA = (parts[0] as vscode.LanguageModelTextPart).value;
     assert.ok(markerA.includes('[Image'), markerA);
+  });
+});
+
+/**
+ * v0.22.3 (task v0223-vision-cache-warm, D3) — the read-only
+ * `hasBeenSent` query. The provider's two-phase vision gate needs to
+ * ask "was this image ALREADY sent RAW to some model this session?"
+ * (a vision-primary RAW commit) to decide between a cached/warmed
+ * description and a repeat marker on a text-only primary — WITHOUT
+ * exposing the private `sentImageHashes` set.
+ */
+describe('TurnLedger — hasBeenSent read-only query (v0.22.3 D3)', () => {
+  beforeEach(() => {
+    vscode.workspace.getConfiguration('ollamaCloud')._replace({
+      'visionHistory.mode': 'marker',
+      'visionHistory.rawResendCap': 3,
+    });
+  });
+
+  it('commitTurn → hasBeenSent(hash) is true', () => {
+    const ledger = new TurnLedger();
+    const turn = ledger.beginTurn();
+    ledger.applyLifecycle([userMsg([imagePart(PNG_A)])], turn);
+    assert.equal(ledger.hasBeenSent(sha256ShortHex(PNG_A)), false, 'pending only — not yet sent');
+    ledger.commitTurn(turn);
+    assert.equal(ledger.hasBeenSent(sha256ShortHex(PNG_A)), true, 'committed by a successful turn');
+  });
+
+  it('a failed turn (recordFailedTurn) → hasBeenSent stays false (commit-on-success)', () => {
+    const ledger = new TurnLedger();
+    const turn = ledger.beginTurn();
+    ledger.applyLifecycle([userMsg([imagePart(PNG_A)])], turn);
+    ledger.recordFailedTurn(turn);
+    assert.equal(
+      ledger.hasBeenSent(sha256ShortHex(PNG_A)),
+      false,
+      'a failed send never commits the hash',
+    );
+  });
+
+  it('an uncommitted pending hash → false; an unknown hash → false', () => {
+    const ledger = new TurnLedger();
+    const turn = ledger.beginTurn();
+    ledger.applyLifecycle([userMsg([imagePart(PNG_A)])], turn);
+    assert.equal(
+      ledger.hasBeenSent(sha256ShortHex(PNG_A)),
+      false,
+      'still pending — the model has not seen it yet',
+    );
+    assert.equal(
+      ledger.hasBeenSent(sha256ShortHex(PNG_B)),
+      false,
+      'never in any container',
+    );
+  });
+
+  it('quiet-completed cancel with cap>0 → false (the D-2 failed-send routing)', () => {
+    const ledger = new TurnLedger();
+    const turn = ledger.beginTurn();
+    ledger.applyLifecycle([userMsg([imagePart(PNG_A)])], turn);
+    const cancelled = { isCancellationRequested: true } as vscode.CancellationToken;
+    ledger.commitTurn(turn, cancelled);
+    assert.equal(
+      ledger.hasBeenSent(sha256ShortHex(PNG_A)),
+      false,
+      'a cancelled token at commit time counts as a failed send',
+    );
   });
 });
