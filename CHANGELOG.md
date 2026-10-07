@@ -4,6 +4,11 @@ All notable changes to ollama-cloud-provider are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), adheres to [SemVer 2.0.0](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.22.3] - 2026-10-07
+
+PATCH release — regression fix for the vision-fallback gate on mid-session model switches.
+
 ### Fixed
 - **Text-only fallback on a no-new-image turn no longer re-describes an image a vision-capable model already saw (and no longer dies when the describe service is busy)** — mid-session switch from a vision-capable primary to a text-only one used to fire a fresh "Describing image" vision call on EVERY turn (the persistent description cache was never written on the vision-primary RAW channel), and a describe failure (HTTP 429/abort observed with MiniMax M3) killed the whole turn. Now the description is quietly cached in the background right after the vision-primary turn completes; a switch turn is a silent cache hit or, when that has not landed, a short "image already sent" marker — never a fresh describe, never a throw. Images never shown to a model keep the exact prior describe behavior. Nothing to configure (v0.22.3; ADR 0015 amended).
 
